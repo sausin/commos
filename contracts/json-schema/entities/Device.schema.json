@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Device.schema.json",
+  "title": "Device",
+  "description": "Physical or virtual endpoint owned by the Organisation (Volume 2). May be shared (assigned_user_id null).",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "vendor_key": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/OpenKey" },
+    "model": { "type": "string" },
+    "mac": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+    "assigned_user_id": {
+      "oneOf": [
+        { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+        { "type": "null" }
+      ]
+    },
+    "firmware": { "type": "string" },
+    "network": {
+      "type": "object",
+      "properties": {
+        "ip": { "type": "string" },
+        "vlan": { "type": "integer" },
+        "switch_port": { "type": "string" },
+        "location": { "type": "string" }
+      }
+    },
+    "registration": {
+      "type": "object",
+      "properties": {
+        "status": { "type": "string", "enum": ["REGISTERED", "UNREGISTERED"] },
+        "last_seen_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" }
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": ["DETECTED", "PENDING", "APPROVED", "PROVISIONED", "OPERATIONAL", "REPLACING", "RETIRED", "REJECTED"]
+    }
+  },
+  "required": ["vendor_key", "model", "state"]
+}

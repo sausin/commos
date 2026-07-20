@@ -1,0 +1,16 @@
+{
+  "id": "018f0a10-4444-7444-8444-444444440001",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "version": 1,
+  "created_at": "2026-07-20T14:32:05.123Z",
+  "updated_at": "2026-07-20T14:32:05.123Z",
+  "vendor_key": "yealink",
+  "model": "T54W",
+  "mac": "805e0c112233",
+  "assigned_user_id": "018f0a10-1111-7111-8111-111111110002",
+  "state": "OPERATIONAL",
+  "registration": {
+    "status": "REGISTERED",
+    "last_seen_at": "2026-07-20T14:32:05.123Z"
+  }
+}

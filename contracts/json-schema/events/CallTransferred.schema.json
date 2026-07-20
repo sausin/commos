@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallTransferred.schema.json",
+  "title": "CallTransferred",
+  "description": "CommOS canonical event 'CallTransferred' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallTransferred"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "transfer_type": {
+          "type": "string",
+          "enum": [
+            "BLIND",
+            "ATTENDED"
+          ]
+        },
+        "from_ref": {
+          "type": "string"
+        },
+        "to_ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "transfer_type",
+        "to_ref"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

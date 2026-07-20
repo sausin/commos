@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/IdentityAuthenticated.schema.json",
+  "title": "IdentityAuthenticated",
+  "description": "CommOS canonical event 'IdentityAuthenticated' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "IdentityAuthenticated"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "identity_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "device_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "PIN",
+            "RFID",
+            "NFC",
+            "QR",
+            "BLUETOOTH",
+            "FIDO2",
+            "PROXIMITY",
+            "FACE",
+            "SSO",
+            "OIDC",
+            "SAML",
+            "LDAP"
+          ]
+        },
+        "assurance_level": {
+          "type": "string",
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+          ]
+        }
+      },
+      "required": [
+        "identity_id",
+        "user_id",
+        "method",
+        "assurance_level"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

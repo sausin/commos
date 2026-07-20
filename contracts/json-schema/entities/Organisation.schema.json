@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Organisation.schema.json",
+  "title": "Organisation",
+  "description": "Tenant; isolation and billing root (Volume 2).",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
+    "default_currency": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Currency" },
+    "region": { "type": "string" },
+    "settings": { "type": "object" }
+  },
+  "required": ["name", "slug", "default_currency"]
+}

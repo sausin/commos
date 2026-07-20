@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallAnswered.schema.json",
+  "title": "CallAnswered",
+  "description": "CommOS canonical event 'CallAnswered' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallAnswered"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "identity_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "answered_at": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "call_id",
+        "answered_at"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

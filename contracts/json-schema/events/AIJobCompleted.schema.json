@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/AIJobCompleted.schema.json",
+  "title": "AIJobCompleted",
+  "description": "CommOS canonical event 'AIJobCompleted' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "AIJobCompleted"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "consumer_key": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/OpenKey"
+        },
+        "result_object_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "input_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "job_id",
+        "kind",
+        "consumer_key"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

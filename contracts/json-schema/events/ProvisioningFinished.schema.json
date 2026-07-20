@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/ProvisioningFinished.schema.json",
+  "title": "ProvisioningFinished",
+  "description": "CommOS canonical event 'ProvisioningFinished' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "ProvisioningFinished"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "firmware": {
+          "type": "string"
+        },
+        "config_object_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "SUCCESS",
+            "FAILURE"
+          ]
+        }
+      },
+      "required": [
+        "device_id",
+        "result"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

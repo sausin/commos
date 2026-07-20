@@ -1,0 +1,12 @@
+{
+  "id": "018f0a10-6666-7666-8666-666666660001",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "version": 1,
+  "created_at": "2026-07-20T14:32:05.123Z",
+  "updated_at": "2026-07-20T14:32:05.123Z",
+  "kind": "RECORDING",
+  "uri": "s3://commos-rec/2026/07/abc.opus",
+  "bytes": 1048576,
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "content_type": "audio/opus"
+}

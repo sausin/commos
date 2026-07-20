@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Call.schema.json",
+  "title": "Call",
+  "description": "A signalling+media session; one workload instance (Volume 2).",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "direction": { "type": "string", "enum": ["INBOUND", "OUTBOUND", "INTERNAL"] },
+    "from_ref": { "type": "string" },
+    "to_ref": { "type": "string" },
+    "device_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "identity_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "correlation_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "state": {
+      "type": "string",
+      "enum": ["INITIATED", "RINGING", "ANSWERED", "HELD", "ENDED", "FAILED", "NO_ANSWER", "BUSY", "REJECTED"]
+    },
+    "answered_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" },
+    "ended_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" },
+    "hangup_cause": { "type": "string" },
+    "media": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["AUDIO", "VIDEO", "APPLICATION"] },
+          "codec": { "type": "string" },
+          "direction": { "type": "string", "enum": ["SENDRECV", "SENDONLY", "RECVONLY", "INACTIVE"] }
+        },
+        "required": ["kind", "direction"]
+      }
+    }
+  },
+  "required": ["direction", "from_ref", "to_ref", "correlation_id", "state"]
+}

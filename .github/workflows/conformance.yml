@@ -1,0 +1,20 @@
+name: conformance
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  contracts:
+    name: Validate contracts (spec-first)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install harness dependencies
+        run: python3 -m pip install --quiet jsonschema pyyaml
+      - name: Run conformance harness
+        run: python3 conformance/run.py

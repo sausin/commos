@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/CDR.schema.json",
+  "title": "CDR",
+  "description": "Call Detail Record: the billable, attributable projection of a Call (Volumes 2 & 10).",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "call_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "organisation_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "cost_centre_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "department_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "user_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "identity_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "device_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "extension": { "type": "string" },
+    "did": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/E164" },
+    "carrier_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "duration_ms": { "type": "integer", "minimum": 0 },
+    "billable_ms": { "type": "integer", "minimum": 0 },
+    "cost": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Money" },
+    "codec": { "type": "string" },
+    "recording_object_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "transcript_object_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "tags": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["call_id", "organisation_id", "duration_ms", "billable_ms", "cost"]
+}

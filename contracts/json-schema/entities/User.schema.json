@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/User.schema.json",
+  "title": "User",
+  "description": "Human or service principal (Volume 2). Distinct from Identity, Device, Extension.",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "display_name": { "type": "string", "minLength": 1 },
+    "email": { "type": "string", "format": "email" },
+    "department_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "cost_centre_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "capabilities": { "type": "array", "items": { "type": "string" } },
+    "state": { "type": "string", "enum": ["INVITED", "ACTIVE", "SUSPENDED", "DEACTIVATED"] }
+  },
+  "required": ["display_name", "state"]
+}

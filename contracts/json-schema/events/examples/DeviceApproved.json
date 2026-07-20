@@ -1,0 +1,17 @@
+{
+  "id": "018f0a10-eeee-7eee-8eee-000000000004",
+  "specversion": "0.3",
+  "type": "DeviceApproved",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a10-4444-7444-8444-444444440001",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "DeviceApproved:018f0a10-4444-7444-8444-444444440001",
+  "sequence": 4,
+  "datacontenttype": "application/json",
+  "data": {
+    "device_id": "018f0a10-4444-7444-8444-444444440001",
+    "approved_by_user_id": "018f0a10-1111-7111-8111-111111110002"
+  }
+}

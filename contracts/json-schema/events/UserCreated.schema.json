@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/UserCreated.schema.json",
+  "title": "UserCreated",
+  "description": "CommOS canonical event 'UserCreated' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "UserCreated"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "INVITED"
+          ]
+        }
+      },
+      "required": [
+        "user_id",
+        "display_name",
+        "state"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}
