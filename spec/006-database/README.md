@@ -1,6 +1,6 @@
 # Volume 6 — Database & Logical Data Model
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** DB
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** DB
 
 This volume specifies the **logical** persistence model for the CommOS Control
 Plane: the relations, keys, constraints, isolation, partitioning, retention, and

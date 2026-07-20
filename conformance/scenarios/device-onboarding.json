@@ -1,0 +1,49 @@
+{
+  "name": "Zero-touch device onboarding",
+  "profile": "provisioning",
+  "entity": "Device",
+  "description": "A discovered phone is approved and provisioned over a signed URL, then registers.",
+  "requirement_ids": [
+    "CMOS-02-DOM-007",
+    "CMOS-08-PROV-001",
+    "CMOS-00-ENG-010"
+  ],
+  "steps": [
+    {
+      "from": "(none)",
+      "action": "discover",
+      "to": "PENDING",
+      "expect_event": "DeviceDetected"
+    },
+    {
+      "from": "PENDING",
+      "action": "approve",
+      "to": "APPROVED",
+      "expect_event": "DeviceApproved"
+    },
+    {
+      "from": "APPROVED",
+      "action": "provision",
+      "to": "PROVISIONED",
+      "expect_event": "ProvisioningFinished"
+    },
+    {
+      "from": "PROVISIONED",
+      "action": "register",
+      "to": "OPERATIONAL",
+      "expect_event": "RegistrationSucceeded"
+    }
+  ],
+  "illegal": [
+    {
+      "from": "PENDING",
+      "action": "provision",
+      "reason": "must be APPROVED before provisioning"
+    },
+    {
+      "from": "DETECTED",
+      "action": "register",
+      "reason": "not yet provisioned"
+    }
+  ]
+}

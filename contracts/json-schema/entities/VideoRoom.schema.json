@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/VideoRoom.schema.json",
+  "title": "VideoRoom",
+  "description": "CommOS domain entity 'VideoRoom' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "SFU",
+        "P2P"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "ENDED"
+      ]
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "mode",
+    "state"
+  ]
+}

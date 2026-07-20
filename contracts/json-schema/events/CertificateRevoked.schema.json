@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CertificateRevoked.schema.json",
+  "title": "CertificateRevoked",
+  "description": "CommOS canonical event 'CertificateRevoked' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CertificateRevoked"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "certificate_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "certificate_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

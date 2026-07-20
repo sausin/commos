@@ -1,0 +1,33 @@
+{
+  "description": "Rating engine output feeding the CDR (Volume 10).",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "cost": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Money"
+    },
+    "increment_ms": {
+      "type": "integer"
+    },
+    "minimum_ms": {
+      "type": "integer"
+    },
+    "rounding": {
+      "type": "string",
+      "enum": [
+        "UP",
+        "NEAREST",
+        "DOWN"
+      ]
+    }
+  },
+  "required": [
+    "call_id",
+    "cost"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/RatingResult.schema.json",
+  "title": "RatingResult"
+}

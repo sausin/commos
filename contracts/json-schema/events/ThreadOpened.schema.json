@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/ThreadOpened.schema.json",
+  "title": "ThreadOpened",
+  "description": "CommOS canonical event 'ThreadOpened' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "ThreadOpened"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "channel_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "thread_id",
+        "channel_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

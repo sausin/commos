@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Plugin.schema.json",
+  "title": "Plugin",
+  "description": "CommOS domain entity 'Plugin' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "plugin_version": {
+      "type": "string"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "resource_limits": {
+      "type": "object"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "INSTALLED",
+        "ENABLED",
+        "DISABLED",
+        "FAILED",
+        "UNINSTALLED"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "plugin_version",
+    "state"
+  ]
+}

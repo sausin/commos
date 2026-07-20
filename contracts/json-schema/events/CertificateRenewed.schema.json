@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CertificateRenewed.schema.json",
+  "title": "CertificateRenewed",
+  "description": "CommOS canonical event 'CertificateRenewed' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CertificateRenewed"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "certificate_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "certificate_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

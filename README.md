@@ -73,11 +73,13 @@ The harness is the arbiter of "does this conform." See [`conformance/README.md`]
 
 ## Status
 
-This is **v0.3** — the foundational spine is frozen (Philosophy, Domain, Events,
-API conventions, Architecture) and backed by machine-readable contracts and a
-running harness. The breadth volumes are structured and in progress. The complete
-target specification is expected to exceed 1,000 pages and is expanded
-volume-by-volume under version control. See the freeze-status matrix in
+This is **v0.4** — **contract-complete**. The foundational spine (Philosophy, Domain,
+Events, API, Architecture) is `FROZEN`; the remaining volumes are at `REVIEW`. Every
+domain entity (36) and canonical event (74) has a JSON Schema and validated example,
+the OpenAPI covers the full API surface (91 paths), the subsystem interfaces are
+typed (8), and a second workload (messaging/video/presence/contact-centre) is modelled
+alongside voice — proving the substrate is workload-general. The executable
+conformance harness runs 500+ checks (green). See the freeze-status matrix in
 [`spec/README.md`](spec/README.md).
 
 ## Licence

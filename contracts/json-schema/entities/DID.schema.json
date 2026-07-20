@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/DID.schema.json",
+  "title": "DID",
+  "description": "CommOS domain entity 'DID' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "e164": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/E164"
+    },
+    "carrier_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "destination_ref": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "e164",
+    "carrier_id",
+    "destination_ref"
+  ]
+}

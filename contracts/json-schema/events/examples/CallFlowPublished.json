@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-0405-7405-8405-000000000405",
+  "specversion": "0.3",
+  "type": "CallFlowPublished",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-033d-733d-833d-00000000033d",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "CallFlowPublished:129",
+  "sequence": 129,
+  "datacontenttype": "application/json",
+  "data": {
+    "call_flow_id": "018f0a30-0021-7021-8021-000000000021",
+    "published_version": 4
+  }
+}

@@ -1,6 +1,6 @@
 # Volume 2 — Domain Model
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** DOM
+**Status:** FROZEN · **Version:** 0.4.0 · **Subsystem tag:** DOM
 
 The domain model is the **keystone** of the specification. Every event payload
 (Volume 5) and every API body (Volume 4) is a projection of an entity defined here.
@@ -109,6 +109,20 @@ Full field lists in [`entities.md`](entities.md); schemas in `contracts/`.
 | **Plugin** | in Organisation/global | A WASM extension instance. |
 | **AuditEntry** | in Organisation | Append-only record of an action. |
 
+### Communication workloads (peers of voice)
+Full treatment in [`workloads.md`](workloads.md); these prove "voice is one workload"
+(CMOS-00-ENG-016). Each is tenant-scoped and reuses the shared substrate.
+
+| Entity | Workload | Purpose |
+|--------|----------|---------|
+| **Channel** | Messaging | A conversation space (chat/SMS/WhatsApp/email/internal). |
+| **Thread** | Messaging | A conversation within a Channel. |
+| **Message** | Messaging | A single message (body + Object attachments). |
+| **VideoRoom** | Video | An SFU/P2P multi-party video session. |
+| **Participant** | Video/Conference | A party in a session, with a role. |
+| **PresenceState** | Presence | A User's availability, feeding routing. |
+| **Agent** | Contact-centre | A User serving Queues, with skills/state. |
+
 ## 4. Cross-entity invariants
 
 - **CMOS-02-DOM-010** A **Call** MUST reference, at answer time, an owning
@@ -153,8 +167,9 @@ transition emits an event (Volume 5).
   and that example instances validate.
 
 ## 7. Open items
-- Messaging/Video workload entities (Message, Thread, VideoRoom) — reserved for v0.4.
-- IoT endpoint entity model — reserved.
+- Messaging/Video/Presence/Contact-centre workload entities — **added in v0.4**
+  ([`workloads.md`](workloads.md); schemas under `contracts/json-schema/entities`).
+- IoT endpoint entity model — reserved for a future workload.
 - Formal relational cardinalities move to Volume 6 (Database).
 
 ## Change log

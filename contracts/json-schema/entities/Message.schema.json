@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Message.schema.json",
+  "title": "Message",
+  "description": "CommOS domain entity 'Message' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "channel_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "thread_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "sender_ref": {
+      "type": "string"
+    },
+    "body": {
+      "type": "string"
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "SENT",
+        "DELIVERED",
+        "READ",
+        "FAILED"
+      ]
+    }
+  },
+  "required": [
+    "channel_id",
+    "sender_ref",
+    "state"
+  ]
+}

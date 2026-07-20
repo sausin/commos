@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Participant.schema.json",
+  "title": "Participant",
+  "description": "CommOS domain entity 'Participant' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "session_ref": {
+      "type": "string"
+    },
+    "identity_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "role": {
+      "type": "string",
+      "enum": [
+        "HOST",
+        "GUEST",
+        "AGENT",
+        "OBSERVER"
+      ]
+    },
+    "joined_at": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+    },
+    "left_at": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+    }
+  },
+  "required": [
+    "session_ref",
+    "role"
+  ]
+}

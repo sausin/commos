@@ -147,23 +147,32 @@ def suite_consistency(root: Path, sch_dir: Path, rep: Report):
         else:
             rep.fail(f"entity schema {name} has no example instance")
 
-    # OpenAPI parses (YAML if available, else structural sniff)
+    # OpenAPI parses (YAML if available, else structural sniff) + local $ref existence
     oapi = root / "contracts/openapi/commos.openapi.yaml"
     try:
         import yaml  # type: ignore
         doc = yaml.safe_load(oapi.read_text())
         if isinstance(doc, dict) and doc.get("openapi", "").startswith("3."):
-            rep.ok(f"OpenAPI parses and declares {doc['openapi']}")
+            rep.ok(f"OpenAPI parses and declares {doc['openapi']} ({len(doc.get('paths', {}))} paths)")
         else:
             rep.fail("OpenAPI document missing a 3.x 'openapi' version")
     except ImportError:
         head = oapi.read_text(4096)
-        if head.lstrip().startswith("openapi: 3."):
+        if head.lstrip().startswith(("openapi: 3.", "# ")):
             rep.note("pyyaml not installed; OpenAPI checked structurally only "
                      "(pip install pyyaml for full parse)")
             rep.ok("OpenAPI declares a 3.x version (structural check)")
         else:
             rep.fail("OpenAPI does not start with 'openapi: 3.'")
+    # every ../json-schema/... $ref in the OpenAPI must resolve to a real file
+    oapi_text = oapi.read_text()
+    refs = sorted(set(re.findall(r"\.\./json-schema/[^'\"\s}]+\.json", oapi_text)))
+    bad = [r for r in refs if not (oapi.parent / r).resolve().exists()]
+    if bad:
+        for r in bad:
+            rep.fail(f"OpenAPI $ref does not resolve: {r}")
+    else:
+        rep.ok(f"all {len(refs)} OpenAPI schema $refs resolve to files")
 
 
 # --------------------------------------------------------------- suite 3 ------
@@ -182,22 +191,53 @@ def _validate_instance(schema_path: Path, instance_path: Path, registry: Registr
 
 def suite_examples_valid(sch_dir: Path, registry: Registry, rep: Report):
     print("\n[3] examples-valid")
-    # events
-    ev_dir = sch_dir / "events"
-    for ex in sorted((ev_dir / "examples").glob("*.json")):
-        schema = ev_dir / f"{ex.stem}.schema.json"
-        if schema.exists():
-            _validate_instance(schema, ex, registry, rep, "event")
+    # any contract dir with an examples/ subfolder: validate each example against
+    # its sibling schema. Covers entities, events, and interfaces uniformly.
+    example_dirs = sorted(p.parent for p in sch_dir.rglob("examples") if p.is_dir())
+    for ex_dir in example_dirs:
+        label = ex_dir.name.rstrip("s") or ex_dir.name
+        for ex in sorted((ex_dir / "examples").glob("*.json")):
+            schema = ex_dir / f"{ex.stem}.schema.json"
+            if schema.exists():
+                _validate_instance(schema, ex, registry, rep, label)
+            else:
+                rep.fail(f"{label} example {ex.name} has no matching schema")
+
+
+# --------------------------------------------------------------- suite 4 ------
+def suite_scenarios(root: Path, sch_dir: Path, registry: Registry, rep: Report):
+    """Validate L2 behavioural scenarios structurally and cross-check that every
+    `expect_event` names a real, schema-backed event (Volume 16)."""
+    print("\n[4] behavioural-scenarios (L2 definitions)")
+    scen_dir = root / "conformance/scenarios"
+    schema_path = scen_dir / "scenario.schema.json"
+    if not schema_path.exists():
+        rep.note("no scenario schema; skipping L2 scenario checks")
+        return
+    scen_schema = load_json(schema_path)
+    validator = Draft202012Validator(scen_schema, registry=registry)
+    known_events = {p.stem.replace(".schema", "")
+                    for p in (sch_dir / "events").glob("*.schema.json")}
+    files = sorted(p for p in scen_dir.glob("*.json") if p.name != "scenario.schema.json")
+    if not files:
+        rep.note("no scenarios defined yet")
+        return
+    for sf in files:
+        scen = load_json(sf)
+        errors = sorted(validator.iter_errors(scen), key=lambda e: list(e.path))
+        if errors:
+            for e in errors:
+                loc = "/".join(str(x) for x in e.path) or "(root)"
+                rep.fail(f"scenario {sf.name}: {loc}: {e.message}")
+            continue
+        # every expected event must be a real, catalogued event
+        unknown = sorted({s["expect_event"] for s in scen["steps"]
+                          if s["expect_event"] not in known_events})
+        if unknown:
+            rep.fail(f"scenario {sf.name}: unknown expect_event(s): {', '.join(unknown)}")
         else:
-            rep.fail(f"event example {ex.name} has no matching schema")
-    # entities
-    ent_dir = sch_dir / "entities"
-    for ex in sorted((ent_dir / "examples").glob("*.json")):
-        schema = ent_dir / f"{ex.stem}.schema.json"
-        if schema.exists():
-            _validate_instance(schema, ex, registry, rep, "entity")
-        else:
-            rep.fail(f"entity example {ex.name} has no matching schema")
+            rep.ok(f"scenario {sf.name} valid ({len(scen['steps'])} steps, "
+                   f"{len(scen.get('illegal', []))} illegal-transition assertions)")
 
 
 # ------------------------------------------------------------------ main ------
@@ -221,6 +261,7 @@ def main() -> int:
     suite_schema_validity(sch_dir, schema_files, registry, rep)
     suite_consistency(root, sch_dir, rep)
     suite_examples_valid(sch_dir, registry, rep)
+    suite_scenarios(root, sch_dir, registry, rep)
 
     print("\n" + "=" * 60)
     print(f"PASS: {rep.passed}   FAIL: {len(rep.failures)}   NOTE: {len(rep.notes)}")

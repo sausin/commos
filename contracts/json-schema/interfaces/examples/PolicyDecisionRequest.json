@@ -1,0 +1,20 @@
+{
+  "request_id": "018f0a40-0004-7004-8004-000000000004",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "action": "call.dial",
+  "subject": {
+    "user_id": "018f0a40-0001-7001-8001-000000000001",
+    "identity_id": "018f0a40-0002-7002-8002-000000000002",
+    "assurance_level": "HIGH",
+    "capabilities": [
+      "calls.originate"
+    ]
+  },
+  "resource": {
+    "destination": "+441632960001"
+  },
+  "context": {
+    "emergency": false,
+    "destination_class": "INTERNATIONAL"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Conference.schema.json",
+  "title": "Conference",
+  "description": "CommOS domain entity 'Conference' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "ENDED"
+      ]
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "state"
+  ]
+}

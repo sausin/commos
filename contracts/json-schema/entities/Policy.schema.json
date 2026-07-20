@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Policy.schema.json",
+  "title": "Policy",
+  "description": "CommOS domain entity 'Policy' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "subject": {
+      "type": "string"
+    },
+    "effect": {
+      "type": "string",
+      "enum": [
+        "ALLOW",
+        "DENY",
+        "REQUIRE_IDENTITY",
+        "REQUIRE_APPROVAL"
+      ]
+    },
+    "conditions": {
+      "type": "object"
+    },
+    "priority": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "subject",
+    "effect"
+  ]
+}

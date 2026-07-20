@@ -1,6 +1,6 @@
 # Volume 8 — Provisioning
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** PROV
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** PROV
 
 Zero-touch device provisioning is the feature that most directly proves the prime
 directive (CMOS-00-ENG-001): an operator plugs a phone into a switch port and, within

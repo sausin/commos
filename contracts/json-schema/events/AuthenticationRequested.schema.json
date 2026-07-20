@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/AuthenticationRequested.schema.json",
+  "title": "AuthenticationRequested",
+  "description": "CommOS canonical event 'AuthenticationRequested' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "AuthenticationRequested"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "method": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

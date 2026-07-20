@@ -1,6 +1,6 @@
 # Volume 13 — User Interface
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** UI
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** UI
 
 The administrative and operational UI is the human-facing embodiment of the
 constitution's operability mandate (CMOS-00-ENG-001) and progressive-complexity

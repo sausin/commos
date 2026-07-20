@@ -1,6 +1,6 @@
 # Volume 19 — Architectural Decision Records
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** (governance)
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** (governance)
 
 Every significant decision is recorded here so future contributors do not unknowingly
 re-open settled questions — and so that when a decision *should* be reopened, the

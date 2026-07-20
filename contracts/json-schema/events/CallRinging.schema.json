@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallRinging.schema.json",
+  "title": "CallRinging",
+  "description": "CommOS canonical event 'CallRinging' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallRinging"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "call_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

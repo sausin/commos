@@ -1,6 +1,6 @@
 # Volume 12 — Plugin SDK
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** PLUG
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** PLUG
 
 CommOS is extended by **WASM plugins** run in a Wasmtime-class sandbox. A plugin is
 untrusted, capability-scoped code that the **host** loads to implement a well-defined

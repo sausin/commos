@@ -1,6 +1,6 @@
 # Volume 1 — Product Requirements
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** PRD
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** PRD
 
 This volume states *what* the product does and *for whom*, as personas, epics, and
 measurable acceptance criteria. It is subordinate to Volume 0 (Philosophy): every
@@ -128,10 +128,14 @@ Performance (Volume 17), security (Volume 9), observability (Volume 15), and
 upgradeability (Volume 14) requirements apply to every epic above. Where an AC cites
 a numeric target, the number is normative and owned by the referenced volume.
 
-## 5. Out of scope (this version)
-Messaging, video, and contact-centre epics are sketched but their entities/flows are
-reserved for v0.4+ (see Volume 2 Open items). This volume currently freezes the voice
-+ platform surface.
+## 5. Scope of workloads
+The voice workload is fully specified here. As of v0.4 the **messaging, video,
+presence, and contact-centre workloads** are modelled in the domain and event
+contracts (Volume 2 [`workloads.md`](../002-domain-model/workloads.md);
+`contracts/json-schema`) and validated by the harness, proving the substrate is
+workload-general (CMOS-00-ENG-016). Their full *product* epics (detailed UX, SLAs,
+supervisor tooling) build on that base and are elaborated incrementally; the
+entity/event/API contracts they depend on are already frozen.
 
 ## 6. Conformance notes
 Each AC maps to one or more Volume 16 conformance scenarios; the scenario cites the

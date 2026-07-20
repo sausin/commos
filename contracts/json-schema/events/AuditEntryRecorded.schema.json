@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/AuditEntryRecorded.schema.json",
+  "title": "AuditEntryRecorded",
+  "description": "CommOS canonical event 'AuditEntryRecorded' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "AuditEntryRecorded"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "audit_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "action": {
+          "type": "string"
+        },
+        "actor_ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "audit_id",
+        "action"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

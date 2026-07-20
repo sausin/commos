@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Channel.schema.json",
+  "title": "Channel",
+  "description": "CommOS domain entity 'Channel' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "CHAT",
+        "SMS",
+        "WHATSAPP",
+        "EMAIL",
+        "INTERNAL"
+      ]
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "ARCHIVED"
+      ]
+    }
+  },
+  "required": [
+    "kind",
+    "state"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "description": "A typed fact reported by the media plane to the control plane (media-quality, signalling state). Facts are the source of the Volume 5 media/call events.",
+  "type": "object",
+  "properties": {
+    "fact_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "correlation_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "observed_at": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "RINGING",
+        "ANSWERED",
+        "ENDED",
+        "MEDIA_QUALITY",
+        "REGISTRATION_STATE",
+        "DTMF"
+      ]
+    },
+    "subject_ref": {
+      "type": "string"
+    },
+    "detail": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "fact_id",
+    "correlation_id",
+    "kind",
+    "subject_ref"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/ControlMediaFact.schema.json",
+  "title": "ControlMediaFact"
+}

@@ -4,20 +4,26 @@ These artifacts are **normative** (CONVENTIONS §8). They are the source of trut
 the *shape* of every entity, event, and API message. The prose in `spec/` is the
 source of *meaning*; where they disagree about shape, the contract wins.
 
+As of v0.4 the contract set is **complete**: every domain entity (Volume 2) and every
+catalogued event (Volume 5) has a schema and a validated example, the API surface
+(Volume 4) is fully covered, and the subsystem interfaces are typed.
+
 ```
 contracts/
 ├── json-schema/
 │   ├── common.schema.json          # shared $defs: Uuid, Timestamp, Money, EntityBase…
 │   ├── envelope.schema.json        # the canonical event envelope (Volume 5 §2)
-│   ├── entities/                   # one schema per domain entity (Volume 2)
-│   │   ├── Organisation.schema.json  User.schema.json  Identity.schema.json
-│   │   ├── Device.schema.json  Call.schema.json  Object.schema.json  CDR.schema.json
-│   └── events/                     # one schema per canonical event (Volume 5)
-│       ├── <EventName>.schema.json # allOf envelope + type const + typed `data`
-│       └── examples/               # a valid example instance per event
+│   ├── entities/                   # 36 schemas — every domain entity (Volume 2)
+│   │   └── examples/               #   a valid example instance per entity
+│   ├── events/                     # 74 schemas — every canonical event (Volume 5)
+│   │   └── examples/               #   a valid example instance per event
+│   └── interfaces/                 # 8 typed subsystem interfaces (control↔media,
+│       └── examples/               #   Provisioner ABI, Policy, Rating) + examples
 └── openapi/
-    └── commos.openapi.yaml         # the API surface (Volume 4)
+    └── commos.openapi.yaml         # 91 paths — the full API surface (Volume 4)
 ```
+
+Counts are asserted by the conformance harness, not hand-maintained; run it to verify.
 
 ## Conventions
 
@@ -29,6 +35,8 @@ contracts/
   `{currency, minor_units}`.
 - Event schemas are `allOf [envelope]` with a `type` const and a typed `data`
   payload; each has a matching example under `events/examples/`.
+- Any contract directory with an `examples/` subfolder has every example validated
+  against its sibling schema by the harness (entities, events, interfaces alike).
 
 ## Freeze rule
 

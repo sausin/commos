@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/PluginEnabled.schema.json",
+  "title": "PluginEnabled",
+  "description": "CommOS canonical event 'PluginEnabled' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "PluginEnabled"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "plugin_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

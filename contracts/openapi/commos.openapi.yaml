@@ -1,182 +1,3179 @@
+# CommOS API — generated OpenAPI 3.1 (Volume 4). Source of shape for API messages.
 openapi: 3.1.0
 info:
   title: CommOS API
-  version: 0.3.0
-  description: >
-    The CommOS control-plane API (Volume 4). Every capability of the platform is
-    available here; the UI, CLI, mobile app, and Terraform provider are clients of
-    this same API (CMOS-00-ENG-003). This document is a skeleton for v0.3: it fixes
-    conventions and the core resource surface. Entity/event shapes are defined in
-    ../json-schema and referenced here.
+  version: 0.4.0
+  description: The CommOS control-plane API (Volume 4). Every platform capability is available here; UI,
+    CLI, mobile, and Terraform are clients of this same API (CMOS-00-ENG-003). Entity/event shapes live
+    in ../json-schema and are referenced by $ref.
   license:
     name: TBD (see ADR-0009)
 servers:
-  - url: https://{host}/v1
-    variables:
-      host: { default: pbx.example.com }
-
-# ---- Cross-cutting conventions (normative; Volume 4) ----------------------------
+- url: https://{host}/v1
+  variables:
+    host:
+      default: pbx.example.com
 security:
-  - bearerAuth: []
-  - apiKey: []
-
+- bearerAuth: []
+- apiKey: []
 tags:
-  - { name: people, description: Organisations, users, identities }
-  - { name: devices, description: Device lifecycle & provisioning }
-  - { name: routing, description: Routes, call flows, calls }
-  - { name: billing, description: CDRs and exports }
-  - { name: integration, description: Webhooks, automations, AI jobs, plugins }
-  - { name: stream, description: Real-time events }
-
+- name: people
+- name: devices
+- name: numbering
+- name: routing
+- name: media
+- name: billing
+- name: integration
+- name: security
+- name: messaging
+- name: stream
 paths:
-  /users:
+  /organisations:
     get:
-      tags: [people]
-      operationId: listUsers
-      summary: List users (cursor-paginated)
+      tags:
+      - people
+      operationId: list_organisations
+      summary: List organisations (cursor-paginated). Capability org.manage.
       parameters:
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
       responses:
-        '200': { $ref: '#/components/responses/UserPage' }
-        default: { $ref: '#/components/responses/Problem' }
-    post:
-      tags: [people]
-      operationId: createUser
-      summary: Create (invite) a user — emits UserCreated
-      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '../json-schema/entities/User.schema.json' }
-      responses:
-        '201': { $ref: '#/components/responses/User' }
-        default: { $ref: '#/components/responses/Problem' }
-
-  /users/{id}:
-    parameters: [ { $ref: '#/components/parameters/Id' } ]
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Organisation.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: &id001
+          $ref: '#/components/responses/Problem'
+  /organisations/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
     get:
-      tags: [people]
-      operationId: getUser
+      tags:
+      - people
+      operationId: get_organisations
       responses:
-        '200': { $ref: '#/components/responses/User' }
-        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Organisation.schema.json
+        default: *id001
     patch:
-      tags: [people]
-      operationId: updateUser
+      tags:
+      - people
+      operationId: update_organisations
       description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
-      parameters: [ { $ref: '#/components/parameters/IfMatch' } ]
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
       requestBody:
         required: true
         content:
           application/merge-patch+json:
-            schema: { type: object }
+            schema:
+              type: object
       responses:
-        '200': { $ref: '#/components/responses/User' }
-        '412': { $ref: '#/components/responses/Problem' }
-        default: { $ref: '#/components/responses/Problem' }
-
-  /identities:authenticate:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Organisation.schema.json
+        '412': *id001
+        default: *id001
+  /users:
+    get:
+      tags:
+      - people
+      operationId: list_users
+      summary: List users (cursor-paginated). Capability users.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/User.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
     post:
-      tags: [people]
-      operationId: authenticateIdentity
-      summary: Authenticate an identity — emits AuthenticationSucceeded/Failed, IdentityAuthenticated
+      tags:
+      - people
+      operationId: create_users
+      summary: Create user. Capability users.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                user_id: { type: string }
-                device_id: { type: string }
-                method: { type: string, enum: [PIN, RFID, NFC, QR, BLUETOOTH, FIDO2, PROXIMITY, FACE, SSO, OIDC, SAML, LDAP] }
-                credential: { type: string, description: Method-specific secret; never logged/echoed }
-              required: [method]
+              $ref: ../json-schema/entities/User.schema.json
       responses:
-        '201': { description: Identity established, content: { application/json: { schema: { $ref: '../json-schema/entities/Identity.schema.json' } } } }
-        '401': { $ref: '#/components/responses/Problem' }
-        default: { $ref: '#/components/responses/Problem' }
-
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/User.schema.json
+        default: *id001
+  /users/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - people
+      operationId: get_users
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/User.schema.json
+        default: *id001
+    patch:
+      tags:
+      - people
+      operationId: update_users
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/User.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - people
+      operationId: delete_users
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /users/{id}:grant:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - people
+      operationId: grant_users
+      summary: grant action on user (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/User.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /users/{id}:revoke:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - people
+      operationId: revoke_users
+      summary: revoke action on user (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/User.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /departments:
+    get:
+      tags:
+      - people
+      operationId: list_departments
+      summary: List departments (cursor-paginated). Capability org.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Department.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - people
+      operationId: create_departments
+      summary: Create department. Capability org.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Department.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Department.schema.json
+        default: *id001
+  /departments/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - people
+      operationId: get_departments
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Department.schema.json
+        default: *id001
+    patch:
+      tags:
+      - people
+      operationId: update_departments
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Department.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - people
+      operationId: delete_departments
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /cost-centres:
+    get:
+      tags:
+      - people
+      operationId: list_cost_centres
+      summary: List cost-centres (cursor-paginated). Capability billing.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/CostCentre.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - people
+      operationId: create_cost_centres
+      summary: Create cost-centre. Capability billing.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/CostCentre.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CostCentre.schema.json
+        default: *id001
+  /cost-centres/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - people
+      operationId: get_cost_centres
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CostCentre.schema.json
+        default: *id001
+    patch:
+      tags:
+      - people
+      operationId: update_cost_centres
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CostCentre.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - people
+      operationId: delete_cost_centres
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /capabilities:
+    get:
+      tags:
+      - people
+      operationId: list_capabilities
+      summary: List capabilities (cursor-paginated). Capability iam.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Capability.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - people
+      operationId: create_capabilities
+      summary: Create capabilitie. Capability iam.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Capability.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Capability.schema.json
+        default: *id001
+  /capabilities/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - people
+      operationId: get_capabilities
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Capability.schema.json
+        default: *id001
+    patch:
+      tags:
+      - people
+      operationId: update_capabilities
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Capability.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - people
+      operationId: delete_capabilities
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /policies:
+    get:
+      tags:
+      - people
+      operationId: list_policies
+      summary: List policies (cursor-paginated). Capability policy.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Policy.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - people
+      operationId: create_policies
+      summary: Create policie. Capability policy.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Policy.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Policy.schema.json
+        default: *id001
+  /policies/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - people
+      operationId: get_policies
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Policy.schema.json
+        default: *id001
+    patch:
+      tags:
+      - people
+      operationId: update_policies
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Policy.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - people
+      operationId: delete_policies
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
   /devices:
     get:
-      tags: [devices]
-      operationId: listDevices
+      tags:
+      - devices
+      operationId: list_devices
+      summary: List devices (cursor-paginated). Capability provision.devices.
       parameters:
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
-        - { name: state, in: query, schema: { type: string } }
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
       responses:
-        '200': { description: Page of devices, content: { application/json: { schema: { $ref: '#/components/schemas/DevicePage' } } } }
-        default: { $ref: '#/components/responses/Problem' }
-
-  /devices/{id}:approve:
-    parameters: [ { $ref: '#/components/parameters/Id' } ]
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Device.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
     post:
-      tags: [devices]
-      operationId: approveDevice
-      summary: Approve a detected device — emits DeviceApproved. Capability provision.devices.
-      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
-      responses:
-        '200': { description: Device approved, content: { application/json: { schema: { $ref: '../json-schema/entities/Device.schema.json' } } } }
-        '403': { $ref: '#/components/responses/Problem' }
-        default: { $ref: '#/components/responses/Problem' }
-
-  /calls:
-    post:
-      tags: [routing]
-      operationId: originateCall
-      summary: Originate a call — emits CallStarted. Capability calls.originate.
-      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      tags:
+      - devices
+      operationId: create_devices
+      summary: Create device. Capability provision.devices.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
           application/json:
             schema:
+              $ref: ../json-schema/entities/Device.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        default: *id001
+  /devices/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - devices
+      operationId: get_devices
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        default: *id001
+    patch:
+      tags:
+      - devices
+      operationId: update_devices
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
               type: object
-              properties:
-                from_ref: { type: string }
-                to_ref: { type: string }
-                device_id: { type: string }
-              required: [from_ref, to_ref]
       responses:
-        '201': { description: Call created, content: { application/json: { schema: { $ref: '../json-schema/entities/Call.schema.json' } } } }
-        default: { $ref: '#/components/responses/Problem' }
-
-  /calls/{id}:hangup:
-    parameters: [ { $ref: '#/components/parameters/Id' } ]
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - devices
+      operationId: delete_devices
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /devices/{id}:approve:
+    parameters:
+    - $ref: '#/components/parameters/Id'
     post:
-      tags: [routing]
-      operationId: hangupCall
-      summary: End a call — emits CallEnded. Capability calls.control.
+      tags:
+      - devices
+      operationId: approve_devices
+      summary: approve action on device (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
       responses:
-        '202': { description: Hangup accepted }
-        default: { $ref: '#/components/responses/Problem' }
-
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /devices/{id}:reject:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - devices
+      operationId: reject_devices
+      summary: reject action on device (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /devices/{id}:provision:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - devices
+      operationId: provision_devices
+      summary: provision action on device (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /devices/{id}:replace:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - devices
+      operationId: replace_devices
+      summary: replace action on device (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /devices/{id}:retire:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - devices
+      operationId: retire_devices
+      summary: retire action on device (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Device.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /extensions:
+    get:
+      tags:
+      - numbering
+      operationId: list_extensions
+      summary: List extensions (cursor-paginated). Capability numbering.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Extension.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - numbering
+      operationId: create_extensions
+      summary: Create extension. Capability numbering.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Extension.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Extension.schema.json
+        default: *id001
+  /extensions/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - numbering
+      operationId: get_extensions
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Extension.schema.json
+        default: *id001
+    patch:
+      tags:
+      - numbering
+      operationId: update_extensions
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Extension.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - numbering
+      operationId: delete_extensions
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /dids:
+    get:
+      tags:
+      - numbering
+      operationId: list_dids
+      summary: List dids (cursor-paginated). Capability numbering.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/DID.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - numbering
+      operationId: create_dids
+      summary: Create did. Capability numbering.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/DID.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/DID.schema.json
+        default: *id001
+  /dids/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - numbering
+      operationId: get_dids
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/DID.schema.json
+        default: *id001
+    patch:
+      tags:
+      - numbering
+      operationId: update_dids
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/DID.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - numbering
+      operationId: delete_dids
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /carriers:
+    get:
+      tags:
+      - numbering
+      operationId: list_carriers
+      summary: List carriers (cursor-paginated). Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Carrier.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - numbering
+      operationId: create_carriers
+      summary: Create carrier. Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Carrier.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Carrier.schema.json
+        default: *id001
+  /carriers/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - numbering
+      operationId: get_carriers
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Carrier.schema.json
+        default: *id001
+    patch:
+      tags:
+      - numbering
+      operationId: update_carriers
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Carrier.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - numbering
+      operationId: delete_carriers
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /gateways:
+    get:
+      tags:
+      - numbering
+      operationId: list_gateways
+      summary: List gateways (cursor-paginated). Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Gateway.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - numbering
+      operationId: create_gateways
+      summary: Create gateway. Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Gateway.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Gateway.schema.json
+        default: *id001
+  /gateways/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - numbering
+      operationId: get_gateways
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Gateway.schema.json
+        default: *id001
+    patch:
+      tags:
+      - numbering
+      operationId: update_gateways
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Gateway.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - numbering
+      operationId: delete_gateways
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /trunks:
+    get:
+      tags:
+      - numbering
+      operationId: list_trunks
+      summary: List trunks (cursor-paginated). Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Trunk.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - numbering
+      operationId: create_trunks
+      summary: Create trunk. Capability carriers.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Trunk.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Trunk.schema.json
+        default: *id001
+  /trunks/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - numbering
+      operationId: get_trunks
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Trunk.schema.json
+        default: *id001
+    patch:
+      tags:
+      - numbering
+      operationId: update_trunks
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Trunk.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - numbering
+      operationId: delete_trunks
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /routes:
+    get:
+      tags:
+      - routing
+      operationId: list_routes
+      summary: List routes (cursor-paginated). Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Route.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_routes
+      summary: Create route. Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Route.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Route.schema.json
+        default: *id001
+  /routes/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_routes
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Route.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_routes
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Route.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_routes
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /call-flows:
+    get:
+      tags:
+      - routing
+      operationId: list_call_flows
+      summary: List call-flows (cursor-paginated). Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/CallFlow.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_call_flows
+      summary: Create call-flow. Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/CallFlow.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CallFlow.schema.json
+        default: *id001
+  /call-flows/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_call_flows
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CallFlow.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_call_flows
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CallFlow.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_call_flows
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /call-flows/{id}:publish:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: publish_call_flows
+      summary: publish action on call-flow (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CallFlow.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /ivrs:
+    get:
+      tags:
+      - routing
+      operationId: list_ivrs
+      summary: List ivrs (cursor-paginated). Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/IVR.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_ivrs
+      summary: Create ivr. Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/IVR.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/IVR.schema.json
+        default: *id001
+  /ivrs/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_ivrs
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/IVR.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_ivrs
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/IVR.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_ivrs
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /queues:
+    get:
+      tags:
+      - routing
+      operationId: list_queues
+      summary: List queues (cursor-paginated). Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Queue.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_queues
+      summary: Create queue. Capability routing.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Queue.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Queue.schema.json
+        default: *id001
+  /queues/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_queues
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Queue.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_queues
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Queue.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_queues
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /calls:
+    get:
+      tags:
+      - routing
+      operationId: list_calls
+      summary: List calls (cursor-paginated). Capability calls.view.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Call.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_calls
+      summary: Create call. Capability calls.view.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Call.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        default: *id001
+  /calls/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_calls
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_calls
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_calls
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /calls/{id}:transfer:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: transfer_calls
+      summary: transfer action on call (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /calls/{id}:hold:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: hold_calls
+      summary: hold action on call (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /calls/{id}:resume:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: resume_calls
+      summary: resume action on call (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /calls/{id}:hangup:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: hangup_calls
+      summary: hangup action on call (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Call.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /conferences:
+    get:
+      tags:
+      - routing
+      operationId: list_conferences
+      summary: List conferences (cursor-paginated). Capability conf.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Conference.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - routing
+      operationId: create_conferences
+      summary: Create conference. Capability conf.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Conference.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Conference.schema.json
+        default: *id001
+  /conferences/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - routing
+      operationId: get_conferences
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Conference.schema.json
+        default: *id001
+    patch:
+      tags:
+      - routing
+      operationId: update_conferences
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Conference.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - routing
+      operationId: delete_conferences
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /conferences/{id}:invite:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - routing
+      operationId: invite_conferences
+      summary: invite action on conference (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Conference.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /recordings:
+    get:
+      tags:
+      - media
+      operationId: list_recordings
+      summary: List recordings (cursor-paginated). Capability recordings.view.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Recording.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+  /recordings/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - media
+      operationId: get_recordings
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Recording.schema.json
+        default: *id001
+  /voicemails:
+    get:
+      tags:
+      - media
+      operationId: list_voicemails
+      summary: List voicemails (cursor-paginated). Capability voicemail.view.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Voicemail.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+  /voicemails/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - media
+      operationId: get_voicemails
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Voicemail.schema.json
+        default: *id001
+  /objects:
+    get:
+      tags:
+      - media
+      operationId: list_objects
+      summary: List objects (cursor-paginated). Capability objects.rw.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Object.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - media
+      operationId: create_objects
+      summary: Create object. Capability objects.rw.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Object.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Object.schema.json
+        default: *id001
+  /objects/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - media
+      operationId: get_objects
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Object.schema.json
+        default: *id001
+    patch:
+      tags:
+      - media
+      operationId: update_objects
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Object.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - media
+      operationId: delete_objects
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
   /cdrs:
     get:
-      tags: [billing]
-      operationId: listCdrs
-      summary: List call detail records. Capability billing.view.
+      tags:
+      - billing
+      operationId: list_cdrs
+      summary: List cdrs (cursor-paginated). Capability billing.view.
       parameters:
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
       responses:
-        '200': { description: Page of CDRs, content: { application/json: { schema: { $ref: '#/components/schemas/CdrPage' } } } }
-        default: { $ref: '#/components/responses/Problem' }
-
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/CDR.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+  /cdrs/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - billing
+      operationId: get_cdrs
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/CDR.schema.json
+        default: *id001
   /webhooks:
     get:
-      tags: [integration]
-      operationId: listWebhooks
+      tags:
+      - integration
+      operationId: list_webhooks
+      summary: List webhooks (cursor-paginated). Capability integrations.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
       responses:
-        '200': { description: Webhooks }
-        default: { $ref: '#/components/responses/Problem' }
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Webhook.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
     post:
-      tags: [integration]
-      operationId: createWebhook
-      summary: Register an event subscription. Capability integrations.manage.
+      tags:
+      - integration
+      operationId: create_webhooks
+      summary: Create webhook. Capability integrations.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Webhook.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Webhook.schema.json
+        default: *id001
+  /webhooks/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - integration
+      operationId: get_webhooks
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Webhook.schema.json
+        default: *id001
+    patch:
+      tags:
+      - integration
+      operationId: update_webhooks
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Webhook.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - integration
+      operationId: delete_webhooks
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /automations:
+    get:
+      tags:
+      - integration
+      operationId: list_automations
+      summary: List automations (cursor-paginated). Capability integrations.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Automation.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - integration
+      operationId: create_automations
+      summary: Create automation. Capability integrations.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Automation.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Automation.schema.json
+        default: *id001
+  /automations/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - integration
+      operationId: get_automations
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Automation.schema.json
+        default: *id001
+    patch:
+      tags:
+      - integration
+      operationId: update_automations
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Automation.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - integration
+      operationId: delete_automations
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /plugins:
+    get:
+      tags:
+      - integration
+      operationId: list_plugins
+      summary: List plugins (cursor-paginated). Capability plugins.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Plugin.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - integration
+      operationId: create_plugins
+      summary: Create plugin. Capability plugins.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Plugin.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Plugin.schema.json
+        default: *id001
+  /plugins/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - integration
+      operationId: get_plugins
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Plugin.schema.json
+        default: *id001
+    patch:
+      tags:
+      - integration
+      operationId: update_plugins
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Plugin.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - integration
+      operationId: delete_plugins
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /plugins/{id}:enable:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - integration
+      operationId: enable_plugins
+      summary: enable action on plugin (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Plugin.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /plugins/{id}:disable:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - integration
+      operationId: disable_plugins
+      summary: disable action on plugin (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Plugin.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /audit:
+    get:
+      tags:
+      - integration
+      operationId: list_audit
+      summary: List audit (cursor-paginated). Capability audit.view.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/AuditEntry.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+  /audit/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - integration
+      operationId: get_audit
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/AuditEntry.schema.json
+        default: *id001
+  /channels:
+    get:
+      tags:
+      - messaging
+      operationId: list_channels
+      summary: List channels (cursor-paginated). Capability messaging.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Channel.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - messaging
+      operationId: create_channels
+      summary: Create channel. Capability messaging.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Channel.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Channel.schema.json
+        default: *id001
+  /channels/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_channels
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Channel.schema.json
+        default: *id001
+    patch:
+      tags:
+      - messaging
+      operationId: update_channels
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Channel.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - messaging
+      operationId: delete_channels
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /threads:
+    get:
+      tags:
+      - messaging
+      operationId: list_threads
+      summary: List threads (cursor-paginated). Capability messaging.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Thread.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - messaging
+      operationId: create_threads
+      summary: Create thread. Capability messaging.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Thread.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Thread.schema.json
+        default: *id001
+  /threads/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_threads
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Thread.schema.json
+        default: *id001
+    patch:
+      tags:
+      - messaging
+      operationId: update_threads
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Thread.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - messaging
+      operationId: delete_threads
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /threads/{id}:close:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - messaging
+      operationId: close_threads
+      summary: close action on thread (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Thread.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /messages:
+    get:
+      tags:
+      - messaging
+      operationId: list_messages
+      summary: List messages (cursor-paginated). Capability messaging.send.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Message.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - messaging
+      operationId: create_messages
+      summary: Create message. Capability messaging.send.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Message.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Message.schema.json
+        default: *id001
+  /messages/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_messages
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Message.schema.json
+        default: *id001
+    patch:
+      tags:
+      - messaging
+      operationId: update_messages
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Message.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - messaging
+      operationId: delete_messages
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /video-rooms:
+    get:
+      tags:
+      - messaging
+      operationId: list_video_rooms
+      summary: List video-rooms (cursor-paginated). Capability video.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/VideoRoom.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - messaging
+      operationId: create_video_rooms
+      summary: Create video-room. Capability video.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/VideoRoom.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/VideoRoom.schema.json
+        default: *id001
+  /video-rooms/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_video_rooms
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/VideoRoom.schema.json
+        default: *id001
+    patch:
+      tags:
+      - messaging
+      operationId: update_video_rooms
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/VideoRoom.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - messaging
+      operationId: delete_video_rooms
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /video-rooms/{id}:end:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    post:
+      tags:
+      - messaging
+      operationId: end_video_rooms
+      summary: end action on video-room (emits the corresponding event).
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/VideoRoom.schema.json
+        '202':
+          description: accepted
+        '403': *id001
+        default: *id001
+  /presence:
+    get:
+      tags:
+      - messaging
+      operationId: list_presence
+      summary: List presence (cursor-paginated). Capability presence.view.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/PresenceState.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+  /presence/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_presence
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/PresenceState.schema.json
+        default: *id001
+  /agents:
+    get:
+      tags:
+      - messaging
+      operationId: list_agents
+      summary: List agents (cursor-paginated). Capability cc.manage.
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/Agent.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - messaging
+      operationId: create_agents
+      summary: Create agent. Capability cc.manage.
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/Agent.schema.json
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Agent.schema.json
+        default: *id001
+  /agents/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - messaging
+      operationId: get_agents
+      responses:
+        '200':
+          description: item
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Agent.schema.json
+        default: *id001
+    patch:
+      tags:
+      - messaging
+      operationId: update_agents
+      description: JSON Merge Patch (RFC 7386). Requires If-Match with the entity version.
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: updated
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Agent.schema.json
+        '412': *id001
+        default: *id001
+    delete:
+      tags:
+      - messaging
+      operationId: delete_agents
+      description: Transition to a terminal state (not a hard delete; CMOS-02-DOM-003).
+      responses:
+        '204':
+          description: deleted (soft)
+        default: *id001
+  /identities:authenticate:
+    post:
+      tags:
+      - people
+      operationId: authenticate_identity
+      summary: "Authenticate an identity \u2014 emits AuthenticationSucceeded/Failed, IdentityAuthenticated."
       requestBody:
         required: true
         content:
@@ -184,100 +3181,248 @@ paths:
             schema:
               type: object
               properties:
-                url: { type: string, format: uri }
-                event_types: { type: array, items: { type: string } }
-              required: [url, event_types]
+                user_id:
+                  type: string
+                device_id:
+                  type: string
+                method:
+                  type: string
+                credential:
+                  type: string
+                  description: never logged/echoed
+              required:
+              - method
       responses:
-        '201': { description: Webhook created }
-        default: { $ref: '#/components/responses/Problem' }
-
+        '201':
+          description: identity
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/Identity.schema.json
+        '401': *id001
+        default: *id001
+  /ai/jobs:
+    get:
+      tags:
+      - integration
+      operationId: list_ai_jobs
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: ../json-schema/entities/AIJob.schema.json
+                  next_cursor:
+                    type:
+                    - string
+                    - 'null'
+                required:
+                - items
+                - next_cursor
+        default: *id001
+    post:
+      tags:
+      - integration
+      operationId: create_ai_job
+      summary: Queue an AI job. Capability ai.jobs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ../json-schema/entities/AIJob.schema.json
+      responses:
+        '201':
+          description: queued
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/AIJob.schema.json
+        default: *id001
+  /ai/jobs/{id}:
+    parameters:
+    - $ref: '#/components/parameters/Id'
+    get:
+      tags:
+      - integration
+      operationId: get_ai_job
+      responses:
+        '200':
+          description: job
+          content:
+            application/json:
+              schema:
+                $ref: ../json-schema/entities/AIJob.schema.json
+        default: *id001
+  /secrets:
+    get:
+      tags:
+      - security
+      operationId: list_secrets
+      summary: List secret references (never values). Capability secrets.manage.
+      responses:
+        '200':
+          description: references
+        default: *id001
+    post:
+      tags:
+      - security
+      operationId: create_secret_ref
+      summary: Register a secret reference. Capability secrets.manage. Plaintext is never returned.
+      responses:
+        '201':
+          description: created
+        default: *id001
+  /certificates:
+    get:
+      tags:
+      - security
+      operationId: list_certificates
+      summary: List certificates. Capability certs.manage.
+      responses:
+        '200':
+          description: certs
+        default: *id001
+    post:
+      tags:
+      - security
+      operationId: issue_certificate
+      summary: Issue a certificate. Capability certs.manage.
+      responses:
+        '201':
+          description: issued
+        default: *id001
+  /billing/exports:
+    post:
+      tags:
+      - billing
+      operationId: create_billing_export
+      summary: Create a billing export (async). Capability billing.export. Emits ExportReady.
+      responses:
+        '202':
+          description: accepted
+        default: *id001
   /stream:
     get:
-      tags: [stream]
+      tags:
+      - stream
       operationId: stream
-      summary: WebSocket upgrade — subscribe to the Volume 5 event envelope stream.
-      description: Upgrades to WebSocket. Frames carry the event envelope (../json-schema/envelope.schema.json).
+      summary: "WebSocket upgrade \u2014 subscribe to the Volume 5 event envelope stream."
       responses:
-        '101': { description: Switching Protocols (WebSocket) }
-
+        '101':
+          description: Switching Protocols (WebSocket)
+  /events:
+    get:
+      tags:
+      - stream
+      operationId: sse_events
+      summary: Server-Sent Events stream of the Volume 5 envelope.
+      responses:
+        '200':
+          description: text/event-stream
+  /openapi.json:
+    get:
+      tags:
+      - stream
+      operationId: get_openapi
+      summary: The live OpenAPI; MUST match the frozen contract for this version.
+      responses:
+        '200':
+          description: OpenAPI document
   /events/schemas:
     get:
-      tags: [stream]
-      operationId: eventSchemas
-      summary: Event schema registry — MUST match contracts/json-schema/events for this version.
+      tags:
+      - stream
+      operationId: get_event_schemas
+      summary: Event schema registry; MUST match contracts/json-schema/events.
       responses:
-        '200': { description: Map of event type to JSON Schema }
-
+        '200':
+          description: map of event type to JSON Schema
 components:
   securitySchemes:
-    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
-    apiKey: { type: apiKey, in: header, name: X-Api-Key }
-
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
   parameters:
-    Id: { name: id, in: path, required: true, schema: { type: string } }
-    Limit: { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
-    Cursor: { name: cursor, in: query, schema: { type: string } }
-    IdempotencyKey: { name: Idempotency-Key, in: header, schema: { type: string } }
-    IfMatch: { name: If-Match, in: header, schema: { type: string }, description: Entity version for optimistic concurrency }
-
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 50
+        maximum: 200
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema:
+        type: string
+    IfMatch:
+      name: If-Match
+      in: header
+      schema:
+        type: string
+      description: Entity version for optimistic concurrency
   schemas:
     Problem:
-      description: RFC 9457 Problem Details (Volume 4 §5)
+      description: "RFC 9457 Problem Details (Volume 4 \xA75)"
       type: object
       properties:
-        type: { type: string }
-        title: { type: string }
-        status: { type: integer }
-        detail: { type: string }
-        instance: { type: string }
-        code: { type: string, description: Stable machine code (forbidden, validation_failed, conflict, …) }
-        correlation_id: { type: string }
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+        correlation_id:
+          type: string
         errors:
           type: array
           items:
             type: object
             properties:
-              field: { type: string }
-              message: { type: string }
-      required: [title, status, code]
-    Page:
-      type: object
-      properties:
-        items: { type: array }
-        next_cursor: { type: [string, "null"] }
-      required: [items, next_cursor]
-    UserPage:
-      allOf:
-        - $ref: '#/components/schemas/Page'
-        - type: object
-          properties:
-            items: { type: array, items: { $ref: '../json-schema/entities/User.schema.json' } }
-    DevicePage:
-      allOf:
-        - $ref: '#/components/schemas/Page'
-        - type: object
-          properties:
-            items: { type: array, items: { $ref: '../json-schema/entities/Device.schema.json' } }
-    CdrPage:
-      allOf:
-        - $ref: '#/components/schemas/Page'
-        - type: object
-          properties:
-            items: { type: array, items: { $ref: '../json-schema/entities/CDR.schema.json' } }
-
+              field:
+                type: string
+              message:
+                type: string
+      required:
+      - title
+      - status
+      - code
   responses:
     Problem:
       description: Error (RFC 9457)
       content:
         application/problem+json:
-          schema: { $ref: '#/components/schemas/Problem' }
-    User:
-      description: A user
-      content:
-        application/json:
-          schema: { $ref: '../json-schema/entities/User.schema.json' }
-    UserPage:
-      description: A page of users
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/UserPage' }
+          schema:
+            $ref: '#/components/schemas/Problem'

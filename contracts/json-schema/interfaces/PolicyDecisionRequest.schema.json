@@ -1,0 +1,64 @@
+{
+  "description": "Input to the Policy Engine (Volume 9). Deterministic evaluation; DENY overrides ALLOW; obligations may be returned.",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "tenant_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "action": {
+      "type": "string",
+      "description": "e.g. call.dial, device.provision"
+    },
+    "subject": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "identity_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "assurance_level": {
+          "type": "string",
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "resource": {
+      "type": "object"
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "emergency": {
+          "type": "boolean"
+        },
+        "destination_class": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "required": [
+    "request_id",
+    "tenant_id",
+    "action",
+    "subject"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/PolicyDecisionRequest.schema.json",
+  "title": "PolicyDecisionRequest"
+}

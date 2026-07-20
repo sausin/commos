@@ -1,0 +1,38 @@
+{
+  "name": "Chargeable call without required identity is rejected",
+  "profile": "voice",
+  "entity": "Call",
+  "description": "Policy requires an authenticated Identity for external calls; a chargeable leg lacking one is rejected, not silently defaulted (CMOS-02-DOM-010).",
+  "requirement_ids": [
+    "CMOS-02-DOM-010",
+    "CMOS-01-PRD-051"
+  ],
+  "steps": [
+    {
+      "from": "(none)",
+      "action": "originate",
+      "to": "INITIATED",
+      "expect_event": "CallStarted"
+    },
+    {
+      "from": "INITIATED",
+      "action": "alert",
+      "to": "RINGING",
+      "expect_event": "CallRinging"
+    },
+    {
+      "from": "RINGING",
+      "action": "policy-deny",
+      "to": "REJECTED",
+      "expect_event": "CallRejected",
+      "note": "REQUIRE_IDENTITY unmet"
+    }
+  ],
+  "illegal": [
+    {
+      "from": "REJECTED",
+      "action": "answer",
+      "reason": "terminal state"
+    }
+  ]
+}

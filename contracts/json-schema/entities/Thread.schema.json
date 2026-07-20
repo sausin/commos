@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Thread.schema.json",
+  "title": "Thread",
+  "description": "CommOS domain entity 'Thread' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "channel_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "OPEN",
+        "CLOSED"
+      ]
+    }
+  },
+  "required": [
+    "channel_id",
+    "state"
+  ]
+}

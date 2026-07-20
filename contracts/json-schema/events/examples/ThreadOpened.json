@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-041a-741a-841a-00000000041a",
+  "specversion": "0.3",
+  "type": "ThreadOpened",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0352-7352-8352-000000000352",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "ThreadOpened:150",
+  "sequence": 150,
+  "datacontenttype": "application/json",
+  "data": {
+    "thread_id": "018f0a30-0033-7033-8033-000000000033",
+    "channel_id": "018f0a30-0032-7032-8032-000000000032"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/MediaStream.schema.json",
+  "title": "MediaStream",
+  "description": "CommOS domain entity 'MediaStream' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "call_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "AUDIO",
+        "VIDEO",
+        "APPLICATION"
+      ]
+    },
+    "codec": {
+      "type": "string"
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "SENDRECV",
+        "SENDONLY",
+        "RECVONLY",
+        "INACTIVE"
+      ]
+    },
+    "stats": {
+      "type": "object",
+      "properties": {
+        "mos": {
+          "type": "number"
+        },
+        "jitter_ms": {
+          "type": "number"
+        },
+        "packet_loss": {
+          "type": "number"
+        },
+        "latency_ms": {
+          "type": "number"
+        }
+      }
+    }
+  },
+  "required": [
+    "call_id",
+    "kind",
+    "direction"
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Agent.schema.json",
+  "title": "Agent",
+  "description": "CommOS domain entity 'Agent' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "user_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "queues": {
+      "type": "array",
+      "items": {
+        "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+      }
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "READY",
+        "BUSY",
+        "WRAP_UP",
+        "PAUSED",
+        "OFFLINE"
+      ]
+    },
+    "skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "user_id",
+    "state"
+  ]
+}

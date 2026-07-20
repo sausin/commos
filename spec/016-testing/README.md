@@ -1,6 +1,6 @@
 # Volume 16 — Testing & Conformance
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** TEST
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** TEST
 
 This volume operationalises the project's founding claim: **the specification and
 its contracts are the strategic asset, not any single implementation**

@@ -1,6 +1,6 @@
 # Volume 7 — Communications Workload (Voice)
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** SIP
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** SIP
 
 This volume specifies the **voice communications workload**: how real-time
 signalling and media are realised, and — critically — how every

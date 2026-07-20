@@ -1,0 +1,42 @@
+{
+  "description": "Policy Engine output. effect plus any obligations the caller must satisfy.",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "effect": {
+      "type": "string",
+      "enum": [
+        "ALLOW",
+        "DENY"
+      ]
+    },
+    "obligations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "REQUIRE_IDENTITY",
+          "REQUIRE_APPROVAL"
+        ]
+      }
+    },
+    "matched_policy_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+      }
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "effect"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/PolicyDecision.schema.json",
+  "title": "PolicyDecision"
+}

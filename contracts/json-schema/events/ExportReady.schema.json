@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/ExportReady.schema.json",
+  "title": "ExportReady",
+  "description": "CommOS canonical event 'ExportReady' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "ExportReady"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "export_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "object_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "export_id",
+        "object_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

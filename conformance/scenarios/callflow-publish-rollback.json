@@ -1,0 +1,31 @@
+{
+  "name": "Call flow publish and Time Machine rollback",
+  "profile": "voice",
+  "entity": "CallFlow",
+  "description": "Publishing creates an immutable version; rollback republishes a prior version (never mutates).",
+  "requirement_ids": [
+    "CMOS-00-ENG-012",
+    "CMOS-01-PRD-031"
+  ],
+  "steps": [
+    {
+      "from": "DRAFT",
+      "action": "publish",
+      "to": "PUBLISHED",
+      "expect_event": "CallFlowPublished"
+    },
+    {
+      "from": "PUBLISHED",
+      "action": "publish-newer",
+      "to": "SUPERSEDED",
+      "expect_event": "CallFlowPublished"
+    },
+    {
+      "from": "SUPERSEDED",
+      "action": "rollback",
+      "to": "PUBLISHED",
+      "expect_event": "CallFlowPublished",
+      "note": "republish prior version"
+    }
+  ]
+}

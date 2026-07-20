@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Route.schema.json",
+  "title": "Route",
+  "description": "CommOS domain entity 'Route' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "match": {
+      "type": "object"
+    },
+    "destination_ref": {
+      "type": "string"
+    },
+    "priority": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "destination_ref"
+  ]
+}

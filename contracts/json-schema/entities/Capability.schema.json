@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Capability.schema.json",
+  "title": "Capability",
+  "description": "CommOS domain entity 'Capability' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]+$"
+    },
+    "description": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "key",
+    "description"
+  ]
+}

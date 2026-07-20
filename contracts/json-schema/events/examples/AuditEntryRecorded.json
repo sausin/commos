@@ -1,0 +1,18 @@
+{
+  "id": "018f0a30-0418-7418-8418-000000000418",
+  "specversion": "0.3",
+  "type": "AuditEntryRecorded",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0350-7350-8350-000000000350",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "AuditEntryRecorded:148",
+  "sequence": 148,
+  "datacontenttype": "application/json",
+  "data": {
+    "audit_id": "018f0a30-002f-702f-802f-00000000002f",
+    "action": "device.approve",
+    "actor_ref": "user:018f0a30-0001-7001-8001-000000000001"
+  }
+}

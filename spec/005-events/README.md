@@ -1,6 +1,6 @@
 # Volume 5 — Events
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** EVT
+**Status:** FROZEN · **Version:** 0.4.0 · **Subsystem tag:** EVT
 
 The event model is the platform's highest-leverage integration surface. AI, CRM,
 billing, and automation are all **subscribers**; the platform embeds no knowledge of

@@ -1,6 +1,6 @@
 # Volume 15 — Observability
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** OBS
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** OBS
 
 Observability is how the operability mandate (CMOS-00-ENG-001) is verified in
 production: a system that cannot be seen cannot be operated simply. This volume

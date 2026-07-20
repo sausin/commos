@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-0404-7404-8404-000000000404",
+  "specversion": "0.3",
+  "type": "ConferenceEnded",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-033c-733c-833c-00000000033c",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "ConferenceEnded:128",
+  "sequence": 128,
+  "datacontenttype": "application/json",
+  "data": {
+    "conference_id": "018f0a30-0020-7020-8020-000000000020",
+    "duration_ms": 600000
+  }
+}

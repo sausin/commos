@@ -1,6 +1,6 @@
 # Volume 11 — AI Integration Surface
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** AI
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** AI
 
 CommOS **does not implement AI**. It is designed to be the world's best AI
 *integration surface*: an external AI system — Claude, OpenAI, Gemini, a self-hosted

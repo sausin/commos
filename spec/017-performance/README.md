@@ -1,6 +1,6 @@
 # Volume 17 — Performance Targets
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** PERF
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** PERF
 
 Performance is a **contract**, not a hope. This volume states CommOS's performance
 and capacity guarantees as **numeric, normative, measurable** requirements. Each

@@ -1,6 +1,6 @@
 # Volume 3 — System Architecture
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** ARCH
+**Status:** FROZEN · **Version:** 0.4.0 · **Subsystem tag:** ARCH
 
 This volume defines the subsystems, their boundaries, and how they interact. It is
 the engineering bible: it constrains *structure*, not implementation technology

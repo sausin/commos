@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/PolicyUpdated.schema.json",
+  "title": "PolicyUpdated",
+  "description": "CommOS canonical event 'PolicyUpdated' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "PolicyUpdated"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "policy_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "policy_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

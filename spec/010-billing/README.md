@@ -1,6 +1,6 @@
 # Volume 10 — Billing
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** BILL
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** BILL
 
 Billing is a **first-class workload of the substrate**, not a bolt-on report. Voice
 is one billable workload; messaging, video, AI jobs, and future workloads bill

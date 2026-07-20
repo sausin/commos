@@ -1,6 +1,6 @@
 # Volume 9 — Security
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** SEC
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** SEC
 
 Security in CommOS is **identity beyond passwords** and **authorization beyond roles**.
 A person is a `User`; a proof that this person is present *now, here, this strongly* is

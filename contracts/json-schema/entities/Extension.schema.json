@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Extension.schema.json",
+  "title": "Extension",
+  "description": "CommOS domain entity 'Extension' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "number": {
+      "type": "string"
+    },
+    "route_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "label": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "number",
+    "route_id"
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Trunk.schema.json",
+  "title": "Trunk",
+  "description": "CommOS domain entity 'Trunk' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "carrier_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "channels_max": {
+      "type": "integer"
+    },
+    "codecs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "auth": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "carrier_id"
+  ]
+}

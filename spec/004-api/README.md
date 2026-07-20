@@ -1,6 +1,6 @@
 # Volume 4 — API
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** API
+**Status:** FROZEN · **Version:** 0.4.0 · **Subsystem tag:** API
 
 Everything the platform can do is available through this API — the web UI, CLI,
 mobile app, and Terraform provider are all clients of the *same* API, with no

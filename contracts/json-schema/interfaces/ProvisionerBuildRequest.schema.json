@@ -1,0 +1,66 @@
+{
+  "description": "Vendor-neutral desired device state handed to a Provisioner plugin's build_config (Volume 8). Contains no vendor template; the plugin renders it.",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "device": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "vendor_key": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/OpenKey"
+        },
+        "model": {
+          "type": "string"
+        },
+        "mac": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id",
+        "vendor_key",
+        "model"
+      ]
+    },
+    "desired": {
+      "type": "object",
+      "properties": {
+        "extension": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "sip": {
+          "type": "object"
+        },
+        "network": {
+          "type": "object"
+        },
+        "firmware_target": {
+          "type": "string"
+        }
+      }
+    },
+    "secret_handles": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Opaque handles; plaintext never crosses the boundary."
+    }
+  },
+  "required": [
+    "request_id",
+    "device",
+    "desired"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/ProvisionerBuildRequest.schema.json",
+  "title": "ProvisionerBuildRequest"
+}

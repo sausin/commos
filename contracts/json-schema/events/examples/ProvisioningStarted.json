@@ -1,0 +1,16 @@
+{
+  "id": "018f0a30-03f9-73f9-83f9-0000000003f9",
+  "specversion": "0.3",
+  "type": "ProvisioningStarted",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0331-7331-8331-000000000331",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "ProvisioningStarted:117",
+  "sequence": 117,
+  "datacontenttype": "application/json",
+  "data": {
+    "device_id": "018f0a30-000a-700a-800a-00000000000a"
+  }
+}

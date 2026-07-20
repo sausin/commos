@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-0414-7414-8414-000000000414",
+  "specversion": "0.3",
+  "type": "CertificateIssued",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-034c-734c-834c-00000000034c",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "CertificateIssued:144",
+  "sequence": 144,
+  "datacontenttype": "application/json",
+  "data": {
+    "certificate_id": "018f0a30-002c-702c-802c-00000000002c",
+    "subject": "device:018f0a30-000a-700a-800a-00000000000a"
+  }
+}

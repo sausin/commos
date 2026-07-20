@@ -1,6 +1,6 @@
 # Volume 0 — Philosophy & Design Principles
 
-**Status:** REVIEW · **Version:** 0.3.0 · **Subsystem tag:** (constitution)
+**Status:** FROZEN · **Version:** 0.4.0 · **Subsystem tag:** (constitution)
 
 This volume is the **constitution**. It does not describe features; it states the
 invariants and non-goals that every other volume, contract, and implementation

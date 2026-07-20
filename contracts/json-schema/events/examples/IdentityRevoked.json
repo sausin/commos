@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-03f1-73f1-83f1-0000000003f1",
+  "specversion": "0.3",
+  "type": "IdentityRevoked",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0329-7329-8329-000000000329",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "IdentityRevoked:109",
+  "sequence": 109,
+  "datacontenttype": "application/json",
+  "data": {
+    "identity_id": "018f0a30-0002-7002-8002-000000000002",
+    "reason": "admin"
+  }
+}

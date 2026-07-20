@@ -1,6 +1,6 @@
 # Volume 14 — Deployment & Operations
 
-**Status:** DRAFT · **Version:** 0.3.0 · **Subsystem tag:** DEP
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** DEP
 
 Deployment is where the operability mandate (CMOS-00-ENG-001) meets the ground. This
 volume specifies how CommOS is packaged, run, scaled, upgraded, backed up, and

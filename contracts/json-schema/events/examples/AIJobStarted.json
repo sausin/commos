@@ -1,0 +1,16 @@
+{
+  "id": "018f0a30-040c-740c-840c-00000000040c",
+  "specversion": "0.3",
+  "type": "AIJobStarted",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0344-7344-8344-000000000344",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "AIJobStarted:136",
+  "sequence": 136,
+  "datacontenttype": "application/json",
+  "data": {
+    "job_id": "018f0a30-002a-702a-802a-00000000002a"
+  }
+}
