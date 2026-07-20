@@ -105,6 +105,7 @@ OpenAPI. Core resources:
 /v1/recordings  /v1/voicemails  /v1/objects
 /v1/cdrs  /v1/billing/exports
 /v1/webhooks  /v1/automations  /v1/ai/jobs  /v1/plugins  /v1/audit
+/v1/secrets  /v1/certificates
 /v1/stream (WS)  /v1/events (SSE)  /v1/openapi.json  /v1/events/schemas
 ```
 

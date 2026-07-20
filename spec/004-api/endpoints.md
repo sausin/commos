@@ -40,7 +40,7 @@ Legend: 🔒 requires the named capability · ⚡ emits event(s).
 | `POST /call-flows/{id}:publish` | `routing.manage` | `CallFlowPublished` |
 | `GET/POST /ivrs` · `/queues` | `routing.manage` | — |
 | `GET /calls` · `GET /calls/{id}` | `calls.view` | — |
-| `POST /calls` (originate) | `calls.originate` | `CallStarted` |
+| `POST /calls` (originate) | `calls.originate` (+ `calls.dial.international` for intl/elevated-cost) | `CallStarted` |
 | `POST /calls/{id}:transfer` | `calls.control` | `CallTransferred` |
 | `POST /calls/{id}:hold` `:resume` | `calls.control` | `CallHeld`/`CallResumed` |
 | `POST /calls/{id}:hangup` | `calls.control` | `CallEnded` |
@@ -67,6 +67,17 @@ Legend: 🔒 requires the named capability · ⚡ emits event(s).
 | `GET/POST /ai/jobs` · `GET /ai/jobs/{id}` | `ai.jobs` | `AIJobQueued`, `AIJobCompleted\|Failed` |
 | `GET/POST /plugins` · `POST /plugins/{id}:enable` `:disable` | `plugins.manage` | `PluginInstalled\|Failed` |
 | `GET /audit` | `audit.view` | (read-only, append-only source) |
+
+## Security & platform (Volume 9)
+| Method & path | Capability 🔒 | Emits ⚡ |
+|---------------|--------------|----------|
+| `GET/POST /secrets` · `GET/DELETE /secrets/{id}` | `secrets.manage` | `SecretReferenceUpdated` |
+| `GET/POST /certificates` · `POST /certificates/{id}:renew` `:revoke` | `certs.manage` | `CertificateIssued`/`CertificateRenewed`/`CertificateRevoked` |
+
+> `/secrets` stores and manages secret **references** only — plaintext secret values
+> are never returned by the API (Volume 9, CMOS-09-SEC-*). The capability keys
+> `secrets.manage`, `certs.manage`, and `calls.dial.international` are defined in the
+> canonical catalogue at [`spec/009-security/capabilities.md`](../009-security/capabilities.md).
 
 ## Real-time & discovery
 | Method & path | Notes |

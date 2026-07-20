@@ -72,5 +72,9 @@ exist under [`contracts/`](../contracts/), and the conformance harness passes fo
 - **0.3.0** — Foundational spine deepened to implementation grade (Vols 0, 2, 3, 4,
   5). Added `contracts/` (JSON Schema for envelope, core entities, and events;
   OpenAPI skeleton) and the executable conformance harness. Added CONVENTIONS and
-  GLOSSARY. Breadth volumes given real structure.
+  GLOSSARY. **All breadth volumes (1, 6–18) authored to implementation-grade drafts**
+  and ADRs (19) recorded. Consistency pass: the API catalogue (Vol 4) adopted the
+  capability keys introduced by Security (Vol 9) — `secrets.manage`, `certs.manage`,
+  `calls.dial.international` — and the event catalogue (Vol 5) names the additional
+  `Plugin*`, `Media`, and PKI/secret lifecycle events as `planned`.
 - **0.2.0** — Initial 20-volume skeleton with seed content (imported baseline).

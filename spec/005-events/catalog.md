@@ -52,6 +52,7 @@ a MAJOR line (CMOS-CONV-003). Adding an event is a MINOR change.
 | `ConferenceStarted` / `ConferenceEnded` | Conference | planned | |
 | `CallFlowPublished` | CallFlow | planned | versioned publish |
 | `GatewayOffline` / `GatewayRecovered` | Gateway | planned | health |
+| `MediaQualityReported` | MediaStream | planned | MOS/jitter/loss facts, media→control (Vol 15/17) |
 
 ## Billing, Webhook, Automation, AI, Plugin, Audit
 | Event | Subject | Schema | Notes |
@@ -62,7 +63,9 @@ a MAJOR line (CMOS-CONV-003). Adding an event is a MINOR change.
 | `AutomationTriggered` | Automation | planned | |
 | `AIJobQueued` / `AIJobStarted` / `AIJobFailed` | AIJob | planned | |
 | `AIJobCompleted` | AIJob | [core](../../contracts/json-schema/events/AIJobCompleted.schema.json) | result Object ref |
-| `PluginInstalled` / `PluginFailed` | Plugin | planned | |
+| `PluginInstalled` / `PluginEnabled` / `PluginDisabled` / `PluginUninstalled` / `PluginFailed` | Plugin | planned | lifecycle (Vol 12) |
+| `SecretReferenceUpdated` | Secret | planned | reference only, never values (Vol 9) |
+| `CertificateIssued` / `CertificateRenewed` / `CertificateRevoked` | Certificate | planned | PKI/mTLS (Vol 9) |
 | `AuditEntryRecorded` | AuditEntry | planned | append-only |
 
 ## Envelope invariants (recap)
