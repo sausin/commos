@@ -3,4 +3,5 @@
 //! through the outbox.
 
 pub mod messaging;
+pub mod realtime;
 pub mod routing;

@@ -15,7 +15,9 @@ use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
+use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::video_room::VideoRoom;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
@@ -69,6 +71,26 @@ CREATE TABLE IF NOT EXISTS messages (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_tenant_id_idx ON messages (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS video_rooms (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS video_rooms_tenant_id_idx ON video_rooms (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS presence (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS presence_tenant_id_idx ON presence (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
@@ -290,6 +312,58 @@ impl Store for PgStore {
             }
         }
 
+        // Real-time entities are created at version 0 → a plain insert. A colliding id
+        // means someone else already created it (mirrors the Call v0 path).
+        for vr in &tx.video_rooms {
+            let data = serde_json::to_value(vr).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO video_rooms (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(vr.base.id.as_uuid())
+            .bind(vr.base.tenant_id.as_uuid())
+            .bind(vr.base.version as i64)
+            .bind(vr.base.created_at.into_offset())
+            .bind(vr.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "VideoRoom",
+                    id: vr.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+
+        // PresenceState is inserted at version 0 for the MVP (a fuller upsert-by-subject is
+        // a later refinement); a colliding id is a conflict.
+        for p in &tx.presence {
+            let data = serde_json::to_value(p).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO presence (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(p.base.id.as_uuid())
+            .bind(p.base.tenant_id.as_uuid())
+            .bind(p.base.version as i64)
+            .bind(p.base.created_at.into_offset())
+            .bind(p.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "PresenceState",
+                    id: p.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
                 "INSERT INTO idempotency_keys (tenant_id, key, call_id) \
@@ -446,6 +520,68 @@ impl Store for PgStore {
             .await?;
         let next_cursor = if items.len() == limit {
             items.last().map(|m| m.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_video_room(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<VideoRoom>, StoreError> {
+        let row = sqlx::query("SELECT data FROM video_rooms WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_video_rooms(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<VideoRoom>, StoreError> {
+        let items = self
+            .list_entities::<VideoRoom>("video_rooms", tenant, limit, cursor)
+            .await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|v| v.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_presence(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<PresenceState>, StoreError> {
+        let row = sqlx::query("SELECT data FROM presence WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_presence(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<PresenceState>, StoreError> {
+        let items = self
+            .list_entities::<PresenceState>("presence", tenant, limit, cursor)
+            .await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|p| p.base.id.to_string())
         } else {
             None
         };

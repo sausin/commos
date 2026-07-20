@@ -154,13 +154,29 @@ async fn run(cfg: Config) -> i32 {
         }
     };
 
-    let media = Arc::new(LoopbackMedia);
+    let (fact_tx, mut fact_rx) = tokio::sync::mpsc::unbounded_channel::<media::MediaFact>();
+    let media = Arc::new(LoopbackMedia::new(fact_tx));
     let signal = RelaySignal::new();
     let routing = Routing::new(store.clone(), media, signal.clone());
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
+    let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
+
+    // Media-fact loop: apply media→control facts (ring/answer/…) to Call state and emit their
+    // events (CMOS-03-ARCH-003). In the single binary this is an in-process channel; in the
+    // split-media topology it is the media node's fact stream — same control-plane logic.
+    {
+        let routing = routing.clone();
+        tokio::spawn(async move {
+            while let Some(fact) = fact_rx.recv().await {
+                if let Err(e) = routing.apply_fact(fact).await {
+                    tracing::warn!("failed to apply media fact: {e}");
+                }
+            }
+        });
+    }
 
     let bind = cfg.listen.to_string();
-    let app_state = AppState::new(store.clone(), routing, messaging, bus.clone(), recent);
+    let app_state = AppState::new(store.clone(), routing, messaging, realtime, bus.clone(), recent);
 
     // --- shutdown plumbing -----------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

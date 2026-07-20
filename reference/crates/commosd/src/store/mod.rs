@@ -24,7 +24,9 @@ use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
+use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::video_room::VideoRoom;
 
 pub use mem::MemStore;
 pub use postgres::PgStore;
@@ -37,6 +39,9 @@ pub struct Tx {
     pub channels: Vec<Channel>,
     pub threads: Vec<Thread>,
     pub messages: Vec<Message>,
+    /// Real-time workload entities — video/presence peers of `Call` on the same substrate.
+    pub video_rooms: Vec<VideoRoom>,
+    pub presence: Vec<PresenceState>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -110,6 +115,31 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Message>, StoreError>;
+
+    // Real-time (video/presence) workload reads — tenant-scoped, mirroring the Call ones.
+    async fn get_video_room(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<VideoRoom>, StoreError>;
+    async fn list_video_rooms(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<VideoRoom>, StoreError>;
+
+    async fn get_presence(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<PresenceState>, StoreError>;
+    async fn list_presence(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<PresenceState>, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

@@ -18,7 +18,7 @@ use commos_core::events::call_ringing::CallRinging;
 use commos_core::events::call_started::CallStarted;
 use commos_core::events::call_transferred::{CallTransferred, TransferType};
 
-use crate::media::{MediaCommand, MediaPlane};
+use crate::media::{MediaCommand, MediaFact, MediaPlane};
 use crate::relay::RelaySignal;
 use crate::store::{Store, StoreError, Tx};
 
@@ -76,7 +76,7 @@ impl Routing {
             }
         }
 
-        let mut call = Call::originate(tenant, req.direction, &req.from_ref, &req.to_ref);
+        let call = Call::originate(tenant, req.direction, &req.from_ref, &req.to_ref);
 
         // Build the CallStarted envelope. Its correlation_id mirrors the Call's, tying
         // every downstream event into one causal chain (Volume 5 §3).
@@ -112,6 +112,7 @@ impl Routing {
 
         // Command the media plane over the typed boundary (control decides, media acts).
         let ack = self.media.dispatch(MediaCommand::Originate {
+            tenant_id: tenant,
             call_id: call.base.id,
             from_ref: call.from_ref.clone(),
             to_ref: call.to_ref.clone(),
@@ -120,28 +121,38 @@ impl Routing {
             return Err(RoutingError::MediaRejected(reason));
         }
 
-        // The loopback media plane answers immediately (no real peer). Apply the
-        // ring→answer facts so the Call reaches ANSWERED and the full lifecycle
-        // (CallStarted → CallRinging → CallAnswered) is observable. A real SIP plane would
-        // deliver these asynchronously; the control-plane logic is identical.
-        if self.media.auto_answers() {
-            call.transition(CallState::Ringing)
-                .map_err(|e| RoutingError::IllegalState(e.to_string()))?;
-            self.commit_event(tenant, &call, true, CallRinging { call_id: call.base.id })
-                .await?;
-            call.transition(CallState::Answered)
-                .map_err(|e| RoutingError::IllegalState(e.to_string()))?;
-            let answered_at = call.answered_at.expect("answered_at set on transition");
-            self.commit_event(
-                tenant,
-                &call,
-                true,
-                CallAnswered { call_id: call.base.id, identity_id: None, answered_at },
-            )
-            .await?;
-        }
-
+        // The Call starts INITIATED. Ring and answer arrive asynchronously as media facts
+        // and are applied by `apply_fact` (media→control, CMOS-03-ARCH-003) — not computed
+        // here. A client observes the progression via GET or the event stream.
         Ok(call)
+    }
+
+    /// Apply a media fact to Call state and emit the corresponding event
+    /// (media→control, CMOS-03-ARCH-003). Driven by the fact loop wired in `main`; a real
+    /// media node reports these from actual signalling.
+    pub async fn apply_fact(&self, fact: MediaFact) -> Result<(), RoutingError> {
+        match fact {
+            MediaFact::Rang { tenant_id, call_id } => {
+                let mut call = self.load(tenant_id, call_id).await?;
+                call.transition(CallState::Ringing)
+                    .map_err(|e| RoutingError::IllegalState(e.to_string()))?;
+                self.commit_event(tenant_id, &call, true, CallRinging { call_id })
+                    .await
+            }
+            MediaFact::Answered { tenant_id, call_id, answered_at } => {
+                let mut call = self.load(tenant_id, call_id).await?;
+                call.transition(CallState::Answered)
+                    .map_err(|e| RoutingError::IllegalState(e.to_string()))?;
+                let answered_at = call.answered_at.unwrap_or(answered_at);
+                self.commit_event(
+                    tenant_id,
+                    &call,
+                    true,
+                    CallAnswered { call_id, identity_id: None, answered_at },
+                )
+                .await
+            }
+        }
     }
 
     /// Load a Call for this tenant or report it missing (tenant-scoped, CMOS-03-ARCH-050).
@@ -273,10 +284,13 @@ mod tests {
     use crate::media::LoopbackMedia;
     use crate::store::{MemStore, Store};
 
-    fn routing() -> (Routing, Arc<dyn Store>) {
+    type FactRx = tokio::sync::mpsc::UnboundedReceiver<crate::media::MediaFact>;
+
+    fn routing() -> (Routing, Arc<dyn Store>, FactRx) {
         let store: Arc<dyn Store> = Arc::new(MemStore::new());
-        let r = Routing::new(store.clone(), Arc::new(LoopbackMedia), RelaySignal::new());
-        (r, store)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = Routing::new(store.clone(), Arc::new(LoopbackMedia::new(tx)), RelaySignal::new());
+        (r, store, rx)
     }
 
     fn originate_req() -> OriginateRequest {
@@ -290,12 +304,19 @@ mod tests {
 
     #[tokio::test]
     async fn full_lifecycle_hold_resume_hangup() {
-        let (r, store) = routing();
+        let (r, store, mut facts) = routing();
         let t = Uuid::now_v7();
 
-        // Originate auto-answers on the loopback media plane.
+        // Originate starts INITIATED; the loopback media plane queues ring+answer facts.
         let call = r.originate(t, originate_req()).await.unwrap();
-        assert_eq!(call.state, CallState::Answered);
+        assert_eq!(call.state, CallState::Initiated);
+
+        // Apply the media facts (as the fact loop does in `main`) → the Call reaches ANSWERED.
+        while let Ok(fact) = facts.try_recv() {
+            r.apply_fact(fact).await.unwrap();
+        }
+        let answered = store.get_call(t, call.base.id).await.unwrap().unwrap();
+        assert_eq!(answered.state, CallState::Answered);
 
         assert_eq!(r.hold(t, call.base.id).await.unwrap().state, CallState::Held);
         assert_eq!(r.resume(t, call.base.id).await.unwrap().state, CallState::Answered);
@@ -313,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn action_on_missing_call_is_not_found() {
-        let (r, _) = routing();
+        let (r, _store, _facts) = routing();
         let t = Uuid::now_v7();
         assert!(matches!(
             r.hold(t, Uuid::now_v7()).await,

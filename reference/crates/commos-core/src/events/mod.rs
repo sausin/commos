@@ -14,4 +14,8 @@ pub mod call_started;
 pub mod call_transferred;
 pub mod channel_created;
 pub mod message_sent;
+pub mod participant_joined;
+pub mod participant_left;
+pub mod presence_changed;
 pub mod thread_opened;
+pub mod video_room_started;

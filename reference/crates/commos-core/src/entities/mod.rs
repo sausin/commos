@@ -7,4 +7,7 @@
 pub mod call;
 pub mod channel;
 pub mod message;
+pub mod participant;
+pub mod presence_state;
 pub mod thread;
+pub mod video_room;

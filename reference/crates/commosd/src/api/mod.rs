@@ -10,8 +10,10 @@ pub mod channels;
 pub mod health;
 pub mod introspect;
 pub mod messages;
+pub mod presence;
 pub mod problem;
 pub mod threads;
+pub mod video_rooms;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -28,7 +30,7 @@ pub fn router(state: AppState) -> Router {
     // sub-paths (`/calls/:id/hold`) for now — same command, same event, same capability.
     let v1 = Router::new()
         .route("/calls", get(calls::list_calls).post(calls::create_calls))
-        .route("/calls/:id", get(calls::get_call))
+        .route("/calls/:id", get(calls::get_call).patch(calls::patch_call))
         .route("/calls/:id/hold", post(calls::hold_call))
         .route("/calls/:id/resume", post(calls::resume_call))
         .route("/calls/:id/hangup", post(calls::hangup_call))
@@ -39,7 +41,12 @@ pub fn router(state: AppState) -> Router {
         .route("/threads", get(threads::list_threads).post(threads::create_thread))
         .route("/threads/:id", get(threads::get_thread))
         .route("/messages", get(messages::list_messages).post(messages::create_message))
-        .route("/messages/:id", get(messages::get_message));
+        .route("/messages/:id", get(messages::get_message))
+        // Real-time workloads — video rooms and presence, same substrate again.
+        .route("/video-rooms", get(video_rooms::list_video_rooms).post(video_rooms::create_video_room))
+        .route("/video-rooms/:id", get(video_rooms::get_video_room))
+        .route("/presence", get(presence::list_presence).post(presence::set_presence))
+        .route("/presence/:id", get(presence::get_presence));
 
     Router::new()
         .nest("/v1", v1)

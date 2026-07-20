@@ -17,6 +17,7 @@ use super::auth::TenantContext;
 use super::problem::Problem;
 use crate::control::routing::{OriginateRequest, RoutingError};
 use crate::state::AppState;
+use crate::store::{StoreError, Tx};
 
 /// Parse a path id into a validated UUIDv7 or a 400 Problem.
 fn parse_id(id: &str) -> Result<Uuid, Problem> {
@@ -197,4 +198,121 @@ pub async fn transfer_call(
         .await
         .map(Json)
         .map_err(map_routing_err)
+}
+
+// --- Optimistic-concurrency update (OpenAPI `update_calls`). ------------------------------
+// `PATCH /v1/calls/{id}` with `If-Match` + RFC 7386 JSON Merge Patch (Volume 4).
+
+/// Apply an RFC 7386 JSON Merge Patch: for an object patch, recurse per key —
+/// a `null` value removes the key, any other value replaces it; a non-object patch
+/// replaces the target wholesale.
+fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(patch_obj) => {
+            // If the target is not an object, RFC 7386 says start from an empty one.
+            if !target.is_object() {
+                *target = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let target_obj = target.as_object_mut().expect("target is an object");
+            for (key, value) in patch_obj {
+                if value.is_null() {
+                    target_obj.remove(key);
+                } else {
+                    merge(target_obj.entry(key.clone()).or_insert(serde_json::Value::Null), value);
+                }
+            }
+        }
+        _ => *target = patch.clone(),
+    }
+}
+
+/// `PATCH /v1/calls/{id}` — optimistic-concurrency update via JSON Merge Patch (RFC 7386).
+///
+/// A generic PATCH has no dedicated catalogue event, so this MVP persists the change
+/// WITHOUT emitting one. This is a deliberate deviation from the "no state change without
+/// its event" guarantee that the action verbs uphold; a future refinement should emit an
+/// audit/`updated` event through the outbox alongside the write.
+pub async fn patch_call(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    // Accept any content type (contract: `application/merge-patch+json`); read the raw JSON.
+    Json(patch): Json<serde_json::Value>,
+) -> Result<Json<Call>, Problem> {
+    let id = parse_id(&id)?;
+
+    // 1. Load the current call (tenant-scoped).
+    let mut call = st
+        .store
+        .get_call(tenant.tenant_id, id)
+        .await
+        .map_err(|e| Problem::internal(e.to_string()))?
+        .ok_or_else(|| Problem::not_found("no such call"))?;
+
+    // 2. Require `If-Match` and check it against the current version.
+    let if_match = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            Problem::new(
+                StatusCode::PRECONDITION_REQUIRED,
+                "if_match_required",
+                "If-Match header with the entity version is required",
+            )
+        })?;
+    // Tolerate a quoted ETag form (e.g. `"3"`) as well as a bare integer.
+    let expected: u64 = if_match
+        .trim()
+        .trim_matches('"')
+        .parse()
+        .map_err(|_| Problem::bad_request("If-Match must be an integer entity version"))?;
+    if expected != call.base.version {
+        return Err(Problem::new(
+            StatusCode::PRECONDITION_FAILED,
+            "version_conflict",
+            format!(
+                "If-Match {expected} does not match current version {}",
+                call.base.version
+            ),
+        ));
+    }
+
+    // 3. Serialize, apply the merge patch.
+    let original = serde_json::to_value(&call).map_err(|e| Problem::internal(e.to_string()))?;
+    let mut merged = original.clone();
+    merge(&mut merged, &patch);
+
+    // 4. Protect server-managed identity/tenant fields: force them back to their originals
+    //    so a patch cannot re-home or re-identify the entity, then re-validate the shape.
+    if let Some(obj) = merged.as_object_mut() {
+        for field in ["id", "tenant_id", "created_at", "correlation_id"] {
+            if let Some(orig) = original.get(field) {
+                obj.insert(field.to_string(), orig.clone());
+            }
+        }
+    }
+    call = serde_json::from_value(merged)
+        .map_err(|e| Problem::bad_request(format!("patch produced an invalid Call: {e}")))?;
+
+    // 5. Bump version + updated_at so the store's If-Match check (version = N updates only a
+    //    stored row at N-1) guards the write, then commit.
+    call.base.touch();
+    st.store
+        .commit(Tx {
+            calls: vec![call.clone()],
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| match e {
+            StoreError::VersionConflict { .. } => Problem::new(
+                StatusCode::PRECONDITION_FAILED,
+                "version_conflict",
+                "the call was modified concurrently; reload and retry",
+            ),
+            other => Problem::internal(other.to_string()),
+        })?;
+
+    // 6. Return the updated Call.
+    Ok(Json(call))
 }

@@ -109,11 +109,15 @@ curl -s localhost:8080/_introspect/events        # watch CallStarted flow throug
 ### Endpoints
 
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
-- **Voice workload** — `GET|POST /v1/calls`, `GET /v1/calls/{id}`, and actions
-  `POST /v1/calls/{id}/{hold,resume,hangup,transfer}` (the frozen API's `:action` form,
-  mounted as sub-paths). Each action transitions the Call and emits its event.
+- **Voice workload** — `GET|POST /v1/calls`, `GET|PATCH /v1/calls/{id}` (`PATCH` is an
+  RFC 7386 merge-patch with `If-Match` optimistic concurrency), and actions
+  `POST /v1/calls/{id}/{hold,resume,hangup,transfer}`. A Call starts `INITIATED`; ring and
+  answer arrive **asynchronously as media facts** (the media plane reports them; the control
+  plane applies them), so a fresh call reaches `ANSWERED` a moment after creation.
 - **Messaging workload** — `GET|POST /v1/channels`, `/v1/threads`, `/v1/messages` and
-  their `/{id}` reads. Same substrate, same store, same outbox.
+  their `/{id}` reads.
+- **Real-time workloads** — `GET|POST /v1/video-rooms`, `GET|POST /v1/presence` and their
+  `/{id}` reads. Same substrate, same store, same outbox — voice is one workload of many.
 - `GET /_introspect/events[/stream]` — **non-normative** view of the event bus for bring-up; not part of the contract.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped.
@@ -136,13 +140,15 @@ All `/v1` routes are bearer-authenticated and tenant-scoped.
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. A real media→control fact channel so Call progression (ring/answer) comes from the media
-   plane rather than the loopback's `auto_answers`, and the SIP/RTP engine behind the
-   existing `MediaPlane` trait.
-2. Update/soft-delete and richer queries for messaging (thread listing by channel, message
-   paging by thread), and the remaining workloads (video/presence/contact-centre).
-3. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
+1. **SQLite as the zero-config durable default** — an embedded, single-writer `Store`
+   binding so the single binary is durable *and* dependency-free out of the box (ideal for a
+   Raspberry Pi / small-business box). In-memory stays the explicit test mode; PostgreSQL
+   becomes the opt-in multi-node/HA backend. Keep ephemeral state (registrations, presence)
+   in memory to minimise SD-card writes.
+2. The real SIP/RTP media engine behind the existing `MediaPlane` trait (the fact channel is
+   already in place), and registration handling as in-memory ephemeral state.
+3. Richer queries and update/soft-delete across the workloads (thread-scoped message paging,
+   presence upsert-by-subject).
+4. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
-4. Real JWT verification against Identity (Volume 9), replacing the dev token.
-5. `PATCH`/`If-Match` optimistic-concurrency updates over the API (the store already enforces
-   versioning).
+5. Real JWT verification against Identity (Volume 9), replacing the dev token.

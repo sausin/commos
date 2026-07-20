@@ -11,7 +11,9 @@ use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
+use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::video_room::VideoRoom;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
@@ -80,6 +82,11 @@ struct Inner {
     thread_order: Vec<(Uuid, Uuid)>,
     messages: HashMap<(Uuid, Uuid), Message>,
     message_order: Vec<(Uuid, Uuid)>,
+    /// Real-time (video/presence) workload tables, each with their own insertion-order index.
+    video_rooms: HashMap<(Uuid, Uuid), VideoRoom>,
+    video_room_order: Vec<(Uuid, Uuid)>,
+    presence: HashMap<(Uuid, Uuid), PresenceState>,
+    presence_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -161,6 +168,30 @@ impl Store for MemStore {
                 });
             }
         }
+        // Real-time entities are created at version 0 → an id collision is a conflict.
+        for vr in &tx.video_rooms {
+            let key = (vr.base.tenant_id, vr.base.id);
+            if g.video_rooms.contains_key(&key) || vr.base.version != 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "VideoRoom",
+                    id: vr.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+        // PresenceState is keyed by its own id and, for the MVP, inserted at version 0 like
+        // any other create (an id collision is a conflict). A fuller upsert-by-subject —
+        // one live row per (tenant, user_id) that versions forward — is a later refinement.
+        for p in &tx.presence {
+            let key = (p.base.tenant_id, p.base.id);
+            if g.presence.contains_key(&key) || p.base.version != 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "PresenceState",
+                    id: p.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -184,6 +215,16 @@ impl Store for MemStore {
             let key = (m.base.tenant_id, m.base.id);
             g.message_order.push(key);
             g.messages.insert(key, m);
+        }
+        for vr in tx.video_rooms {
+            let key = (vr.base.tenant_id, vr.base.id);
+            g.video_room_order.push(key);
+            g.video_rooms.insert(key, vr);
+        }
+        for p in tx.presence {
+            let key = (p.base.tenant_id, p.base.id);
+            g.presence_order.push(key);
+            g.presence.insert(key, p);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -305,6 +346,56 @@ impl Store for MemStore {
         Ok(page_from(
             &g.message_order,
             |k| g.messages.get(k).cloned(),
+            tenant,
+            limit,
+            cursor,
+        ))
+    }
+
+    async fn get_video_room(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<VideoRoom>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.video_rooms.get(&(tenant, id)).cloned())
+    }
+
+    async fn list_video_rooms(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<VideoRoom>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(
+            &g.video_room_order,
+            |k| g.video_rooms.get(k).cloned(),
+            tenant,
+            limit,
+            cursor,
+        ))
+    }
+
+    async fn get_presence(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<Option<PresenceState>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.presence.get(&(tenant, id)).cloned())
+    }
+
+    async fn list_presence(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<PresenceState>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(
+            &g.presence_order,
+            |k| g.presence.get(k).cloned(),
             tenant,
             limit,
             cursor,
