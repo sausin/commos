@@ -1,0 +1,17 @@
+[package]
+name = "commos-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CommOS core contract types — Rust projections of the frozen JSON-Schema domain & event model."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+regex-lite = "0.1"

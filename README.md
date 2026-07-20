@@ -34,6 +34,7 @@ what OCI did for containers and Kubernetes did for orchestration.
 | [`spec/GLOSSARY.md`](spec/GLOSSARY.md) | Canonical terms. One word, one meaning. |
 | [`contracts/`](contracts/) | Machine-readable contracts: JSON Schema for the domain model and events, OpenAPI for the API. **Normative.** |
 | [`conformance/`](conformance/) | The executable conformance harness. Validates that the contracts are self-consistent and that any implementation conforms. |
+| [`reference/`](reference/) | The **reference implementation** — the `commosd` single binary (Rust). First vertical slice of the frozen spine; builds for Raspberry Pi 4 (arm64) and amd64. |
 
 ## The specification suite
 

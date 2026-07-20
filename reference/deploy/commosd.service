@@ -1,0 +1,31 @@
+# Reference systemd unit for the CommOS single binary (CMOS-14-DEP-002).
+# Clean start/stop, graceful drain on stop, and journald-integrated structured logs.
+[Unit]
+Description=CommOS single-binary communications substrate (commosd)
+Documentation=https://github.com/sausin/commos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The binary is self-contained; PostgreSQL (when configured) is the only hard dependency.
+ExecStart=/usr/local/bin/commosd --config /etc/commos/pbx.yaml
+# Graceful drain: SIGTERM makes the node report not-ready, finish in-flight work, and
+# flush the outbox before exit (CMOS-14-DEP-051). Give it room before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+# Hardening (Volume 9). commosd needs no privilege beyond binding its port.
+DynamicUser=yes
+StateDirectory=commos
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# CommOS config-as-code — the declarative desired state (Volume 14 §10, CMOS-14-DEP-080).
+#
+# Git-reviewable and diff-friendly. NEVER put secrets here (CMOS-14-DEP-083): reference
+# them from an external secret manager and commosd rejects an inline DSN with credentials.
+
+api_version: commos.dev/v0.4
+
+# Address the API Gateway binds. 0.0.0.0:8080 suits a single box on the LAN — e.g. a
+# Raspberry Pi 4 — or a host-networked container.
+listen: "0.0.0.0:8080"
+
+# PostgreSQL system of record (CMOS-14-DEP-020). Omit entirely to run the zero-dependency
+# in-process store (single-binary dev/edge mode). When set, it MUST be a *reference*:
+#
+# database_url:
+#   ref_uri: "vault://commos/db#dsn"     # resolved from Vault/KMS/1Password at boot
+#
+# Rejected (secret in YAML):
+#   database_url: postgres://user:password@db:5432/commos
+
+log:
+  format: json   # json (structured, systemd/observability) | text (human, dev)
+  level: info

@@ -1,0 +1,31 @@
+[package]
+name = "commosd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CommOS single self-contained binary — control plane + media plane in one process (CMOS-14-DEP-001/010)."
+
+[[bin]]
+name = "commosd"
+path = "src/main.rs"
+
+[dependencies]
+commos-core = { path = "../commos-core" }
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
