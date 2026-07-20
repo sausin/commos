@@ -23,9 +23,11 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
+use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::video_room::VideoRoom;
 
@@ -44,6 +46,9 @@ pub struct Tx {
     /// Real-time workload entities — video/presence peers of `Call` on the same substrate.
     pub video_rooms: Vec<VideoRoom>,
     pub presence: Vec<PresenceState>,
+    /// Billing (CDR) and contact-centre (Queue) entities.
+    pub cdrs: Vec<Cdr>,
+    pub queues: Vec<Queue>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -142,6 +147,23 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<PresenceState>, StoreError>;
+
+    // Billing (CDR) and contact-centre (Queue) reads — tenant-scoped.
+    async fn get_cdr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Cdr>, StoreError>;
+    async fn list_cdrs(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Cdr>, StoreError>;
+
+    async fn get_queue(&self, tenant: Uuid, id: Uuid) -> Result<Option<Queue>, StoreError>;
+    async fn list_queues(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Queue>, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod calls;
+pub mod cdrs;
 pub mod channels;
 pub mod dashboard;
 pub mod health;
@@ -13,6 +14,7 @@ pub mod introspect;
 pub mod messages;
 pub mod presence;
 pub mod problem;
+pub mod queues;
 pub mod registrations;
 pub mod threads;
 pub mod video_rooms;
@@ -51,7 +53,13 @@ pub fn router(state: AppState) -> Router {
         .route("/presence/:id", get(presence::get_presence))
         // Device registrations — ephemeral in-memory state (not the durable store).
         .route("/registrations", get(registrations::list_registrations).post(registrations::create_registration))
-        .route("/registrations/:id", get(registrations::get_registration).delete(registrations::delete_registration));
+        .route("/registrations/:id", get(registrations::get_registration).delete(registrations::delete_registration))
+        // Billing — CDRs are produced by the platform on call end (read-only).
+        .route("/cdrs", get(cdrs::list_cdrs))
+        .route("/cdrs/:id", get(cdrs::get_cdr))
+        // Contact-centre — call queues.
+        .route("/queues", get(queues::list_queues).post(queues::create_queue))
+        .route("/queues/:id", get(queues::get_queue));
 
     Router::new()
         .nest("/v1", v1)

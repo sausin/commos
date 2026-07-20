@@ -9,9 +9,11 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
+use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::video_room::VideoRoom;
 
@@ -87,6 +89,11 @@ struct Inner {
     video_room_order: Vec<(Uuid, Uuid)>,
     presence: HashMap<(Uuid, Uuid), PresenceState>,
     presence_order: Vec<(Uuid, Uuid)>,
+    /// Billing (CDR) and contact-centre (Queue) tables.
+    cdrs: HashMap<(Uuid, Uuid), Cdr>,
+    cdr_order: Vec<(Uuid, Uuid)>,
+    queues: HashMap<(Uuid, Uuid), Queue>,
+    queue_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -192,6 +199,18 @@ impl Store for MemStore {
                 });
             }
         }
+        for c in &tx.cdrs {
+            let key = (c.base.tenant_id, c.base.id);
+            if g.cdrs.contains_key(&key) || c.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "CDR", id: c.base.id.to_string(), expected: 0 });
+            }
+        }
+        for q in &tx.queues {
+            let key = (q.base.tenant_id, q.base.id);
+            if g.queues.contains_key(&key) || q.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -225,6 +244,16 @@ impl Store for MemStore {
             let key = (p.base.tenant_id, p.base.id);
             g.presence_order.push(key);
             g.presence.insert(key, p);
+        }
+        for c in tx.cdrs {
+            let key = (c.base.tenant_id, c.base.id);
+            g.cdr_order.push(key);
+            g.cdrs.insert(key, c);
+        }
+        for q in tx.queues {
+            let key = (q.base.tenant_id, q.base.id);
+            g.queue_order.push(key);
+            g.queues.insert(key, q);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -400,6 +429,24 @@ impl Store for MemStore {
             limit,
             cursor,
         ))
+    }
+
+    async fn get_cdr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Cdr>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.cdrs.get(&(tenant, id)).cloned())
+    }
+    async fn list_cdrs(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Cdr>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.cdr_order, |k| g.cdrs.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_queue(&self, tenant: Uuid, id: Uuid) -> Result<Option<Queue>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.queues.get(&(tenant, id)).cloned())
+    }
+    async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.queue_order, |k| g.queues.get(k).cloned(), tenant, limit, cursor))
     }
 
     async fn call_for_idempotency_key(

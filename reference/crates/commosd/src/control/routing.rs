@@ -18,6 +18,7 @@ use commos_core::events::call_ringing::CallRinging;
 use commos_core::events::call_started::CallStarted;
 use commos_core::events::call_transferred::{CallTransferred, TransferType};
 
+use crate::control::billing;
 use crate::media::{MediaCommand, MediaFact, MediaPlane};
 use crate::relay::RelaySignal;
 use crate::store::{Store, StoreError, Tx};
@@ -217,8 +218,10 @@ impl Routing {
         Ok(call)
     }
 
-    /// End a Call (`POST /v1/calls/{id}:hangup` → `CallEnded`). Computes the billed
-    /// duration from the Call's own timestamps.
+    /// End a Call (`POST /v1/calls/{id}:hangup`). Emits `CallEnded` **and** assembles the
+    /// billable CDR + `BillingGenerated` event, all in one transaction (Billing consumes
+    /// `CallEnded`; here the platform produces the CDR synchronously so the record is durable
+    /// with the state change — CMOS-03-ARCH-030, Volume 10).
     pub async fn hangup(
         &self,
         tenant: Uuid,
@@ -229,22 +232,43 @@ impl Routing {
         call.transition(CallState::Ended)
             .map_err(|e| RoutingError::IllegalState(e.to_string()))?;
         let ended_at = call.ended_at.expect("ended_at set on transition to ENDED");
-        let start = call.answered_at.unwrap_or(call.base.created_at);
-        let duration_ms = (ended_at.into_offset() - start.into_offset())
-            .whole_milliseconds()
-            .max(0) as u64;
-        self.commit_event(
-            tenant,
-            &call,
-            true,
+
+        // Assemble the CDR from the completed Call (organisation = tenant for now).
+        let cdr = billing::assemble_cdr(&call, tenant);
+        let ctx = Correlation {
+            tenant_id: tenant,
+            correlation_id: call.correlation_id,
+            causation_id: None,
+            sequence: None,
+            traceparent: None,
+        };
+        let ended = Envelope::new(
             CallEnded {
                 call_id: call.base.id,
                 ended_at,
-                duration_ms,
+                duration_ms: cdr.duration_ms,
                 hangup_cause: cause,
             },
-        )
-        .await?;
+            &ctx,
+            format!("{}:CallEnded:{}", call.base.id, call.base.version),
+        );
+        let billing = Envelope::new(
+            billing::billing_event(&cdr),
+            &ctx,
+            format!("{}:BillingGenerated", cdr.base.id),
+        );
+
+        // Call (ENDED) + CDR + both events, atomically.
+        self.store
+            .commit(Tx {
+                calls: vec![call.clone()],
+                cdrs: vec![cdr],
+                events: vec![ended.to_json(), billing.to_json()],
+                ..Default::default()
+            })
+            .await?;
+        self.signal.wake();
+
         self.media.dispatch(MediaCommand::Hangup { call_id: call.base.id });
         Ok(call)
     }
@@ -328,8 +352,9 @@ mod tests {
             Err(RoutingError::IllegalState(_))
         ));
 
-        // Every transition emitted an event: CallStarted, Ringing, Answered, Held, Resumed, Ended.
-        assert_eq!(store.peek_outbox(100).await.unwrap().len(), 6);
+        // Events emitted: CallStarted, CallRinging, CallAnswered, CallHeld, CallResumed,
+        // then CallEnded + BillingGenerated on hangup.
+        assert_eq!(store.peek_outbox(100).await.unwrap().len(), 7);
     }
 
     #[tokio::test]

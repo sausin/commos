@@ -23,6 +23,11 @@ pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
 
+    /// UDP address the SIP signalling ingress binds (Volume 7). Default `0.0.0.0:5060`
+    /// (the IANA SIP port); `null` disables the SIP plane.
+    #[serde(default = "default_sip_listen")]
+    pub sip_listen: Option<SocketAddr>,
+
     /// Database DSN — the system of record. A **reference**, never an inline credential
     /// (CMOS-14-DEP-083). `None` (the default) means use the embedded SQLite store at
     /// `{data_dir}/commos.db` — durable with zero external dependency (CMOS-14-DEP-021,
@@ -108,6 +113,7 @@ impl Default for Config {
         Config {
             api_version: default_api_version(),
             listen: default_listen(),
+            sip_listen: default_sip_listen(),
             database_url: None,
             data_dir: default_data_dir(),
             log: LogConfig::default(),
@@ -117,6 +123,10 @@ impl Default for Config {
 
 fn default_data_dir() -> String {
     ".".to_string()
+}
+
+fn default_sip_listen() -> Option<SocketAddr> {
+    Some("0.0.0.0:5060".parse().expect("valid default SIP addr"))
 }
 
 fn default_api_version() -> String {

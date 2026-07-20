@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bus::EventBus;
 use crate::control::messaging::MessagingService;
+use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
 use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub routing: Routing,
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
+    pub queues: QueueService,
     /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
     /// keeps write volume near zero for SD-card longevity; CMOS-14-DEP-021).
     pub registrations: RegistrationRegistry,
@@ -38,6 +40,7 @@ impl AppState {
         routing: Routing,
         messaging: MessagingService,
         realtime: RealtimeService,
+        queues: QueueService,
         registrations: RegistrationRegistry,
         bus: EventBus,
         recent: RecentEvents,
@@ -47,6 +50,7 @@ impl AppState {
             routing,
             messaging,
             realtime,
+            queues,
             registrations,
             bus,
             recent,

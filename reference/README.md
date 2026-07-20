@@ -125,8 +125,29 @@ ephemeral in-process store (tests), set `database_url` to `memory://`.
   `/{id}` reads. Same substrate, same store, same outbox — voice is one workload of many.
 - **Registrations** — `GET|POST /v1/registrations`, `GET|DELETE /v1/registrations/{id}`.
   Device registrations are **ephemeral in-memory** state (not the durable store), so a
-  re-REGISTER storm never touches disk — SD cards last (CMOS-14-DEP-021).
+  re-REGISTER storm never touches disk — SD cards last (CMOS-14-DEP-021). A real softphone
+  can also register over **SIP/UDP** (see below).
+- **Billing** — `GET /v1/cdrs`, `GET /v1/cdrs/{id}`. A CDR + `BillingGenerated` event are
+  produced atomically when a Call ends (Volume 10).
+- **Contact-centre** — `GET|POST /v1/queues`, `GET /v1/queues/{id}` (strategy + members).
 - `GET /_introspect/events[/stream]` — **non-normative** view of the event bus for bring-up; not part of the contract.
+
+### SIP signalling (Volume 7)
+
+`commosd` also listens for **SIP over UDP** (default `0.0.0.0:5060`, set `sip_listen: null` to
+disable). REGISTER is fully handled — a real softphone (Linphone, a desk phone) registers and
+appears in `/v1/registrations` and the dashboard:
+
+```bash
+# from a SIP client, or a quick smoke test:
+printf 'REGISTER sip:commos.local SIP/2.0\r\nVia: SIP/2.0/UDP host;branch=z9hG4bK1\r\n'\
+'From: <sip:200@commos.local>;tag=a\r\nTo: <sip:200@commos.local>\r\nCall-ID: c1\r\n'\
+'CSeq: 1 REGISTER\r\nContact: <sip:200@host:5060>\r\nExpires: 3600\r\n\r\n' \
+  | nc -u -w1 localhost 5060           # -> SIP/2.0 200 OK
+```
+
+OPTIONS/BYE/CANCEL are answered; INVITE is acknowledged at the signalling layer. INVITE→Call
+creation and RTP media negotiation are the next step behind the existing `MediaPlane` boundary.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped.
 
@@ -148,11 +169,12 @@ All `/v1` routes are bearer-authenticated and tenant-scoped.
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. The real SIP/RTP media engine behind the existing `MediaPlane` trait (the fact channel is
-   already in place) — turning the in-memory registrations into real SIP registration.
-2. Richer queries and update/soft-delete across the workloads (thread-scoped message paging,
-   presence upsert-by-subject).
-3. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
+1. **SIP INVITE→Call + RTP media** — the SIP ingress handles REGISTER today; the next step is
+   INVITE creating a Call and RTP/SDP negotiation behind the existing `MediaPlane` boundary
+   (the control→media command path and media→control fact channel are already in place).
+2. Contact-centre depth: enqueue Calls into a Queue and route to Agents (`AgentStateChanged`
+   exists), and a real rating engine behind the CDR (the `Rating` interface is contracted).
+3. Richer queries / update / soft-delete across the workloads.
+4. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
-4. Real JWT verification against Identity (Volume 9), replacing the dev token.
-5. CDR/billing assembly on `CallEnded`, and the contact-centre (Queue/Agent) workload.
+5. Real JWT verification against Identity (Volume 9), and SIP-domain→tenant mapping.

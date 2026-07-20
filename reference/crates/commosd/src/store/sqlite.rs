@@ -23,9 +23,11 @@ use sqlx::{Row, SqlitePool};
 
 use commos_core::common::{EntityBase, Uuid};
 use commos_core::entities::call::Call;
+use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
+use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::video_room::VideoRoom;
 
@@ -46,6 +48,10 @@ CREATE TABLE IF NOT EXISTS video_rooms  (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS video_rooms_tenant_id_idx ON video_rooms (tenant_id, id);
 CREATE TABLE IF NOT EXISTS presence     (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS presence_tenant_id_idx ON presence (tenant_id, id);
+CREATE TABLE IF NOT EXISTS cdrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS cdrs_tenant_id_idx ON cdrs (tenant_id, id);
+CREATE TABLE IF NOT EXISTS queues       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 "#;
@@ -243,6 +249,18 @@ impl Store for SqliteStore {
                 return Err(StoreError::VersionConflict { entity: "PresenceState", id: p.base.id.to_string(), expected: 0 });
             }
         }
+        for c in &tx.cdrs {
+            let data = serde_json::to_string(c).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "cdrs", &c.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "CDR", id: c.base.id.to_string(), expected: 0 });
+            }
+        }
+        for q in &tx.queues {
+            let data = serde_json::to_string(q).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "queues", &q.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
+            }
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -310,6 +328,20 @@ impl Store for SqliteStore {
     }
     async fn list_presence(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<PresenceState>, StoreError> {
         self.list("presence", tenant, limit, cursor).await
+    }
+
+    async fn get_cdr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Cdr>, StoreError> {
+        self.get_one("cdrs", tenant, id).await
+    }
+    async fn list_cdrs(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Cdr>, StoreError> {
+        self.list("cdrs", tenant, limit, cursor).await
+    }
+
+    async fn get_queue(&self, tenant: Uuid, id: Uuid) -> Result<Option<Queue>, StoreError> {
+        self.get_one("queues", tenant, id).await
+    }
+    async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
+        self.list("queues", tenant, limit, cursor).await
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

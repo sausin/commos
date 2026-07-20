@@ -12,6 +12,7 @@ pub mod call_resumed;
 pub mod call_ringing;
 pub mod call_started;
 pub mod call_transferred;
+pub mod billing_generated;
 pub mod channel_created;
 pub mod message_sent;
 pub mod participant_joined;

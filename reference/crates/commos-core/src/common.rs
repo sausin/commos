@@ -143,7 +143,7 @@ impl<'de> Deserialize<'de> for Timestamp {
 }
 
 /// ISO 4217 alphabetic currency code (`common.schema.json#/$defs/Currency`).
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Currency(String);
 
@@ -158,7 +158,7 @@ impl Currency {
 }
 
 /// Money as integer minor units — never floating point (`common.schema.json#/$defs/Money`).
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Money {
     pub currency: Currency,
     pub minor_units: i64,

@@ -13,9 +13,11 @@ use sqlx::{PgPool, Row};
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
+use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::video_room::VideoRoom;
 
@@ -91,6 +93,26 @@ CREATE TABLE IF NOT EXISTS presence (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS presence_tenant_id_idx ON presence (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS cdrs (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cdrs_tenant_id_idx ON cdrs (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS queues (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
@@ -364,6 +386,46 @@ impl Store for PgStore {
             }
         }
 
+        for c in &tx.cdrs {
+            let data = serde_json::to_value(c).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO cdrs (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(c.base.id.as_uuid())
+            .bind(c.base.tenant_id.as_uuid())
+            .bind(c.base.version as i64)
+            .bind(c.base.created_at.into_offset())
+            .bind(c.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict { entity: "CDR", id: c.base.id.to_string(), expected: 0 });
+            }
+        }
+
+        for q in &tx.queues {
+            let data = serde_json::to_value(q).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO queues (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(q.base.id.as_uuid())
+            .bind(q.base.tenant_id.as_uuid())
+            .bind(q.base.version as i64)
+            .bind(q.base.created_at.into_offset())
+            .bind(q.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
+            }
+        }
+
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
                 "INSERT INTO idempotency_keys (tenant_id, key, call_id) \
@@ -582,6 +644,46 @@ impl Store for PgStore {
             .await?;
         let next_cursor = if items.len() == limit {
             items.last().map(|p| p.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_cdr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Cdr>, StoreError> {
+        let row = sqlx::query("SELECT data FROM cdrs WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_cdrs(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Cdr>, StoreError> {
+        let items = self.list_entities::<Cdr>("cdrs", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|c| c.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_queue(&self, tenant: Uuid, id: Uuid) -> Result<Option<Queue>, StoreError> {
+        let row = sqlx::query("SELECT data FROM queues WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
+        let items = self.list_entities::<Queue>("queues", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|q| q.base.id.to_string())
         } else {
             None
         };

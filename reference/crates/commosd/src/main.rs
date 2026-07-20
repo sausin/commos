@@ -16,6 +16,7 @@ mod control;
 mod introspect;
 mod media;
 mod relay;
+mod sip;
 mod state;
 mod store;
 mod telemetry;
@@ -33,6 +34,10 @@ use crate::media::LoopbackMedia;
 use crate::relay::RelaySignal;
 use crate::state::AppState;
 use crate::store::MemStore;
+
+/// Tenant the SIP ingress attributes registrations to, until SIP-domain→tenant mapping
+/// lands (Volume 9). Matches the dev bearer token used elsewhere.
+const SIP_DEFAULT_TENANT: &str = "01920000-0000-7000-8000-000000000001";
 
 /// Exit-code contract (CMOS-14-DEP-002), following the BSD `sysexits.h` convention so
 /// systemd and operators can distinguish failure classes.
@@ -134,7 +139,23 @@ async fn run(cfg: Config) -> i32 {
     let routing = Routing::new(store.clone(), media, signal.clone());
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
+    let queues = control::queue::QueueService::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
+
+    // SIP signalling ingress (Volume 7): a real softphone can REGISTER and appear in
+    // /v1/registrations and the dashboard. The ingress maps to a single tenant for now
+    // (SIP-domain→tenant mapping is Volume 9). INVITE→Call + RTP land next.
+    if let Some(sip_addr) = cfg.sip_listen {
+        let regs = registrations.clone();
+        let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
+            .expect("valid default SIP tenant");
+        tokio::spawn(async move {
+            if let Err(e) = sip::SipServer::new(regs, default_tenant).run(sip_addr).await {
+                tracing::error!("SIP ingress stopped: {e}");
+            }
+        });
+        tracing::info!(addr = %sip_addr, "SIP signalling ingress listening (UDP)");
+    }
 
     // Media-fact loop: apply media→control facts (ring/answer/…) to Call state and emit their
     // events (CMOS-03-ARCH-003). In the single binary this is an in-process channel; in the
@@ -156,6 +177,7 @@ async fn run(cfg: Config) -> i32 {
         routing,
         messaging,
         realtime,
+        queues,
         registrations,
         bus.clone(),
         recent,
