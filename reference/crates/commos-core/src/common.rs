@@ -26,6 +26,18 @@ impl Uuid {
         Uuid(uuid::Uuid::now_v7())
     }
 
+    /// Borrow the inner `uuid::Uuid` — for persistence bindings that round-trip through a
+    /// native `uuid` column. Values only enter the system already validated, so this is safe.
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Wrap a `uuid::Uuid` read back from storage. The stored value was validated on the way
+    /// in, so no re-validation is performed here.
+    pub fn from_uuid(u: uuid::Uuid) -> Self {
+        Uuid(u)
+    }
+
     /// Parse and validate that the value is a v7 UUID in canonical lowercase form.
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let parsed = uuid::Uuid::parse_str(s).map_err(|_| CoreError::invalid("Uuid", s))?;
@@ -88,6 +100,20 @@ impl Timestamp {
     pub fn parse(s: &str) -> Result<Self, CoreError> {
         let dt = OffsetDateTime::parse(s, &Rfc3339).map_err(|_| CoreError::invalid("Timestamp", s))?;
         Ok(Timestamp(dt))
+    }
+
+    /// Wrap an `OffsetDateTime` read from a `timestamptz` column, truncated to the
+    /// contract's millisecond resolution so it round-trips identically.
+    pub fn from_offset(dt: OffsetDateTime) -> Self {
+        let dt = dt.to_offset(time::UtcOffset::UTC);
+        let millis = dt.millisecond();
+        let truncated = dt.replace_nanosecond(millis as u32 * 1_000_000).expect("in range");
+        Timestamp(truncated)
+    }
+
+    /// Borrow the inner `OffsetDateTime` for persistence into a `timestamptz` column.
+    pub fn into_offset(self) -> OffsetDateTime {
+        self.0
     }
 }
 

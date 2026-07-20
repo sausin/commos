@@ -1,75 +1,18 @@
-//! System of record + transactional outbox (CMOS-00-ENG-007; CMOS-03-ARCH-030;
-//! CMOS-05-EVT-010).
-//!
-//! **The guarantee:** every observable state change is written to the outbox *in the same
-//! transaction* as the state change. Either both land or neither does; the relay then
-//! delivers from the outbox at-least-once. That is what makes "no state change without its
-//! event" true even across a crash.
-//!
-//! [`Store`] is the abstraction; [`MemStore`] is the zero-dependency binding that lets the
-//! single binary boot with no PostgreSQL (CMOS-14-DEP-021). A PostgreSQL binding
-//! implements the same trait with a real `BEGIN … COMMIT` and a `SELECT … FOR UPDATE SKIP
-//! LOCKED` relay — no caller changes (CMOS-14-DEP-042).
+//! In-memory binding of [`Store`] (CMOS-14-DEP-021: the single binary provides an embedded
+//! equivalent so it needs no external broker/database). A single mutex stands in for the
+//! database transaction boundary, so `commit` is genuinely all-or-nothing.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+use axum::async_trait;
+
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 
-/// One durable transaction: entity upserts and the events they produce, committed together.
-#[derive(Default)]
-pub struct Tx {
-    pub calls: Vec<Call>,
-    pub events: Vec<serde_json::Value>,
-    /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
-    pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
-}
+use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
-/// A record awaiting relay to the Event Bus.
-#[derive(Clone)]
-pub struct OutboxRecord {
-    pub seq: u64,
-    pub event: serde_json::Value,
-}
-
-/// A page of a cursor-paginated listing (Volume 4 pagination: `{items, next_cursor}`).
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("optimistic-concurrency conflict on {entity} {id}: expected version {expected}")]
-    VersionConflict {
-        entity: &'static str,
-        id: String,
-        expected: u64,
-    },
-}
-
-/// The persistence + outbox contract. All reads are tenant-scoped: a caller cannot ask
-/// for another tenant's data (CMOS-03-ARCH-050 defence in depth).
-pub trait Store: Send + Sync {
-    /// Atomically apply a transaction: upsert entities and append their events to the
-    /// outbox. This is the single write path (CMOS-03-ARCH-030).
-    fn commit(&self, tx: Tx) -> Result<(), StoreError>;
-
-    fn get_call(&self, tenant: Uuid, id: Uuid) -> Option<Call>;
-    fn list_calls(&self, tenant: Uuid, limit: usize, cursor: Option<&str>) -> Page<Call>;
-
-    /// Return the call id previously created under this idempotency key, if any.
-    fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Option<Uuid>;
-
-    /// Relay support: take up to `max` un-relayed records (does not advance the cursor).
-    fn peek_outbox(&self, max: usize) -> Vec<OutboxRecord>;
-    /// Mark everything up to and including `seq` as relayed (durable cursor advance).
-    fn ack_outbox(&self, up_to_seq: u64);
-}
-
-/// In-memory binding of [`Store`]. A single mutex stands in for the database
-/// transaction boundary, so `commit` is genuinely all-or-nothing.
+/// In-memory system of record + outbox. State is not durable across restarts.
 pub struct MemStore {
     inner: Mutex<Inner>,
 }
@@ -104,8 +47,9 @@ impl Default for MemStore {
     }
 }
 
+#[async_trait]
 impl Store for MemStore {
-    fn commit(&self, tx: Tx) -> Result<(), StoreError> {
+    async fn commit(&self, tx: Tx) -> Result<(), StoreError> {
         let mut g = self.inner.lock().expect("store mutex not poisoned");
 
         // 1) Validate optimistic concurrency for every upsert before mutating anything,
@@ -149,15 +93,20 @@ impl Store for MemStore {
         Ok(())
     }
 
-    fn get_call(&self, tenant: Uuid, id: Uuid) -> Option<Call> {
+    async fn get_call(&self, tenant: Uuid, id: Uuid) -> Result<Option<Call>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
-        g.calls.get(&(tenant, id)).cloned()
+        Ok(g.calls.get(&(tenant, id)).cloned())
     }
 
-    fn list_calls(&self, tenant: Uuid, limit: usize, cursor: Option<&str>) -> Page<Call> {
+    async fn list_calls(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Call>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
         // Cursor is the last id returned; resume strictly after it in insertion order.
-        let start = match cursor {
+        let start = match cursor.as_deref() {
             None => 0,
             Some(c) => g
                 .order
@@ -193,20 +142,24 @@ impl Store for MemStore {
             None
         };
 
-        Page { items, next_cursor }
+        Ok(Page { items, next_cursor })
     }
 
-    fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Option<Uuid> {
+    async fn call_for_idempotency_key(
+        &self,
+        tenant: Uuid,
+        key: &str,
+    ) -> Result<Option<Uuid>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
-        g.idempotency.get(&(tenant, key.to_string())).copied()
+        Ok(g.idempotency.get(&(tenant, key.to_string())).copied())
     }
 
-    fn peek_outbox(&self, max: usize) -> Vec<OutboxRecord> {
+    async fn peek_outbox(&self, max: usize) -> Result<Vec<OutboxRecord>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
-        g.outbox.iter().take(max).cloned().collect()
+        Ok(g.outbox.iter().take(max).cloned().collect())
     }
 
-    fn ack_outbox(&self, up_to_seq: u64) {
+    async fn ack_outbox(&self, up_to_seq: u64) -> Result<(), StoreError> {
         let mut g = self.inner.lock().expect("store mutex not poisoned");
         while let Some(front) = g.outbox.front() {
             if front.seq <= up_to_seq {
@@ -216,6 +169,7 @@ impl Store for MemStore {
             }
         }
         g.relayed_through = g.relayed_through.max(up_to_seq);
+        Ok(())
     }
 }
 
@@ -228,8 +182,8 @@ mod tests {
         Call::originate(tenant, Direction::Outbound, "sip:100", "+14155550100")
     }
 
-    #[test]
-    fn commit_persists_and_queues_outbox_together() {
+    #[tokio::test]
+    async fn commit_persists_and_queues_outbox_together() {
         let store = MemStore::new();
         let tenant = Uuid::now_v7();
         let c = call(tenant);
@@ -240,14 +194,15 @@ mod tests {
                 events: vec![serde_json::json!({"type": "CallStarted"})],
                 idempotency: None,
             })
+            .await
             .unwrap();
 
-        assert!(store.get_call(tenant, id).is_some());
-        assert_eq!(store.peek_outbox(10).len(), 1);
+        assert!(store.get_call(tenant, id).await.unwrap().is_some());
+        assert_eq!(store.peek_outbox(10).await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn reads_are_tenant_scoped() {
+    #[tokio::test]
+    async fn reads_are_tenant_scoped() {
         let store = MemStore::new();
         let a = Uuid::now_v7();
         let b = Uuid::now_v7();
@@ -255,32 +210,36 @@ mod tests {
         let id = c.base.id;
         store
             .commit(Tx { calls: vec![c], ..Default::default() })
+            .await
             .unwrap();
         // Tenant B cannot see tenant A's call.
-        assert!(store.get_call(b, id).is_none());
-        assert_eq!(store.list_calls(b, 50, None).items.len(), 0);
+        assert!(store.get_call(b, id).await.unwrap().is_none());
+        assert_eq!(store.list_calls(b, 50, None).await.unwrap().items.len(), 0);
     }
 
-    #[test]
-    fn version_conflict_is_rejected() {
+    #[tokio::test]
+    async fn version_conflict_is_rejected() {
         let store = MemStore::new();
         let tenant = Uuid::now_v7();
         let c = call(tenant);
         let id = c.base.id;
         store
             .commit(Tx { calls: vec![c.clone()], ..Default::default() })
+            .await
             .unwrap();
         // Re-committing the same v0 (not v1) is a conflict.
         let err = store
             .commit(Tx { calls: vec![c], ..Default::default() })
+            .await
             .unwrap_err();
         match err {
             StoreError::VersionConflict { id: got, .. } => assert_eq!(got, id.to_string()),
+            other => panic!("expected version conflict, got {other:?}"),
         }
     }
 
-    #[test]
-    fn outbox_ack_advances_cursor() {
+    #[tokio::test]
+    async fn outbox_ack_advances_cursor() {
         let store = MemStore::new();
         let tenant = Uuid::now_v7();
         store
@@ -289,10 +248,11 @@ mod tests {
                 events: vec![serde_json::json!({"n": 0}), serde_json::json!({"n": 1})],
                 idempotency: None,
             })
+            .await
             .unwrap();
-        let batch = store.peek_outbox(10);
+        let batch = store.peek_outbox(10).await.unwrap();
         assert_eq!(batch.len(), 2);
-        store.ack_outbox(batch.last().unwrap().seq);
-        assert_eq!(store.peek_outbox(10).len(), 0);
+        store.ack_outbox(batch.last().unwrap().seq).await.unwrap();
+        assert_eq!(store.peek_outbox(10).await.unwrap().len(), 0);
     }
 }

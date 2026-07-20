@@ -1,0 +1,267 @@
+//! PostgreSQL binding of [`Store`] — the durable system of record (CMOS-14-DEP-020;
+//! CMOS-00-ENG-007). The transactional-outbox guarantee is a real `BEGIN … COMMIT`:
+//! entity upserts and their events land in one database transaction, so a crash can never
+//! leave a state change without its event (CMOS-03-ARCH-030 / CMOS-05-EVT-010).
+//!
+//! Entities are stored as their contract JSON in a `jsonb` column, with the identity /
+//! version / timestamp fields promoted to typed columns for querying and optimistic
+//! concurrency. This keeps the row a faithful, lossless image of the frozen entity.
+
+use axum::async_trait;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
+
+use commos_core::common::Uuid;
+use commos_core::entities::call::Call;
+
+use super::{OutboxRecord, Page, Store, StoreError, Tx};
+
+/// Schema, applied idempotently at boot. Backward-compatible `IF NOT EXISTS` DDL so old and
+/// new binaries can run concurrently during a rolling upgrade (CMOS-14-DEP-052).
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS calls (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calls_tenant_id_idx ON calls (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    tenant_id   uuid NOT NULL,
+    key         text NOT NULL,
+    call_id     uuid NOT NULL,
+    PRIMARY KEY (tenant_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+    seq         bigserial PRIMARY KEY,
+    event       jsonb NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+"#;
+
+/// Turn any sqlx/serde error into a backend `StoreError`.
+fn be<E: std::fmt::Display>(e: E) -> StoreError {
+    StoreError::Backend(e.to_string())
+}
+
+pub struct PgStore {
+    pool: PgPool,
+}
+
+impl PgStore {
+    /// Connect and apply the schema. The pool is bounded so a small box (a Raspberry Pi)
+    /// doesn't exhaust Postgres connections.
+    pub async fn connect(dsn: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect(dsn)
+            .await
+            .map_err(be)?;
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.map_err(be)?;
+        Ok(PgStore { pool })
+    }
+
+    fn call_from_row(row: &sqlx::postgres::PgRow) -> Result<Call, StoreError> {
+        let data: serde_json::Value = row.try_get("data").map_err(be)?;
+        serde_json::from_value(data).map_err(be)
+    }
+}
+
+#[async_trait]
+impl Store for PgStore {
+    async fn commit(&self, tx: Tx) -> Result<(), StoreError> {
+        // One database transaction. Dropping `dbtx` on any early return rolls it back, so
+        // the whole batch is all-or-nothing (CMOS-03-ARCH-030).
+        let mut dbtx = self.pool.begin().await.map_err(be)?;
+
+        for call in &tx.calls {
+            let data = serde_json::to_value(call).map_err(be)?;
+            let id = call.base.id.as_uuid();
+            let tenant = call.base.tenant_id.as_uuid();
+            let version = call.base.version as i64;
+            let created = call.base.created_at.into_offset();
+            let updated = call.base.updated_at.into_offset();
+
+            if call.base.version == 0 {
+                // First write: a plain insert. A colliding id means someone else created it.
+                let res = sqlx::query(
+                    "INSERT INTO calls (id, tenant_id, version, created_at, updated_at, data) \
+                     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(id)
+                .bind(tenant)
+                .bind(version)
+                .bind(created)
+                .bind(updated)
+                .bind(&data)
+                .execute(&mut *dbtx)
+                .await
+                .map_err(be)?;
+                if res.rows_affected() == 0 {
+                    return Err(StoreError::VersionConflict {
+                        entity: "Call",
+                        id: call.base.id.to_string(),
+                        expected: 0,
+                    });
+                }
+            } else {
+                // Update guarded by the prior version: optimistic concurrency (CMOS-02-DOM-005).
+                let res = sqlx::query(
+                    "UPDATE calls SET version = $1, updated_at = $2, data = $3 \
+                     WHERE id = $4 AND tenant_id = $5 AND version = $6",
+                )
+                .bind(version)
+                .bind(updated)
+                .bind(&data)
+                .bind(id)
+                .bind(tenant)
+                .bind(version - 1)
+                .execute(&mut *dbtx)
+                .await
+                .map_err(be)?;
+                if res.rows_affected() == 0 {
+                    return Err(StoreError::VersionConflict {
+                        entity: "Call",
+                        id: call.base.id.to_string(),
+                        expected: call.base.version,
+                    });
+                }
+            }
+        }
+
+        if let Some((tenant, key, call_id)) = &tx.idempotency {
+            sqlx::query(
+                "INSERT INTO idempotency_keys (tenant_id, key, call_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(tenant.as_uuid())
+            .bind(key)
+            .bind(call_id.as_uuid())
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+        }
+
+        for event in &tx.events {
+            sqlx::query("INSERT INTO outbox (event) VALUES ($1)")
+                .bind(event)
+                .execute(&mut *dbtx)
+                .await
+                .map_err(be)?;
+        }
+
+        dbtx.commit().await.map_err(be)?;
+        Ok(())
+    }
+
+    async fn get_call(&self, tenant: Uuid, id: Uuid) -> Result<Option<Call>, StoreError> {
+        let row = sqlx::query("SELECT data FROM calls WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(Self::call_from_row).transpose()
+    }
+
+    async fn list_calls(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Call>, StoreError> {
+        // UUIDv7 ids sort by creation time, so `id > cursor` resumes strictly after the last
+        // row returned — a stable keyset cursor.
+        let limit_i = limit as i64;
+        let rows = match cursor {
+            Some(c) => {
+                let cur = uuid::Uuid::parse_str(&c)
+                    .map_err(|_| StoreError::Backend("invalid cursor".into()))?;
+                sqlx::query(
+                    "SELECT data FROM calls WHERE tenant_id = $1 AND id > $2 \
+                     ORDER BY id ASC LIMIT $3",
+                )
+                .bind(tenant.as_uuid())
+                .bind(cur)
+                .bind(limit_i)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query("SELECT data FROM calls WHERE tenant_id = $1 ORDER BY id ASC LIMIT $2")
+                    .bind(tenant.as_uuid())
+                    .bind(limit_i)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+        }
+        .map_err(be)?;
+
+        let items = rows
+            .iter()
+            .map(Self::call_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Offer a cursor only when the page was full (more may remain).
+        let next_cursor = if items.len() == limit {
+            items.last().map(|c| c.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn call_for_idempotency_key(
+        &self,
+        tenant: Uuid,
+        key: &str,
+    ) -> Result<Option<Uuid>, StoreError> {
+        let row = sqlx::query("SELECT call_id FROM idempotency_keys WHERE tenant_id = $1 AND key = $2")
+            .bind(tenant.as_uuid())
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        match row {
+            Some(r) => {
+                let id: uuid::Uuid = r.try_get("call_id").map_err(be)?;
+                Ok(Some(Uuid::from_uuid(id)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn peek_outbox(&self, max: usize) -> Result<Vec<OutboxRecord>, StoreError> {
+        // Bound the fetch so a final-drain `usize::MAX` doesn't overflow the bind.
+        let lim = max.min(10_000) as i64;
+        let rows = sqlx::query("SELECT seq, event FROM outbox ORDER BY seq ASC LIMIT $1")
+            .bind(lim)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(be)?;
+        rows.iter()
+            .map(|r| {
+                let seq: i64 = r.try_get("seq").map_err(be)?;
+                let event: serde_json::Value = r.try_get("event").map_err(be)?;
+                Ok(OutboxRecord {
+                    seq: seq as u64,
+                    event,
+                })
+            })
+            .collect()
+    }
+
+    async fn ack_outbox(&self, up_to_seq: u64) -> Result<(), StoreError> {
+        // At-least-once: the relay publishes before it acks, so a crash between the two
+        // re-delivers rather than dropping. Deleting relayed rows keeps the outbox bounded.
+        sqlx::query("DELETE FROM outbox WHERE seq <= $1")
+            .bind(up_to_seq as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(())
+    }
+}

@@ -1,0 +1,60 @@
+# CommOS reference — local PostgreSQL for the durable system-of-record posture.
+#
+# CommOS runs zero-dependency on its in-process store, but PostgreSQL is the intended
+# durable system of record at scale (CMOS-14-DEP-020) and the only hard dependency the
+# binary ever takes. This compose file stands up that dependency for local operation and
+# for the smoke test in scripts/smoke.sh.
+#
+#   docker compose -f deploy/docker-compose.yml up -d postgres
+#
+# Secrets are never inlined into config-as-code (CMOS-14-DEP-083); commosd resolves the
+# DSN from the DATABASE_URL environment variable at boot via `ref_uri: "env://DATABASE_URL"`
+# in pbx.yaml. The password below is a *dev default* only — override POSTGRES_PASSWORD in a
+# real deployment and source it from your secret manager.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: commos-postgres
+    environment:
+      POSTGRES_USER: commos
+      # Dev default; override by exporting POSTGRES_PASSWORD before `up`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-commos-dev-password}
+      POSTGRES_DB: commos
+    ports:
+      # Exposed on the host so commosd (run natively) and scripts/smoke.sh can reach it.
+      - "5432:5432"
+    volumes:
+      - commos-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # commosd's `depends_on` gate below waits on this; `up` also blocks until healthy.
+      test: ["CMD-SHELL", "pg_isready -U commos -d commos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional: run the single binary in the same network as PostgreSQL. Uncomment and
+  # provide an image (or build:) that contains `commosd`. Schema migrations run
+  # automatically at boot, so no separate migration step is needed.
+  #
+  # commosd:
+  #   image: commos/commosd:latest        # or build: { context: .. }
+  #   command: ["commosd", "--config", "/etc/commos/pbx.yaml"]
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy        # wait for pg_isready before booting
+  #   environment:
+  #     # The DSN is a *reference* in pbx.yaml (env://DATABASE_URL) and resolved here.
+  #     # Inside the compose network the host is the service name `postgres`, not localhost.
+  #     DATABASE_URL: "postgres://commos:${POSTGRES_PASSWORD:-commos-dev-password}@postgres:5432/commos"
+  #   volumes:
+  #     - ./pbx.example.yaml:/etc/commos/pbx.yaml:ro
+  #   ports:
+  #     - "8080:8080"
+  #   restart: on-failure
+
+volumes:
+  # Named volume so PostgreSQL data survives `down` (use `down -v` to wipe it).
+  commos-pgdata:

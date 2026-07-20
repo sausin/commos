@@ -27,19 +27,22 @@ presence, and AI agents without a redesign.
 
 | Path | What it is |
 |------|-----------|
-| `crates/commos-core` | Rust projection of the frozen contracts (`contracts/json-schema/*`): primitives, the CloudEvents envelope, entities, and event payloads. Constraints are enforced at the type boundary. |
-| `crates/commosd` | The single binary: API Gateway (Axum), control-plane services, transactional outbox + Event Bus, the typed control→media boundary, config-as-code, graceful drain. |
+| `crates/commos-core` | Rust projection of the frozen contracts (`contracts/json-schema/*`): primitives, the CloudEvents envelope, entities (Call + the messaging workload: Channel/Thread/Message), and event payloads (the full Call lifecycle). Constraints are enforced at the type boundary. |
+| `crates/commosd` | The single binary: API Gateway (Axum), control-plane services, transactional outbox + Event Bus, the typed control→media boundary, config-as-code, graceful drain. The `Store` has two bindings — in-memory (zero-dependency) and **PostgreSQL** (durable system of record). |
 | `build/targets.toml` · `build/build.sh` | The architecture registry and a parametric cross-build. Raspberry Pi 4 (arm64) is the primary target; amd64 and armv7 are one row each. |
-| `deploy/` | Reference `systemd` unit and an example `pbx.yaml`. |
+| `deploy/` | Reference `systemd` unit, example `pbx.yaml`, and a Docker Compose for PostgreSQL. |
+| `scripts/smoke.sh` · `docs/postgres.md` | End-to-end smoke test and the operator guide for running against PostgreSQL. |
 
 ## How the code maps to the spec
 
 | Spec requirement | Where |
 |------------------|-------|
-| Single self-contained binary, PostgreSQL-only hard dep (CMOS-14-DEP-001/020) | `commosd` boots with zero external deps on the in-process store |
+| Single self-contained binary, PostgreSQL-only hard dep (CMOS-14-DEP-001/020) | `commosd` boots with zero external deps on the in-process store, or on PostgreSQL when configured |
+| PostgreSQL is the system of record (CMOS-14-DEP-020) | `store/postgres.rs` — durable binding; entities stored as contract JSON with typed identity/version columns |
 | Two planes over a typed interface, never shared memory (CMOS-03-ARCH-001/002) | `media.rs` — `MediaPlane` trait + `MediaCommand`/`MediaAck`; splittable to a media node unchanged |
-| Stateless control plane; all state in the store (CMOS-03-ARCH-010) | `store.rs` — `Store` trait; handlers hold only shared handles |
-| Transactional outbox: no state change without its event (CMOS-03-ARCH-030 / CMOS-05-EVT-010) | `store.rs` `commit()` writes entity + event atomically; `relay.rs` drains at-least-once |
+| Stateless control plane; all state in the store (CMOS-03-ARCH-010) | `store/` — `Store` trait; handlers hold only shared handles |
+| Transactional outbox: no state change without its event (CMOS-03-ARCH-030 / CMOS-05-EVT-010) | `store/*` `commit()` writes entity + event in one DB transaction; `relay.rs` drains at-least-once |
+| Same source, any topology/binding, no caller change (CMOS-14-DEP-042) | in-memory and PostgreSQL `Store` bindings are drop-in; Routing/API/relay are identical |
 | Canonical event envelope (Volume 5) | `commos-core::event::Envelope` — derives `type`/`source`/`subject`, all required fields |
 | Domain entity + state machine (Volume 2) | `commos-core::entities::call` — enforced legal transitions, versioned twin |
 | Tenant isolation, defence in depth (CMOS-03-ARCH-050) | every `Store` read is tenant-scoped; `TenantContext` auth extractor |
@@ -72,8 +75,25 @@ change — the architecture is not baked into the implementation.
 
 ## Run
 
+### Durable mode (PostgreSQL system of record)
+
 ```bash
-# Zero-dependency mode (in-process store) — boots anywhere, no PostgreSQL needed:
+docker compose -f deploy/docker-compose.yml up -d postgres
+export DATABASE_URL="postgres://commos:commos-dev-password@localhost:5432/commos"
+# pbx.yaml references the secret, never inlines it (CMOS-14-DEP-083):
+#   database_url:
+#     ref_uri: "env://DATABASE_URL"
+./target/debug/commosd --config deploy/pbx.example.yaml   # migrations run at boot
+bash scripts/smoke.sh                                     # end-to-end check
+```
+
+State persists across restarts and the outbox is a real `BEGIN…COMMIT`. See
+[`docs/postgres.md`](docs/postgres.md).
+
+### Zero-dependency mode (in-process store)
+
+```bash
+# Boots anywhere, no PostgreSQL needed (omit database_url from pbx.yaml):
 ./target/x86_64-unknown-linux-gnu/release/commosd --config deploy/pbx.example.yaml
 
 TENANT=01920000-0000-7000-8000-000000000001
@@ -95,20 +115,27 @@ curl -s localhost:8080/_introspect/events        # watch CallStarted flow throug
 ## Conformance evidence
 
 - **Unit + contract tests:** `cargo test` (core primitives match the schema patterns; the
-  Call state machine rejects illegal transitions; the store enforces tenant scoping,
-  optimistic concurrency, and atomic outbox commit).
+  Call state machine rejects illegal transitions; both `Store` bindings enforce tenant
+  scoping, optimistic concurrency, and atomic outbox commit).
 - **Runtime-event conformance:** the `CallStarted` envelope emitted at runtime validates
   against the **frozen** `contracts/json-schema/events/CallStarted.schema.json` (envelope +
   common defs) using the same `referencing` registry the spec's harness uses.
+- **Live PostgreSQL:** `commosd` boots against PostgreSQL, runs migrations, and `smoke.sh`
+  passes end-to-end; state **survives a process restart**, the idempotency key returns the
+  same Call without duplicating a row, and the outbox drains to empty after relay.
+- **Multi-arch:** the same source cross-compiles to a Raspberry Pi 4 `aarch64` ELF
+  (verified end-to-end under emulation) and to amd64.
 - **Spec harness unaffected:** `python3 conformance/run.py` remains green (504 checks).
 
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. PostgreSQL binding of `Store` (SQLx) with the real `BEGIN…COMMIT` outbox and a
-   `SELECT … FOR UPDATE SKIP LOCKED` relay — no caller changes.
-2. The remaining `/v1/calls/{id}:hold|resume|transfer|hangup` actions (media commands are
-   already modelled) and their events.
-3. More entities/events from `contracts/json-schema/` as the surface widens.
+1. The remaining `/v1/calls/{id}:hold|resume|transfer|hangup` actions — the media commands
+   and their events (`CallHeld`/`CallResumed`/`CallTransferred`/`CallEnded`) are already
+   modelled; this is API + Routing wiring.
+2. Persist the messaging-workload entities (Channel/Thread/Message) and expose their
+   `/v1` resources — the substrate is workload-general, so this reuses the same store/outbox.
+3. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
+   concurrent control-plane nodes (split-media topology).
 4. Real JWT verification against Identity (Volume 9), replacing the dev token.
 5. The SIP/RTP media engine behind the existing `MediaPlane` trait.

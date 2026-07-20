@@ -35,15 +35,17 @@ pub async fn list_calls(
     State(st): State<AppState>,
     tenant: TenantContext,
     Query(params): Query<ListParams>,
-) -> Json<CallPage> {
+) -> Result<Json<CallPage>, Problem> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let page = st
         .store
-        .list_calls(tenant.tenant_id, limit, params.cursor.as_deref());
-    Json(CallPage {
+        .list_calls(tenant.tenant_id, limit, params.cursor)
+        .await
+        .map_err(|e| Problem::internal(e.to_string()))?;
+    Ok(Json(CallPage {
         items: page.items,
         next_cursor: page.next_cursor,
-    })
+    }))
 }
 
 /// Body for `create_calls`. The full `Call` schema is the contract shape, but
@@ -82,6 +84,7 @@ pub async fn create_calls(
                 idempotency_key,
             },
         )
+        .await
         .map_err(|e| match e {
             RoutingError::MediaRejected(reason) => {
                 Problem::new(StatusCode::BAD_GATEWAY, "media_rejected", reason)
@@ -99,7 +102,12 @@ pub async fn get_call(
     Path(id): Path<String>,
 ) -> Result<Json<Call>, Problem> {
     let id = Uuid::parse(&id).map_err(|_| Problem::bad_request("id is not a valid UUIDv7"))?;
-    match st.store.get_call(tenant.tenant_id, id) {
+    match st
+        .store
+        .get_call(tenant.tenant_id, id)
+        .await
+        .map_err(|e| Problem::internal(e.to_string()))?
+    {
         Some(call) => Ok(Json(call)),
         None => Err(Problem::not_found("no such call")),
     }

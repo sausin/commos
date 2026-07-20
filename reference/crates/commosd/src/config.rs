@@ -42,6 +42,29 @@ pub struct SecretRef {
     pub ref_uri: String,
 }
 
+impl SecretRef {
+    /// Resolve the reference to its secret value from an external source. The reference
+    /// lives in Git; the secret never does (CMOS-14-DEP-083). This slice supports the two
+    /// simplest backends — an environment variable and a mounted file (e.g. a Kubernetes/
+    /// systemd secret); Vault/KMS bindings slot in behind the same scheme dispatch.
+    pub fn resolve(&self) -> Result<String, ConfigError> {
+        let uri = &self.ref_uri;
+        if let Some(var) = uri.strip_prefix("env://") {
+            std::env::var(var).map_err(|_| {
+                ConfigError::UnresolvedSecret(format!("environment variable {var} is not set"))
+            })
+        } else if let Some(path) = uri.strip_prefix("file://") {
+            std::fs::read_to_string(path)
+                .map(|s| s.trim().to_string())
+                .map_err(|e| ConfigError::UnresolvedSecret(format!("{uri}: {e}")))
+        } else {
+            Err(ConfigError::UnresolvedSecret(format!(
+                "unsupported secret scheme in '{uri}' (expected env:// or file://)"
+            )))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
@@ -105,6 +128,8 @@ pub enum ConfigError {
     Parse(String),
     #[error("config rejected — secrets must be referenced, never inline (CMOS-14-DEP-083): {0}")]
     InlineSecret(String),
+    #[error("could not resolve a referenced secret: {0}")]
+    UnresolvedSecret(String),
 }
 
 impl Config {

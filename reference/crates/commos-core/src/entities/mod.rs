@@ -5,3 +5,6 @@
 //! faithful projection, its enums and invariants enforced at the type boundary.
 
 pub mod call;
+pub mod channel;
+pub mod message;
+pub mod thread;

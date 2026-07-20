@@ -58,9 +58,12 @@ fn main() {
         Err(e) => {
             // Logging may not be up yet; write plainly to stderr.
             eprintln!("commosd: {e}");
+            // Every config failure class maps to the same exit-code contract slot.
             let code = match e {
-                ConfigError::InlineSecret(_) | ConfigError::Parse(_) => exit::CONFIG,
-                ConfigError::Io { .. } => exit::CONFIG,
+                ConfigError::InlineSecret(_)
+                | ConfigError::Parse(_)
+                | ConfigError::Io { .. }
+                | ConfigError::UnresolvedSecret(_) => exit::CONFIG,
             };
             std::process::exit(code);
         }
@@ -117,20 +120,46 @@ async fn run(cfg: Config) -> i32 {
     // --- wire the subsystems ---------------------------------------------------------
     let recent = RecentEvents::new();
     let bus = EventBus::new(recent.clone());
-    let store: Arc<dyn store::Store> = Arc::new(MemStore::new());
+
+    // Select the system-of-record binding. With a configured (referenced) database we use
+    // the durable PostgreSQL store (CMOS-14-DEP-020); with none we run the zero-dependency
+    // in-process store so the single binary boots anywhere (CMOS-14-DEP-021). Callers below
+    // are identical either way (CMOS-14-DEP-042).
+    let store: Arc<dyn store::Store> = match &cfg.database_url {
+        Some(secret) => {
+            let dsn = match secret.resolve() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return exit::CONFIG;
+                }
+            };
+            match store::PgStore::connect(&dsn).await {
+                Ok(pg) => {
+                    tracing::info!("connected to PostgreSQL system of record");
+                    Arc::new(pg)
+                }
+                Err(e) => {
+                    tracing::error!("cannot reach the database: {e}");
+                    return exit::UNAVAILABLE;
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "no database configured — running on the in-process store (single-binary, \
+                 zero-dependency mode). State is not durable across restarts."
+            );
+            Arc::new(MemStore::new())
+        }
+    };
+
     let media = Arc::new(LoopbackMedia);
     let signal = RelaySignal::new();
     let routing = Routing::new(store.clone(), media, signal.clone());
 
     let bind = cfg.listen.to_string();
     let app_state = AppState::new(store.clone(), routing, bus.clone(), recent);
-
-    if cfg.database_url.is_none() {
-        tracing::warn!(
-            "no database configured — running on the in-process store (single-binary, \
-             zero-dependency mode). State is not durable across restarts."
-        );
-    }
 
     // --- shutdown plumbing -----------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

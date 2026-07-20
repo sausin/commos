@@ -52,11 +52,15 @@ impl Routing {
     /// Atomicity: the Call and its `CallStarted` event are written in one [`Tx`]. The media
     /// command is issued after the commit succeeds, so we never signal media for a Call we
     /// failed to persist.
-    pub fn originate(&self, tenant: Uuid, req: OriginateRequest) -> Result<Call, RoutingError> {
+    pub async fn originate(
+        &self,
+        tenant: Uuid,
+        req: OriginateRequest,
+    ) -> Result<Call, RoutingError> {
         // Idempotent replay: a repeat of the same key returns the already-created Call.
         if let Some(key) = &req.idempotency_key {
-            if let Some(existing_id) = self.store.call_for_idempotency_key(tenant, key) {
-                if let Some(existing) = self.store.get_call(tenant, existing_id) {
+            if let Some(existing_id) = self.store.call_for_idempotency_key(tenant, key).await? {
+                if let Some(existing) = self.store.get_call(tenant, existing_id).await? {
                     return Ok(existing);
                 }
             }
@@ -85,13 +89,13 @@ impl Routing {
         let envelope = Envelope::new(payload, &ctx, idem);
 
         // One transaction: entity + event + idempotency ledger.
-        self.store.commit(Tx {
-            calls: vec![call.clone()],
-            events: vec![envelope.to_json()],
-            idempotency: req
-                .idempotency_key
-                .map(|k| (tenant, k, call.base.id)),
-        })?;
+        self.store
+            .commit(Tx {
+                calls: vec![call.clone()],
+                events: vec![envelope.to_json()],
+                idempotency: req.idempotency_key.map(|k| (tenant, k, call.base.id)),
+            })
+            .await?;
         // Wake the relay so the event surfaces promptly.
         self.signal.wake();
 

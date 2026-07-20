@@ -41,7 +41,7 @@ pub async fn run(
 ) {
     const BATCH: usize = 128;
     loop {
-        drain_once(&store, &bus, BATCH);
+        drain_once(&store, &bus, BATCH).await;
 
         tokio::select! {
             _ = signal.notify.notified() => {}
@@ -49,7 +49,7 @@ pub async fn run(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     // Final drain so no committed event is left un-relayed on exit.
-                    drain_once(&store, &bus, usize::MAX);
+                    drain_once(&store, &bus, usize::MAX).await;
                     tracing::info!("outbox relay drained and stopped");
                     return;
                 }
@@ -58,8 +58,14 @@ pub async fn run(
     }
 }
 
-fn drain_once(store: &Arc<dyn Store>, bus: &EventBus, max: usize) {
-    let batch = store.peek_outbox(max);
+async fn drain_once(store: &Arc<dyn Store>, bus: &EventBus, max: usize) {
+    let batch = match store.peek_outbox(max).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("outbox peek failed: {e}");
+            return;
+        }
+    };
     if batch.is_empty() {
         return;
     }
@@ -69,6 +75,10 @@ fn drain_once(store: &Arc<dyn Store>, bus: &EventBus, max: usize) {
         last_seq = rec.seq;
     }
     // Ack only after publishing — a crash before this re-delivers, never drops.
-    store.ack_outbox(last_seq);
+    if let Err(e) = store.ack_outbox(last_seq).await {
+        // The events were published; a failed ack just risks re-delivery (at-least-once).
+        tracing::error!("outbox ack failed: {e}");
+        return;
+    }
     tracing::debug!(count = batch.len(), through = last_seq, "relayed outbox batch");
 }
