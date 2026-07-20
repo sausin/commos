@@ -30,7 +30,7 @@ thiserror = "2"
 anyhow = "1"
 # Pure-Rust Postgres driver, runtime queries (no compile-time DB needed). No TLS feature:
 # the reference posture connects to a local/trusted PostgreSQL; TLS is a documented add.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "uuid", "time", "json"] }
 
 [profile.release]
 # Small, self-contained artifact suited to a Raspberry Pi 4 (CMOS-14-DEP / Vol 17 footprint).

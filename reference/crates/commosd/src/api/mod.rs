@@ -7,11 +7,13 @@
 pub mod auth;
 pub mod calls;
 pub mod channels;
+pub mod dashboard;
 pub mod health;
 pub mod introspect;
 pub mod messages;
 pub mod presence;
 pub mod problem;
+pub mod registrations;
 pub mod threads;
 pub mod video_rooms;
 
@@ -46,7 +48,10 @@ pub fn router(state: AppState) -> Router {
         .route("/video-rooms", get(video_rooms::list_video_rooms).post(video_rooms::create_video_room))
         .route("/video-rooms/:id", get(video_rooms::get_video_room))
         .route("/presence", get(presence::list_presence).post(presence::set_presence))
-        .route("/presence/:id", get(presence::get_presence));
+        .route("/presence/:id", get(presence::get_presence))
+        // Device registrations — ephemeral in-memory state (not the durable store).
+        .route("/registrations", get(registrations::list_registrations).post(registrations::create_registration))
+        .route("/registrations/:id", get(registrations::get_registration).delete(registrations::delete_registration));
 
     Router::new()
         .nest("/v1", v1)
@@ -54,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
         .route("/info", get(health::info))
+        // Live operations dashboard (self-contained HTML, unauthenticated).
+        .route("/dashboard", get(dashboard::dashboard))
         // Non-normative introspection for bring-up/testing.
         .route("/_introspect/events", get(introspect::recent_events))
         .route("/_introspect/events/stream", get(introspect::stream_events))

@@ -37,8 +37,8 @@ presence, and AI agents without a redesign.
 
 | Spec requirement | Where |
 |------------------|-------|
-| Single self-contained binary, PostgreSQL-only hard dep (CMOS-14-DEP-001/020) | `commosd` boots with zero external deps on the in-process store, or on PostgreSQL when configured |
-| PostgreSQL is the system of record (CMOS-14-DEP-020) | `store/postgres.rs` — durable binding; entities stored as contract JSON with typed identity/version columns |
+| Single self-contained binary, zero external deps by default (CMOS-14-DEP-001/021, ADR-0012) | `commosd` defaults to embedded SQLite (`store/sqlite.rs`) — durable with no server; PostgreSQL for multi-node |
+| System of record behind one interface (CMOS-14-DEP-020/042) | `store/{sqlite,postgres,mem}.rs` — drop-in bindings; entities stored as contract JSON with typed id/version columns |
 | Two planes over a typed interface, never shared memory (CMOS-03-ARCH-001/002) | `media.rs` — `MediaPlane` trait + `MediaCommand`/`MediaAck`; splittable to a media node unchanged |
 | Stateless control plane; all state in the store (CMOS-03-ARCH-010) | `store/` — `Store` trait; handlers hold only shared handles |
 | Transactional outbox: no state change without its event (CMOS-03-ARCH-030 / CMOS-05-EVT-010) | `store/*` `commit()` writes entity + event in one DB transaction; `relay.rs` drains at-least-once |
@@ -75,40 +75,45 @@ change — the architecture is not baked into the implementation.
 
 ## Run
 
-### Durable mode (PostgreSQL system of record)
+### Default — embedded SQLite (durable, zero external dependency)
+
+Just run it. With no `database_url` configured, the binary opens/creates a local SQLite
+database (WAL mode) — durable across restarts with **no server to install** (ADR-0012).
+This is the right default for a single box / Raspberry Pi.
+
+```bash
+./target/debug/commosd                            # creates ./commos.db, boots on :8080
+
+TENANT=01920000-0000-7000-8000-000000000001
+AUTH="Authorization: Bearer tenant:$TENANT"       # dev token; JWT verification is Volume 9 work
+curl -s localhost:8080/info
+curl -s -X POST localhost:8080/v1/calls -H "$AUTH" -H 'content-type: application/json' \
+     -d '{"direction":"OUTBOUND","from_ref":"sip:100","to_ref":"+14155550100"}'
+curl -s localhost:8080/_introspect/events         # watch the lifecycle flow through the outbox
+```
+
+Then open **`http://localhost:8080/dashboard`** — a self-contained live view of the
+platform (workloads, calls, and the event stream).
+
+### PostgreSQL (multi-node / HA)
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d postgres
 export DATABASE_URL="postgres://commos:commos-dev-password@localhost:5432/commos"
 # pbx.yaml references the secret, never inlines it (CMOS-14-DEP-083):
-#   database_url:
-#     ref_uri: "env://DATABASE_URL"
+#   database_url: { ref_uri: "env://DATABASE_URL" }
 ./target/debug/commosd --config deploy/pbx.example.yaml   # migrations run at boot
-bash scripts/smoke.sh                                     # end-to-end check
+bash scripts/smoke.sh
 ```
 
-State persists across restarts and the outbox is a real `BEGIN…COMMIT`. See
-[`docs/postgres.md`](docs/postgres.md).
-
-### Zero-dependency mode (in-process store)
-
-```bash
-# Boots anywhere, no PostgreSQL needed (omit database_url from pbx.yaml):
-./target/x86_64-unknown-linux-gnu/release/commosd --config deploy/pbx.example.yaml
-
-TENANT=01920000-0000-7000-8000-000000000001
-AUTH="Authorization: Bearer tenant:$TENANT"     # dev token; JWT verification is Volume 9 work
-
-curl -s localhost:8080/info
-curl -s -X POST localhost:8080/v1/calls -H "$AUTH" -H 'content-type: application/json' \
-     -d '{"direction":"OUTBOUND","from_ref":"sip:100","to_ref":"+14155550100"}'
-curl -s localhost:8080/v1/calls -H "$AUTH"
-curl -s localhost:8080/_introspect/events        # watch CallStarted flow through the outbox
-```
+PostgreSQL is the system of record when multiple stateless control-plane nodes share one
+database (CMOS-14-DEP-011/030). See [`docs/postgres.md`](docs/postgres.md). For an
+ephemeral in-process store (tests), set `database_url` to `memory://`.
 
 ### Endpoints
 
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
+- `GET /dashboard` — self-contained live operations dashboard (unauthenticated).
 - **Voice workload** — `GET|POST /v1/calls`, `GET|PATCH /v1/calls/{id}` (`PATCH` is an
   RFC 7386 merge-patch with `If-Match` optimistic concurrency), and actions
   `POST /v1/calls/{id}/{hold,resume,hangup,transfer}`. A Call starts `INITIATED`; ring and
@@ -118,6 +123,9 @@ curl -s localhost:8080/_introspect/events        # watch CallStarted flow throug
   their `/{id}` reads.
 - **Real-time workloads** — `GET|POST /v1/video-rooms`, `GET|POST /v1/presence` and their
   `/{id}` reads. Same substrate, same store, same outbox — voice is one workload of many.
+- **Registrations** — `GET|POST /v1/registrations`, `GET|DELETE /v1/registrations/{id}`.
+  Device registrations are **ephemeral in-memory** state (not the durable store), so a
+  re-REGISTER storm never touches disk — SD cards last (CMOS-14-DEP-021).
 - `GET /_introspect/events[/stream]` — **non-normative** view of the event bus for bring-up; not part of the contract.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped.
@@ -140,15 +148,11 @@ All `/v1` routes are bearer-authenticated and tenant-scoped.
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. **SQLite as the zero-config durable default** — an embedded, single-writer `Store`
-   binding so the single binary is durable *and* dependency-free out of the box (ideal for a
-   Raspberry Pi / small-business box). In-memory stays the explicit test mode; PostgreSQL
-   becomes the opt-in multi-node/HA backend. Keep ephemeral state (registrations, presence)
-   in memory to minimise SD-card writes.
-2. The real SIP/RTP media engine behind the existing `MediaPlane` trait (the fact channel is
-   already in place), and registration handling as in-memory ephemeral state.
-3. Richer queries and update/soft-delete across the workloads (thread-scoped message paging,
+1. The real SIP/RTP media engine behind the existing `MediaPlane` trait (the fact channel is
+   already in place) — turning the in-memory registrations into real SIP registration.
+2. Richer queries and update/soft-delete across the workloads (thread-scoped message paging,
    presence upsert-by-subject).
-4. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
+3. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
-5. Real JWT verification against Identity (Volume 9), replacing the dev token.
+4. Real JWT verification against Identity (Volume 9), replacing the dev token.
+5. CDR/billing assembly on `CallEnded`, and the contact-centre (Queue/Agent) workload.

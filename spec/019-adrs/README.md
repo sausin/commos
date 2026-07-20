@@ -178,6 +178,33 @@ and tested in Volume 16).
 **Reopen if.** A transport offering practical exactly-once with acceptable cost
 becomes the norm across target bindings.
 
+## ADR-0012 — Embedded SQLite as the default system of record; PostgreSQL for scale
+**Status:** Accepted
+**Problem.** The default single-binary deployment (a small business, an edge box, a
+Raspberry Pi) wants durable storage *without* operating a separate database server, and
+on SD-card hosts must minimise write amplification to survive for years. The v0.4 spine
+named PostgreSQL the sole system of record (CMOS-14-DEP-020), which forces an external
+service even on a one-box install.
+**Alternatives.** In-memory only (not durable); require PostgreSQL always (a service to
+run, patch, and back up — heavy for a single box); embedded SQLite by default with
+PostgreSQL as the scale/HA option.
+**Decision.** The system of record is a SQL store behind one interface (the reference
+`Store` trait). The **default** binding is **embedded SQLite** (WAL journal, `synchronous
+= NORMAL`) — durable with zero external dependency, fulfilling CMOS-14-DEP-021 better
+than an in-memory equivalent. **PostgreSQL** remains the binding for any **multi-node /
+HA** topology (CMOS-14-DEP-011/030), where stateless control-plane nodes share one
+database — which SQLite's single-file model cannot serve. Ephemeral high-churn state
+(registrations, presence) stays in memory, never the durable store, to keep writes low.
+**Consequences.** The single binary is durable *and* dependency-free out of the box;
+SD-card hosts see minimal writes. A single node cannot share its SQLite file across
+processes/nodes (by design — use PostgreSQL there). Amends CMOS-14-DEP-020: PostgreSQL is
+the *scale* system of record, not the only one; the hard-dependency floor for the default
+deployment becomes *none*, strengthening N-3.
+**Reopen if.** A single embedded engine gains safe multi-writer / multi-node semantics,
+or an operational reason makes PostgreSQL-by-default worthwhile again.
+
 ## Change log
+- **0.4.x** — Added ADR-0012 (embedded SQLite default, PostgreSQL for scale), recording
+  the reference implementation's storage tiering.
 - **0.3.0** — Eleven ADRs recording the decisions embodied in the v0.3 spine and
   contracts; ADR-0009 (licence) left `Proposed` pending maintainer ratification.

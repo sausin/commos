@@ -4,4 +4,5 @@
 
 pub mod messaging;
 pub mod realtime;
+pub mod registrations;
 pub mod routing;

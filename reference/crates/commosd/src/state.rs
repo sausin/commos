@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::bus::EventBus;
 use crate::control::messaging::MessagingService;
 use crate::control::realtime::RealtimeService;
+use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
 use crate::introspect::RecentEvents;
 use crate::store::Store;
@@ -20,6 +21,9 @@ pub struct AppState {
     pub routing: Routing,
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
+    /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
+    /// keeps write volume near zero for SD-card longevity; CMOS-14-DEP-021).
+    pub registrations: RegistrationRegistry,
     pub bus: EventBus,
     pub recent: RecentEvents,
     /// Readiness flag — a node reports not-ready before it can serve and again while
@@ -34,6 +38,7 @@ impl AppState {
         routing: Routing,
         messaging: MessagingService,
         realtime: RealtimeService,
+        registrations: RegistrationRegistry,
         bus: EventBus,
         recent: RecentEvents,
     ) -> Self {
@@ -42,6 +47,7 @@ impl AppState {
             routing,
             messaging,
             realtime,
+            registrations,
             bus,
             recent,
             ready: Arc::new(AtomicBool::new(false)),

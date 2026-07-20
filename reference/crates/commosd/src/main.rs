@@ -1,10 +1,10 @@
 //! `commosd` — the CommOS single self-contained binary (CMOS-14-DEP-001/010).
 //!
 //! One process runs the control plane and (a loopback of) the media plane, with the
-//! transactional outbox relaying events to an in-process Event Bus. Its only intended hard
-//! dependency at scale is PostgreSQL (CMOS-14-DEP-020); with no `pbx.yaml` it boots on the
-//! zero-dependency in-memory store so the artifact runs anywhere — a Raspberry Pi 4, a
-//! server, a container — out of the box.
+//! transactional outbox relaying events to an in-process Event Bus. With no `pbx.yaml` it
+//! boots on the **embedded SQLite** store — durable with zero external dependency
+//! (ADR-0012) — so the artifact runs anywhere out of the box; PostgreSQL is the opt-in
+//! multi-node / HA backend (CMOS-14-DEP-020).
 //!
 //! Operable under systemd (CMOS-14-DEP-002): clean start/stop, graceful drain on SIGTERM,
 //! and a defined exit-code contract (see [`exit`]).
@@ -121,37 +121,11 @@ async fn run(cfg: Config) -> i32 {
     let recent = RecentEvents::new();
     let bus = EventBus::new(recent.clone());
 
-    // Select the system-of-record binding. With a configured (referenced) database we use
-    // the durable PostgreSQL store (CMOS-14-DEP-020); with none we run the zero-dependency
-    // in-process store so the single binary boots anywhere (CMOS-14-DEP-021). Callers below
-    // are identical either way (CMOS-14-DEP-042).
-    let store: Arc<dyn store::Store> = match &cfg.database_url {
-        Some(secret) => {
-            let dsn = match secret.resolve() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("{e}");
-                    return exit::CONFIG;
-                }
-            };
-            match store::PgStore::connect(&dsn).await {
-                Ok(pg) => {
-                    tracing::info!("connected to PostgreSQL system of record");
-                    Arc::new(pg)
-                }
-                Err(e) => {
-                    tracing::error!("cannot reach the database: {e}");
-                    return exit::UNAVAILABLE;
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                "no database configured — running on the in-process store (single-binary, \
-                 zero-dependency mode). State is not durable across restarts."
-            );
-            Arc::new(MemStore::new())
-        }
+    // Select the system-of-record binding. Callers below are identical whichever binding
+    // is chosen (CMOS-14-DEP-042).
+    let store: Arc<dyn store::Store> = match select_store(&cfg).await {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
     let (fact_tx, mut fact_rx) = tokio::sync::mpsc::unbounded_channel::<media::MediaFact>();
@@ -160,6 +134,7 @@ async fn run(cfg: Config) -> i32 {
     let routing = Routing::new(store.clone(), media, signal.clone());
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
+    let registrations = control::registrations::RegistrationRegistry::new();
 
     // Media-fact loop: apply media→control facts (ring/answer/…) to Call state and emit their
     // events (CMOS-03-ARCH-003). In the single binary this is an in-process channel; in the
@@ -176,7 +151,15 @@ async fn run(cfg: Config) -> i32 {
     }
 
     let bind = cfg.listen.to_string();
-    let app_state = AppState::new(store.clone(), routing, messaging, realtime, bus.clone(), recent);
+    let app_state = AppState::new(
+        store.clone(),
+        routing,
+        messaging,
+        realtime,
+        registrations,
+        bus.clone(),
+        recent,
+    );
 
     // --- shutdown plumbing -----------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -229,6 +212,63 @@ async fn run(cfg: Config) -> i32 {
     let _ = relay_handle.await;
     tracing::info!("commosd stopped cleanly");
     exit::OK
+}
+
+/// Choose the system-of-record binding from config, connecting/opening it.
+///
+/// Default (no `database_url`): the **embedded SQLite** store — durable with zero external
+/// dependency (ADR-0012), the right fit for a single box / Raspberry Pi. `postgres://…`
+/// selects PostgreSQL (multi-node / HA); `memory://` selects the ephemeral in-process store.
+async fn select_store(cfg: &Config) -> Result<Arc<dyn store::Store>, i32> {
+    let dsn = match &cfg.database_url {
+        Some(secret) => match secret.resolve() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("{e}");
+                return Err(exit::CONFIG);
+            }
+        },
+        None => {
+            let path = cfg.default_sqlite_path();
+            tracing::info!(path = %path, "system of record: embedded SQLite (durable, zero external dependency)");
+            return store::SqliteStore::connect(&path)
+                .await
+                .map(|s| Arc::new(s) as Arc<dyn store::Store>)
+                .map_err(|e| {
+                    tracing::error!("cannot open SQLite database: {e}");
+                    exit::UNAVAILABLE
+                });
+        }
+    };
+
+    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        store::PgStore::connect(&dsn)
+            .await
+            .map(|s| {
+                tracing::info!("system of record: PostgreSQL");
+                Arc::new(s) as Arc<dyn store::Store>
+            })
+            .map_err(|e| {
+                tracing::error!("cannot reach PostgreSQL: {e}");
+                exit::UNAVAILABLE
+            })
+    } else if dsn == "memory://" || dsn == ":memory:" {
+        tracing::warn!("system of record: in-process store (ephemeral — not durable across restarts)");
+        Ok(Arc::new(MemStore::new()))
+    } else {
+        // Anything else is a SQLite path/DSN (`sqlite:foo.db` or a bare path).
+        let path = dsn.strip_prefix("sqlite:").unwrap_or(&dsn).to_string();
+        store::SqliteStore::connect(&path)
+            .await
+            .map(|s| {
+                tracing::info!(path = %path, "system of record: SQLite");
+                Arc::new(s) as Arc<dyn store::Store>
+            })
+            .map_err(|e| {
+                tracing::error!("cannot open SQLite database: {e}");
+                exit::UNAVAILABLE
+            })
+    }
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM (systemd stop).

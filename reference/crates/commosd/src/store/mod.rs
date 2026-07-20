@@ -17,6 +17,7 @@
 
 pub mod mem;
 pub mod postgres;
+pub mod sqlite;
 
 use axum::async_trait;
 
@@ -30,6 +31,7 @@ use commos_core::entities::video_room::VideoRoom;
 
 pub use mem::MemStore;
 pub use postgres::PgStore;
+pub use sqlite::SqliteStore;
 
 /// One durable transaction: entity upserts and the events they produce, committed together.
 #[derive(Default)]
