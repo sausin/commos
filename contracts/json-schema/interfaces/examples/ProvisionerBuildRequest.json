@@ -1,0 +1,17 @@
+{
+  "request_id": "018f0a40-0003-7003-8003-000000000003",
+  "device": {
+    "device_id": "018f0a40-000a-700a-800a-00000000000a",
+    "vendor_key": "yealink",
+    "model": "T54W",
+    "mac": "805e0c112233"
+  },
+  "desired": {
+    "extension": "1001",
+    "display_name": "Alice",
+    "firmware_target": "96.86.0.60"
+  },
+  "secret_handles": [
+    "handle:sip-pw:018f0a40-000b-700b-800b-00000000000b"
+  ]
+}

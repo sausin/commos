@@ -1,0 +1,30 @@
+{
+  "name": "Message send and delivery (second workload)",
+  "profile": "messaging",
+  "entity": "Message",
+  "description": "Proves the substrate carries a non-voice workload with the same event model.",
+  "requirement_ids": [
+    "CMOS-00-ENG-004",
+    "CMOS-00-ENG-016"
+  ],
+  "steps": [
+    {
+      "from": "(none)",
+      "action": "send",
+      "to": "SENT",
+      "expect_event": "MessageSent"
+    },
+    {
+      "from": "SENT",
+      "action": "deliver",
+      "to": "DELIVERED",
+      "expect_event": "MessageDelivered"
+    },
+    {
+      "from": "DELIVERED",
+      "action": "read",
+      "to": "READ",
+      "expect_event": "MessageRead"
+    }
+  ]
+}

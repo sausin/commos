@@ -1,0 +1,57 @@
+{
+  "name": "Outbound call \u2014 happy path",
+  "profile": "voice",
+  "entity": "Call",
+  "description": "An authenticated internal caller places a call that is answered and ends normally, producing the canonical event sequence with a shared correlation_id.",
+  "requirement_ids": [
+    "CMOS-02-DOM-007",
+    "CMOS-02-DOM-010",
+    "CMOS-05-EVT-020"
+  ],
+  "steps": [
+    {
+      "from": "(none)",
+      "action": "originate",
+      "to": "INITIATED",
+      "expect_event": "CallStarted"
+    },
+    {
+      "from": "INITIATED",
+      "action": "alert",
+      "to": "RINGING",
+      "expect_event": "CallRinging"
+    },
+    {
+      "from": "RINGING",
+      "action": "answer",
+      "to": "ANSWERED",
+      "expect_event": "CallAnswered",
+      "chargeable": true
+    },
+    {
+      "from": "ANSWERED",
+      "action": "hangup",
+      "to": "ENDED",
+      "expect_event": "CallEnded"
+    },
+    {
+      "from": "ENDED",
+      "action": "rate",
+      "to": "ENDED",
+      "expect_event": "BillingGenerated",
+      "note": "CDR emitted on end"
+    }
+  ],
+  "illegal": [
+    {
+      "from": "INITIATED",
+      "action": "answer",
+      "reason": "cannot answer before RINGING"
+    },
+    {
+      "from": "ENDED",
+      "action": "hold",
+      "reason": "terminal state"
+    }
+  ]
+}

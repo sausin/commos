@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CapabilityRevoked.schema.json",
+  "title": "CapabilityRevoked",
+  "description": "CommOS canonical event 'CapabilityRevoked' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CapabilityRevoked"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "capability": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "user_id",
+        "capability"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

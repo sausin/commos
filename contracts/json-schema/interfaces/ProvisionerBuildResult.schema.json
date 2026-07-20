@@ -1,0 +1,57 @@
+{
+  "description": "Result returned by a Provisioner plugin. On success carries a config Object reference; errors use the typed taxonomy.",
+  "type": "object",
+  "properties": {
+    "request_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "SUCCESS",
+        "ERROR"
+      ]
+    },
+    "config_object_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "signed_url": {
+          "type": "string"
+        },
+        "expires_at": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+        },
+        "one_time": {
+          "type": "boolean"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": [
+            "TRANSIENT",
+            "PERMANENT",
+            "SECURITY",
+            "PRECONDITION"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "required": [
+    "request_id",
+    "status"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/ProvisionerBuildResult.schema.json",
+  "title": "ProvisionerBuildResult"
+}

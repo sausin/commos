@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/WebhookDeliveryFailed.schema.json",
+  "title": "WebhookDeliveryFailed",
+  "description": "CommOS canonical event 'WebhookDeliveryFailed' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "WebhookDeliveryFailed"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "webhook_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "delivered_event_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "webhook_id",
+        "attempt"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

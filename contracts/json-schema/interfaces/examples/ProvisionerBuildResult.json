@@ -1,0 +1,10 @@
+{
+  "request_id": "018f0a40-0003-7003-8003-000000000003",
+  "status": "SUCCESS",
+  "config_object_id": "018f0a40-000c-700c-800c-00000000000c",
+  "delivery": {
+    "signed_url": "https://pbx.example/p/one-time/abc",
+    "expires_at": "2026-07-20T14:32:05.123Z",
+    "one_time": true
+  }
+}

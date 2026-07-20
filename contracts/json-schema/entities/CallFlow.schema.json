@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/CallFlow.schema.json",
+  "title": "CallFlow",
+  "description": "CommOS domain entity 'CallFlow' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "graph": {
+      "type": "object"
+    },
+    "published_version": {
+      "type": "integer"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "DRAFT",
+        "PUBLISHED",
+        "SUPERSEDED"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "state"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "018f0a10-eeee-7eee-8eee-000000000010",
+  "specversion": "0.3",
+  "type": "CallEnded",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a10-5555-7555-8555-555555550001",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "CallEnded:018f0a10-5555-7555-8555-555555550001",
+  "sequence": 10,
+  "datacontenttype": "application/json",
+  "data": {
+    "call_id": "018f0a10-5555-7555-8555-555555550001",
+    "ended_at": "2026-07-20T14:32:05.123Z",
+    "duration_ms": 42315,
+    "hangup_cause": "NORMAL_CLEARING"
+  }
+}

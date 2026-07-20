@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Carrier.schema.json",
+  "title": "Carrier",
+  "description": "CommOS domain entity 'Carrier' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "PSTN",
+        "MOBILE",
+        "SIP_TRUNK",
+        "INTERNAL"
+      ]
+    },
+    "rating_profile_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    }
+  },
+  "required": [
+    "name",
+    "kind"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "call_id": "018f0a40-0014-7014-8014-000000000014",
+  "cost": {
+    "currency": "GBP",
+    "minor_units": 129
+  },
+  "increment_ms": 1000,
+  "minimum_ms": 1000,
+  "rounding": "UP"
+}

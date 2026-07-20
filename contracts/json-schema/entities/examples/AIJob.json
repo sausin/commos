@@ -1,0 +1,14 @@
+{
+  "id": "018f0a20-0078-7078-8078-000000000078",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "version": 1,
+  "created_at": "2026-07-20T14:32:05.123Z",
+  "updated_at": "2026-07-20T14:32:05.123Z",
+  "kind": "transcription",
+  "consumer_key": "whisper.local",
+  "input_refs": [
+    "object:018f0a20-000a-700a-800a-00000000000a"
+  ],
+  "status": "COMPLETED",
+  "result_object_id": "018f0a20-000b-700b-800b-00000000000b"
+}

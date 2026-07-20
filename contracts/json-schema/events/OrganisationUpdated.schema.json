@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/OrganisationUpdated.schema.json",
+  "title": "OrganisationUpdated",
+  "description": "CommOS canonical event 'OrganisationUpdated' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "OrganisationUpdated"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "organisation_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "organisation_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

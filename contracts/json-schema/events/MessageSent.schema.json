@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/MessageSent.schema.json",
+  "title": "MessageSent",
+  "description": "CommOS canonical event 'MessageSent' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "MessageSent"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "channel_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "sender_ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "channel_id",
+        "sender_ref"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

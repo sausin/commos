@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Identity.schema.json",
+  "title": "Identity",
+  "description": "A proven authentication assertion binding a User to a session/Device (Volume 2). Not the User.",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "user_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "device_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "method": {
+      "type": "string",
+      "enum": ["PIN", "RFID", "NFC", "QR", "BLUETOOTH", "FIDO2", "PROXIMITY", "FACE", "SSO", "OIDC", "SAML", "LDAP"]
+    },
+    "state": { "type": "string", "enum": ["REQUESTED", "AUTHENTICATED", "ACTIVE", "EXPIRED", "REVOKED"] },
+    "assurance_level": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] },
+    "expires_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" }
+  },
+  "required": ["user_id", "method", "state", "assurance_level"]
+}

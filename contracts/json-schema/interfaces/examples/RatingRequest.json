@@ -1,0 +1,8 @@
+{
+  "call_id": "018f0a40-0014-7014-8014-000000000014",
+  "rating_profile_id": "018f0a40-0005-7005-8005-000000000005",
+  "rating_profile_version": 7,
+  "charge_source": "SIP_TRUNK",
+  "destination": "+441632960001",
+  "billable_ms": 43000
+}

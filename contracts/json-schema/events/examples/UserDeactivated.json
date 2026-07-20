@@ -1,0 +1,16 @@
+{
+  "id": "018f0a30-03ec-73ec-83ec-0000000003ec",
+  "specversion": "0.3",
+  "type": "UserDeactivated",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0324-7324-8324-000000000324",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "UserDeactivated:104",
+  "sequence": 104,
+  "datacontenttype": "application/json",
+  "data": {
+    "user_id": "018f0a30-0001-7001-8001-000000000001"
+  }
+}

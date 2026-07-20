@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/ThreadClosed.schema.json",
+  "title": "ThreadClosed",
+  "description": "CommOS canonical event 'ThreadClosed' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "ThreadClosed"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "thread_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallStarted.schema.json",
+  "title": "CallStarted",
+  "description": "CommOS canonical event 'CallStarted' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallStarted"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "INBOUND",
+            "OUTBOUND",
+            "INTERNAL"
+          ]
+        },
+        "from_ref": {
+          "type": "string"
+        },
+        "to_ref": {
+          "type": "string"
+        },
+        "device_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "call_id",
+        "direction",
+        "from_ref",
+        "to_ref"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/conformance/scenario.schema.json",
+  "title": "CommOS L2 Behavioural Scenario",
+  "description": "A state-machine-driven behavioural conformance scenario (Volume 16). Each step asserts a legal transition and the event it must emit; `illegal` lists transitions an implementation MUST reject. Steps sharing a run share one correlation_id; expected events are ordered by `sequence`.",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "profile": { "type": "string", "enum": ["core", "voice", "provisioning", "billing", "ai", "plugins", "contact-center", "messaging"] },
+    "entity": { "type": "string", "description": "The primary domain entity driven (Volume 2)." },
+    "description": { "type": "string" },
+    "requirement_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^CMOS-\\d\\d-[A-Z]+-\\d\\d\\d$" },
+      "minItems": 1
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string" },
+          "action": { "type": "string" },
+          "to": { "type": "string" },
+          "expect_event": { "type": "string", "description": "Canonical event type that MUST be emitted (must exist in the event catalogue)." },
+          "chargeable": { "type": "boolean" },
+          "note": { "type": "string" }
+        },
+        "required": ["from", "action", "to", "expect_event"],
+        "additionalProperties": false
+      }
+    },
+    "illegal": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string" },
+          "action": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["from", "action"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["name", "profile", "entity", "requirement_ids", "steps"],
+  "additionalProperties": false
+}

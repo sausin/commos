@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Webhook.schema.json",
+  "title": "Webhook",
+  "description": "CommOS domain entity 'Webhook' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "url": {
+      "type": "string"
+    },
+    "event_types": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "secret_ref": {
+      "type": "string"
+    },
+    "active": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "url",
+    "event_types",
+    "active"
+  ]
+}

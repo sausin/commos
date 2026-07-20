@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallEnded.schema.json",
+  "title": "CallEnded",
+  "description": "CommOS canonical event 'CallEnded' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallEnded"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "ended_at": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hangup_cause": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "ended_at",
+        "duration_ms"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

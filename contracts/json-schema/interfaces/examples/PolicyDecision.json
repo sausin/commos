@@ -1,0 +1,11 @@
+{
+  "request_id": "018f0a40-0004-7004-8004-000000000004",
+  "effect": "ALLOW",
+  "obligations": [
+    "REQUIRE_APPROVAL"
+  ],
+  "matched_policy_ids": [
+    "018f0a40-0005-7005-8005-000000000005"
+  ],
+  "reason": "international requires manager approval"
+}

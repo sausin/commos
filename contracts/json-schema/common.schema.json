@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/common.schema.json",
+  "title": "CommOS Common Definitions",
+  "description": "Shared type definitions referenced by entity and event schemas. Normative per spec/CONVENTIONS.md §6.",
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "description": "UUIDv7, lowercase canonical form.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "Timestamp": {
+      "type": "string",
+      "description": "RFC 3339 / ISO 8601 UTC with millisecond precision and trailing Z.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "Currency": {
+      "type": "string",
+      "description": "ISO 4217 alphabetic code.",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "Money": {
+      "type": "object",
+      "description": "Integer minor units; never floating point.",
+      "properties": {
+        "currency": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Currency" },
+        "minor_units": { "type": "integer" }
+      },
+      "required": ["currency", "minor_units"],
+      "additionalProperties": false
+    },
+    "E164": {
+      "type": "string",
+      "description": "Canonical external telephone number.",
+      "pattern": "^\\+[1-9]\\d{1,14}$"
+    },
+    "OpenKey": {
+      "type": "string",
+      "description": "Open-set key (e.g. vendor). CONVENTIONS §6 CMOS-CONV-017.",
+      "pattern": "^[a-z0-9_.-]+$"
+    },
+    "EntityBase": {
+      "type": "object",
+      "description": "Fields every persisted entity carries (Volume 2 CMOS-02-DOM-001/005).",
+      "properties": {
+        "id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+        "tenant_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+        "version": { "type": "integer", "minimum": 0, "description": "Monotonic Digital-Twin version." },
+        "created_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" },
+        "updated_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" }
+      },
+      "required": ["id", "tenant_id", "version", "created_at", "updated_at"]
+    }
+  }
+}

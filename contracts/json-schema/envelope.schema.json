@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/envelope.schema.json",
+  "title": "CommOS Event Envelope",
+  "description": "The canonical event envelope (Volume 5 §2). CloudEvents 1.0 with CommOS-required extensions.",
+  "type": "object",
+  "properties": {
+    "id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "specversion": { "type": "string", "pattern": "^\\d+\\.\\d+$", "description": "CommOS event spec version, e.g. 0.3." },
+    "type": { "type": "string", "pattern": "^[A-Z][A-Za-z0-9]+$", "description": "PascalCase event type." },
+    "source": { "type": "string", "description": "Emitting subsystem URI, e.g. /routing." },
+    "time": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" },
+    "tenant_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "subject": { "type": "string", "description": "Primary entity id the event is about." },
+    "correlation_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "causation_id": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid" },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 0, "description": "Per-correlation monotonic ordinal." },
+    "traceparent": { "type": "string", "description": "W3C trace context." },
+    "datacontenttype": { "type": "string", "const": "application/json" },
+    "data": { "type": "object", "description": "Event-specific payload; shape per event schema." }
+  },
+  "required": [
+    "id", "specversion", "type", "source", "time", "tenant_id",
+    "subject", "correlation_id", "idempotency_key", "datacontenttype", "data"
+  ]
+}

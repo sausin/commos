@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/CallFlowPublished.schema.json",
+  "title": "CallFlowPublished",
+  "description": "CommOS canonical event 'CallFlowPublished' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "CallFlowPublished"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "call_flow_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "published_version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "call_flow_id",
+        "published_version"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

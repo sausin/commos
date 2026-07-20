@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/IVR.schema.json",
+  "title": "IVR",
+  "description": "CommOS domain entity 'IVR' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "prompt_object_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "options": {
+      "type": "object"
+    },
+    "timeout_ms": {
+      "type": "integer"
+    },
+    "invalid_action": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "options"
+  ]
+}

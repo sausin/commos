@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Queue.schema.json",
+  "title": "Queue",
+  "description": "CommOS domain entity 'Queue' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "strategy": {
+      "type": "string",
+      "enum": [
+        "RINGALL",
+        "LEAST_RECENT",
+        "FEWEST_CALLS",
+        "ROUND_ROBIN",
+        "SKILLS"
+      ]
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sla_seconds": {
+      "type": "integer"
+    },
+    "max_wait_ms": {
+      "type": "integer"
+    },
+    "overflow_ref": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "strategy"
+  ]
+}

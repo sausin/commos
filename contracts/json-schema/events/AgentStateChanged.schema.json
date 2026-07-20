@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/AgentStateChanged.schema.json",
+  "title": "AgentStateChanged",
+  "description": "CommOS canonical event 'AgentStateChanged' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "AgentStateChanged"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "agent_user_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_user_id",
+        "state"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Recording.schema.json",
+  "title": "Recording",
+  "description": "CommOS domain entity 'Recording' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "call_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "object_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "bytes": {
+      "type": "integer"
+    },
+    "transcript_object_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "duration_ms": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "object_id"
+  ]
+}

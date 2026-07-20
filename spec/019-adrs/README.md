@@ -1,0 +1,183 @@
+# Volume 19 — Architectural Decision Records
+
+**Status:** REVIEW · **Version:** 0.4.0 · **Subsystem tag:** (governance)
+
+Every significant decision is recorded here so future contributors do not unknowingly
+re-open settled questions — and so that when a decision *should* be reopened, the
+original context is available. Each ADR states the **problem**, **alternatives**,
+**decision**, **consequences**, and **what would reopen it**.
+
+ADRs are immutable once `Accepted`. A change of mind is a *new* ADR that supersedes
+an old one (the old one is marked `Superseded by ADR-NNNN`, never deleted —
+CMOS-00-ENG-012). Status ∈ `{Proposed, Accepted, Superseded, Rejected}`.
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| 0001 | Specification-first, with executable conformance as the contract | Accepted |
+| 0002 | Identity-first domain model (four distinct principals) | Accepted |
+| 0003 | Rust + Tokio as the reference implementation language | Accepted |
+| 0004 | PostgreSQL as the system of record | Accepted |
+| 0005 | Pluggable event bus behind one interface (not Kafka-mandated) | Accepted |
+| 0006 | Capability-based authorization, not RBAC | Accepted |
+| 0007 | WebAssembly (Wasmtime-class) for plugins | Accepted |
+| 0008 | Object Storage abstraction, not a filesystem API | Accepted |
+| 0009 | Open, vendor-neutral specification licence | Proposed |
+| 0010 | Control-plane / media-plane separation behind typed interfaces | Accepted |
+| 0011 | CloudEvents-style envelope with at-least-once + idempotency | Accepted |
+
+---
+
+## ADR-0001 — Specification-first, with executable conformance as the contract
+**Status:** Accepted
+**Problem.** A PBX is a distributed real-time OS; a PRD alone cannot coordinate
+parallel (human or AI) implementation of compatible components.
+**Alternatives.** (a) PRD + reference implementation as de-facto spec; (b) prose
+specs only; (c) specs + machine-readable contracts + executable conformance.
+**Decision.** (c). The durable asset is the versioned specification plus
+`contracts/` (JSON Schema, OpenAPI) plus `conformance/` (an executable harness).
+Prose gives meaning; contracts give shape; the harness is the arbiter.
+**Consequences.** Higher up-front cost; enables independent implementations and a
+vendor-neutral standard (OCI/Kubernetes analogy). A volume is `FROZEN` only with a
+contract and passing conformance (CONVENTIONS §5).
+**Reopen if.** The overhead measurably outweighs the coordination benefit for the
+actual contributor set.
+
+## ADR-0002 — Identity-first domain model (four distinct principals)
+**Status:** Accepted
+**Problem.** Legacy PBXs collapse User, Identity, Device, and Extension into "an
+extension", breaking billing, security, and mobility.
+**Alternatives.** (a) Extension-centric (legacy); (b) User+Device only; (c) four
+distinct principals with Extension as a mere label.
+**Decision.** (c) — see CMOS-02-DOM-004 and the Glossary. A Device is owned by the
+Organisation and can carry different Identities across calls.
+**Consequences.** Correct per-User attribution on shared devices; more entities to
+model; every downstream volume must respect the separation.
+**Reopen if.** A concrete workload proves the distinction unnecessary (none known).
+
+## ADR-0003 — Rust + Tokio as the reference implementation language
+**Status:** Accepted
+**Problem.** Media planes need predictable latency (no GC pauses), memory safety, and
+strong async networking; the control plane needs the same toolchain for one binary.
+**Alternatives.** Go (great deployment/hiring, but GC and weaker media performance);
+C++ (fast, memory-unsafe); Java/.NET (heavy runtime); Node/Python (poor for media).
+**Decision.** Rust/Tokio/Axum/SQLx as the **recommended reference** stack. It is not
+*mandated*: conformance is defined against contracts, not languages (CONVENTIONS §3).
+**Consequences.** Higher barrier to contribution; excellent latency/safety; Go
+remains an acceptable control-plane alternative for an implementer who accepts the
+media trade-off.
+**Reopen if.** Rust's ecosystem gaps (e.g. a specific media/codec need) prove
+disqualifying, or an implementer targets a control-plane-only profile.
+
+## ADR-0004 — PostgreSQL as the system of record
+**Status:** Accepted
+**Problem.** Need one dependable store for structured state with strong consistency,
+rich indexing, partitioning, and ubiquitous operational familiarity.
+**Alternatives.** FoundationDB (powerful, operationally niche); a NewSQL cluster
+(heavier); multiple specialised stores (operational sprawl — violates
+CMOS-00-ENG-001).
+**Decision.** PostgreSQL is the reference system of record; ephemeral distributed
+state uses a Redis/NATS-class layer; large artifacts use Object Storage.
+**Consequences.** One well-understood dependency; horizontal write scale needs
+partitioning/replication strategy (Volume 6), not a different engine by default.
+**Reopen if.** A tenant scale is reached where Postgres partitioning/replication no
+longer meets Volume 17 targets.
+
+## ADR-0005 — Pluggable event bus behind one interface (not Kafka-mandated)
+**Status:** Accepted
+**Problem.** The event bus is the core integration surface; mandating one broker
+would burden small deployments and lock out large ones.
+**Alternatives.** Mandate Kafka (heavy for SMB); mandate Redis Streams (limited at
+scale); define one interface with multiple bindings.
+**Decision.** One bus interface with a transactional outbox (CMOS-03-ARCH-030) and
+pluggable bindings (in-process/Redis Streams/NATS JetStream/Kafka). Guarantees
+(at-least-once, ordering by `sequence`, dead-letter) are specified, not the broker.
+**Consequences.** SMB runs with no external broker; enterprise swaps the binding with
+no code change.
+**Reopen if.** A guarantee proves unimplementable across the target bindings.
+
+## ADR-0006 — Capability-based authorization, not RBAC
+**Status:** Accepted
+**Problem.** Roles conflate unrelated permissions and drift; fine-grained control is
+needed for MSP/enterprise and for plugins.
+**Alternatives.** RBAC (familiar, coarse); ABAC (flexible, complex); capabilities
+(fine-grained grants) with roles as UI-only bundles.
+**Decision.** Capabilities are the authorization primitive (CMOS-00-ENG-009); roles,
+if shown, are named capability bundles in the UI only. Plugins receive scoped
+capability grants.
+**Consequences.** Precise least-privilege; the UI must present capabilities
+approachably (Volume 13) to preserve operability (CMOS-00-ENG-001).
+**Reopen if.** Capability management proves too fine-grained to operate at SMB scale
+without the role abstraction being effectively mandatory.
+
+## ADR-0007 — WebAssembly (Wasmtime-class) for plugins
+**Status:** Accepted
+**Problem.** Third parties must extend the platform (provisioners, CRM, billing,
+auth) without the power to crash or compromise it.
+**Alternatives.** Native dynamic libs (unsafe, ABI-fragile); subprocess+RPC (heavier,
+still OS-trusted); WASM sandbox with declared capabilities and resource limits.
+**Decision.** WASM (Wasmtime-class). A plugin fault MUST NOT crash the host
+(CMOS-03-ARCH-051); plugins get scoped capabilities and cpu/mem/time limits
+(Volume 12).
+**Consequences.** Strong isolation and portability; some host APIs must be exposed via
+a stable ABI; certain low-level media tasks stay in-core.
+**Reopen if.** WASM performance/ABI limits block a critical extension class.
+
+## ADR-0008 — Object Storage abstraction, not a filesystem API
+**Status:** Accepted
+**Problem.** Recordings, voicemail, firmware, transcripts, exports must live
+somewhere that scales and is portable across deployments and clouds.
+**Alternatives.** Local filesystem API (doesn't scale/replicate cleanly); hard-code
+S3 (cloud lock-in); one Object Storage interface over many backends.
+**Decision.** All large artifacts are Objects behind one interface
+(Local/S3/MinIO/R2/Backblaze/Azure/GCS) — CMOS-03-ARCH-040. Payloads carry Object
+references, never blobs (CMOS-02-DOM-013).
+**Consequences.** Cloud-native without cloud dependence (N-3); a thin local backend
+is required for the single-binary default.
+**Reopen if.** A backend-specific capability becomes essential and cannot be
+abstracted.
+
+## ADR-0009 — Open, vendor-neutral specification licence
+**Status:** Proposed
+**Problem.** For the spec to become a standard (the stated goal), its licence must
+permit independent, competing implementations and community contribution.
+**Alternatives.** Permissive spec licence (e.g. CC-BY / Apache-2.0 for text +
+schemas); copyleft; proprietary.
+**Decision (proposed).** License the specification and contracts under a permissive,
+vendor-neutral licence so any party may implement it; reference code (if/when added)
+under Apache-2.0. **Final choice pending** — this ADR remains `Proposed` until the
+maintainers ratify the specific licences.
+**Consequences.** Maximises adoption and neutrality; forgoes licence-based control.
+**Reopen if.** Governance requires a different balance (e.g. trademark policy for the
+"CommOS conformant" mark).
+
+## ADR-0010 — Control-plane / media-plane separation behind typed interfaces
+**Status:** Accepted
+**Problem.** A monolith couples call-control logic to media handling and blocks
+independent scaling of media.
+**Alternatives.** Monolith with shared memory; always-separate services (operational
+cost for SMB); one binary with an internal typed control↔media interface.
+**Decision.** Separate the planes behind a typed interface even in one binary
+(CMOS-00-ENG-006, CMOS-03-ARCH-001/002); allow splitting into dedicated media nodes
+with no code redesign.
+**Consequences.** SMB gets one process; enterprise scales media independently; the
+interface must be kept genuinely typed and side-effect-free across the boundary.
+**Reopen if.** The abstraction cost outweighs the benefit for all realistic scales.
+
+## ADR-0011 — CloudEvents-style envelope with at-least-once + idempotency
+**Status:** Accepted
+**Problem.** Integrations need a stable, tool-friendly event contract with clear
+delivery and ordering semantics.
+**Alternatives.** Bespoke envelope; exactly-once transport (costly, often illusory);
+CloudEvents-style envelope + at-least-once + consumer idempotency + per-correlation
+ordering.
+**Decision.** Adopt the envelope in `contracts/json-schema/envelope.schema.json`
+(Volume 5 §2) with at-least-once delivery, idempotency keys, and `sequence` ordering
+per `correlation_id` (CMOS-05-EVT-010..022).
+**Consequences.** Broad tool compatibility; consumers must be idempotent (documented
+and tested in Volume 16).
+**Reopen if.** A transport offering practical exactly-once with acceptable cost
+becomes the norm across target bindings.
+
+## Change log
+- **0.3.0** — Eleven ADRs recording the decisions embodied in the v0.3 spine and
+  contracts; ADR-0009 (licence) left `Proposed` pending maintainer ratification.

@@ -1,0 +1,43 @@
+{
+  "name": "Identity authentication lifecycle",
+  "profile": "core",
+  "entity": "Identity",
+  "description": "A user authenticates on a device; the identity becomes ACTIVE and later expires.",
+  "requirement_ids": [
+    "CMOS-02-DOM-004",
+    "CMOS-09-SEC-001"
+  ],
+  "steps": [
+    {
+      "from": "(none)",
+      "action": "request",
+      "to": "REQUESTED",
+      "expect_event": "AuthenticationRequested"
+    },
+    {
+      "from": "REQUESTED",
+      "action": "verify",
+      "to": "AUTHENTICATED",
+      "expect_event": "AuthenticationSucceeded"
+    },
+    {
+      "from": "AUTHENTICATED",
+      "action": "activate",
+      "to": "ACTIVE",
+      "expect_event": "IdentityAuthenticated"
+    },
+    {
+      "from": "ACTIVE",
+      "action": "expire",
+      "to": "EXPIRED",
+      "expect_event": "IdentityExpired"
+    }
+  ],
+  "illegal": [
+    {
+      "from": "EXPIRED",
+      "action": "activate",
+      "reason": "terminal state"
+    }
+  ]
+}

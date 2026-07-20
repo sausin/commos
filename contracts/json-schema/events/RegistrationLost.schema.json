@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/RegistrationLost.schema.json",
+  "title": "RegistrationLost",
+  "description": "CommOS canonical event 'RegistrationLost' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "RegistrationLost"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "last_seen_at": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+        }
+      },
+      "required": [
+        "device_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "018f0a30-040f-740f-840f-00000000040f",
+  "specversion": "0.3",
+  "type": "PluginEnabled",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-0347-7347-8347-000000000347",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "PluginEnabled:139",
+  "sequence": 139,
+  "datacontenttype": "application/json",
+  "data": {
+    "plugin_id": "018f0a30-002b-702b-802b-00000000002b"
+  }
+}

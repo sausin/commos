@@ -1,0 +1,17 @@
+{
+  "id": "018f0a30-0412-7412-8412-000000000412",
+  "specversion": "0.3",
+  "type": "PluginFailed",
+  "source": "/reference",
+  "time": "2026-07-20T14:32:05.123Z",
+  "tenant_id": "018f0a10-1111-7111-8111-111111110001",
+  "subject": "018f0a30-034a-734a-834a-00000000034a",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "idempotency_key": "PluginFailed:142",
+  "sequence": 142,
+  "datacontenttype": "application/json",
+  "data": {
+    "plugin_id": "018f0a30-002b-702b-802b-00000000002b",
+    "error": "trap"
+  }
+}

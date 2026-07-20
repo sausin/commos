@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Object.schema.json",
+  "title": "Object",
+  "description": "A large binary artifact stored via the Object Storage abstraction (Volume 2 / CMOS-03-ARCH-040).",
+  "allOf": [{ "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase" }],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["RECORDING", "VOICEMAIL", "FAX", "FIRMWARE", "TRANSCRIPT", "EXPORT", "DIAGNOSTIC", "WALLPAPER", "OTHER"]
+    },
+    "uri": { "type": "string", "description": "Backend-opaque URI (local://, s3://, …)." },
+    "bytes": { "type": "integer", "minimum": 0 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "content_type": { "type": "string" },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "policy": { "type": "string" },
+        "expires_at": { "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp" }
+      }
+    }
+  },
+  "required": ["kind", "uri", "bytes", "sha256"]
+}

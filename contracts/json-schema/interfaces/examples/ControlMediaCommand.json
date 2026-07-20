@@ -1,0 +1,12 @@
+{
+  "command_id": "018f0a40-0001-7001-8001-000000000001",
+  "correlation_id": "018f0a10-2222-7222-8222-222222220001",
+  "issued_at": "2026-07-20T14:32:05.123Z",
+  "kind": "TRANSFER",
+  "target_ref": "call:018f0a40-0014-7014-8014-000000000014",
+  "params": {
+    "to_ref": "queue:sales",
+    "transfer_type": "ATTENDED"
+  },
+  "idempotency_key": "xfer-1"
+}

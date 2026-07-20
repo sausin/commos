@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/GatewayOffline.schema.json",
+  "title": "GatewayOffline",
+  "description": "CommOS canonical event 'GatewayOffline' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "GatewayOffline"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "gateway_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "gateway_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

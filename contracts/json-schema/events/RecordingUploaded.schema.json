@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/RecordingUploaded.schema.json",
+  "title": "RecordingUploaded",
+  "description": "CommOS canonical event 'RecordingUploaded' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "RecordingUploaded"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "recording_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "call_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "object_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        },
+        "object_uri": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "recording_id",
+        "call_id",
+        "object_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/Automation.schema.json",
+  "title": "Automation",
+  "description": "CommOS domain entity 'Automation' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "trigger": {
+      "type": "object"
+    },
+    "action": {
+      "type": "object"
+    },
+    "enabled": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "trigger",
+    "action",
+    "enabled"
+  ]
+}

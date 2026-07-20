@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/entities/AIJob.schema.json",
+  "title": "AIJob",
+  "description": "CommOS domain entity 'AIJob' (Volume 2).",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/EntityBase"
+    }
+  ],
+  "properties": {
+    "kind": {
+      "type": "string"
+    },
+    "consumer_key": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/OpenKey"
+    },
+    "input_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "QUEUED",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    "result_object_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    }
+  },
+  "required": [
+    "kind",
+    "status"
+  ]
+}

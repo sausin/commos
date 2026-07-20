@@ -1,0 +1,52 @@
+{
+  "description": "A typed command issued by the control plane to the media plane (ADR-0010). Media never reads control-plane memory; it only receives these.",
+  "type": "object",
+  "properties": {
+    "command_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "correlation_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "issued_at": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Timestamp"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "ORIGINATE",
+        "ANSWER",
+        "HANGUP",
+        "HOLD",
+        "RESUME",
+        "TRANSFER",
+        "START_RECORDING",
+        "STOP_RECORDING",
+        "JOIN_CONFERENCE",
+        "LEAVE_CONFERENCE",
+        "PLAY_PROMPT",
+        "SEND_DTMF"
+      ]
+    },
+    "target_ref": {
+      "type": "string",
+      "description": "Call/Conference/Stream reference the command acts on."
+    },
+    "params": {
+      "type": "object",
+      "description": "Kind-specific parameters."
+    },
+    "idempotency_key": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command_id",
+    "correlation_id",
+    "kind",
+    "target_ref"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/ControlMediaCommand.schema.json",
+  "title": "ControlMediaCommand"
+}

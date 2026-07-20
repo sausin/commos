@@ -1,0 +1,39 @@
+{
+  "description": "Input to the rating engine when a Call ends (Volume 10). Deterministic + reproducible via rating_profile_version.",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "rating_profile_id": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+    },
+    "rating_profile_version": {
+      "type": "integer"
+    },
+    "charge_source": {
+      "type": "string",
+      "enum": [
+        "CARRIER",
+        "MOBILE_GATEWAY",
+        "SIP_TRUNK",
+        "INTERNAL_RECHARGE"
+      ]
+    },
+    "destination": {
+      "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/E164"
+    },
+    "billable_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "call_id",
+    "rating_profile_id",
+    "billable_ms"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/interfaces/RatingRequest.schema.json",
+  "title": "RatingRequest"
+}

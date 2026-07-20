@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commos.dev/schemas/events/AIJobStarted.schema.json",
+  "title": "AIJobStarted",
+  "description": "CommOS canonical event 'AIJobStarted' (Volume 5). Envelope + typed data payload.",
+  "allOf": [
+    {
+      "$ref": "https://commos.dev/schemas/envelope.schema.json"
+    }
+  ],
+  "properties": {
+    "type": {
+      "const": "AIJobStarted"
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "$ref": "https://commos.dev/schemas/common.schema.json#/$defs/Uuid"
+        }
+      },
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "data"
+  ]
+}
