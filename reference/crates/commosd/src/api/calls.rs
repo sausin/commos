@@ -11,11 +11,27 @@ use serde::{Deserialize, Serialize};
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::{Call, Direction};
+use commos_core::events::call_transferred::TransferType;
 
 use super::auth::TenantContext;
 use super::problem::Problem;
 use crate::control::routing::{OriginateRequest, RoutingError};
 use crate::state::AppState;
+
+/// Parse a path id into a validated UUIDv7 or a 400 Problem.
+fn parse_id(id: &str) -> Result<Uuid, Problem> {
+    Uuid::parse(id).map_err(|_| Problem::bad_request("id is not a valid UUIDv7"))
+}
+
+/// Map a Routing error to its Problem-details response (Volume 4 §5).
+fn map_routing_err(e: RoutingError) -> Problem {
+    match e {
+        RoutingError::NotFound => Problem::not_found("no such call"),
+        RoutingError::IllegalState(m) => Problem::new(StatusCode::CONFLICT, "illegal_state", m),
+        RoutingError::MediaRejected(m) => Problem::new(StatusCode::BAD_GATEWAY, "media_rejected", m),
+        RoutingError::Store(e) => Problem::internal(e.to_string()),
+    }
+}
 
 /// Query params for `list_calls` (OpenAPI `Limit` default 50 / max 200, `Cursor`).
 #[derive(Deserialize)]
@@ -85,12 +101,7 @@ pub async fn create_calls(
             },
         )
         .await
-        .map_err(|e| match e {
-            RoutingError::MediaRejected(reason) => {
-                Problem::new(StatusCode::BAD_GATEWAY, "media_rejected", reason)
-            }
-            RoutingError::Store(e) => Problem::internal(e.to_string()),
-        })?;
+        .map_err(map_routing_err)?;
 
     Ok((StatusCode::CREATED, Json(call)))
 }
@@ -111,4 +122,79 @@ pub async fn get_call(
         Some(call) => Ok(Json(call)),
         None => Err(Problem::not_found("no such call")),
     }
+}
+
+// --- Action verbs (Volume 4 `/v1/calls/{id}:<action>`; mounted as sub-paths). ------------
+// Each transitions the Call (where applicable) and emits the corresponding event through the
+// transactional outbox, then commands the media plane.
+
+/// `POST /v1/calls/{id}:hold`
+pub async fn hold_call(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Path(id): Path<String>,
+) -> Result<Json<Call>, Problem> {
+    let id = parse_id(&id)?;
+    st.routing
+        .hold(tenant.tenant_id, id)
+        .await
+        .map(Json)
+        .map_err(map_routing_err)
+}
+
+/// `POST /v1/calls/{id}:resume`
+pub async fn resume_call(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Path(id): Path<String>,
+) -> Result<Json<Call>, Problem> {
+    let id = parse_id(&id)?;
+    st.routing
+        .resume(tenant.tenant_id, id)
+        .await
+        .map(Json)
+        .map_err(map_routing_err)
+}
+
+/// `POST /v1/calls/{id}:hangup`
+pub async fn hangup_call(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Path(id): Path<String>,
+) -> Result<Json<Call>, Problem> {
+    let id = parse_id(&id)?;
+    st.routing
+        .hangup(tenant.tenant_id, id, Some("NORMAL_CLEARING".to_string()))
+        .await
+        .map(Json)
+        .map_err(map_routing_err)
+}
+
+/// Body for `transfer`: the target is required; kind defaults to BLIND.
+#[derive(Deserialize)]
+pub struct TransferBody {
+    pub to_ref: String,
+    #[serde(default)]
+    pub transfer_type: Option<TransferType>,
+    #[serde(default)]
+    pub from_ref: Option<String>,
+}
+
+/// `POST /v1/calls/{id}:transfer`
+pub async fn transfer_call(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Path(id): Path<String>,
+    Json(body): Json<TransferBody>,
+) -> Result<Json<Call>, Problem> {
+    let id = parse_id(&id)?;
+    if body.to_ref.trim().is_empty() {
+        return Err(Problem::bad_request("to_ref is required"));
+    }
+    let transfer_type = body.transfer_type.unwrap_or(TransferType::Blind);
+    st.routing
+        .transfer(tenant.tenant_id, id, body.to_ref, transfer_type, body.from_ref)
+        .await
+        .map(Json)
+        .map_err(map_routing_err)
 }

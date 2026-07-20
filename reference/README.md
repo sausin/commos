@@ -109,8 +109,14 @@ curl -s localhost:8080/_introspect/events        # watch CallStarted flow throug
 ### Endpoints
 
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
-- `GET /v1/calls`, `POST /v1/calls`, `GET /v1/calls/{id}` — the Routing resource (bearer + tenant-scoped).
+- **Voice workload** — `GET|POST /v1/calls`, `GET /v1/calls/{id}`, and actions
+  `POST /v1/calls/{id}/{hold,resume,hangup,transfer}` (the frozen API's `:action` form,
+  mounted as sub-paths). Each action transitions the Call and emits its event.
+- **Messaging workload** — `GET|POST /v1/channels`, `/v1/threads`, `/v1/messages` and
+  their `/{id}` reads. Same substrate, same store, same outbox.
 - `GET /_introspect/events[/stream]` — **non-normative** view of the event bus for bring-up; not part of the contract.
+
+All `/v1` routes are bearer-authenticated and tenant-scoped.
 
 ## Conformance evidence
 
@@ -130,12 +136,13 @@ curl -s localhost:8080/_introspect/events        # watch CallStarted flow throug
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. The remaining `/v1/calls/{id}:hold|resume|transfer|hangup` actions — the media commands
-   and their events (`CallHeld`/`CallResumed`/`CallTransferred`/`CallEnded`) are already
-   modelled; this is API + Routing wiring.
-2. Persist the messaging-workload entities (Channel/Thread/Message) and expose their
-   `/v1` resources — the substrate is workload-general, so this reuses the same store/outbox.
+1. A real media→control fact channel so Call progression (ring/answer) comes from the media
+   plane rather than the loopback's `auto_answers`, and the SIP/RTP engine behind the
+   existing `MediaPlane` trait.
+2. Update/soft-delete and richer queries for messaging (thread listing by channel, message
+   paging by thread), and the remaining workloads (video/presence/contact-centre).
 3. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
 4. Real JWT verification against Identity (Volume 9), replacing the dev token.
-5. The SIP/RTP media engine behind the existing `MediaPlane` trait.
+5. `PATCH`/`If-Match` optimistic-concurrency updates over the API (the store already enforces
+   versioning).

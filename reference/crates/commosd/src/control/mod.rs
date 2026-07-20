@@ -2,4 +2,5 @@
 //! [`crate::store::Store`]; they issue typed commands to the media plane and emit events
 //! through the outbox.
 
+pub mod messaging;
 pub mod routing;

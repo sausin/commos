@@ -22,6 +22,9 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::channel::Channel;
+use commos_core::entities::message::Message;
+use commos_core::entities::thread::Thread;
 
 pub use mem::MemStore;
 pub use postgres::PgStore;
@@ -30,6 +33,10 @@ pub use postgres::PgStore;
 #[derive(Default)]
 pub struct Tx {
     pub calls: Vec<Call>,
+    /// Messaging workload entities — peers of `Call` on the same substrate.
+    pub channels: Vec<Channel>,
+    pub threads: Vec<Thread>,
+    pub messages: Vec<Message>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -78,6 +85,31 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Call>, StoreError>;
+
+    // Messaging workload reads — tenant-scoped, mirroring the Call ones.
+    async fn get_channel(&self, tenant: Uuid, id: Uuid) -> Result<Option<Channel>, StoreError>;
+    async fn list_channels(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Channel>, StoreError>;
+
+    async fn get_thread(&self, tenant: Uuid, id: Uuid) -> Result<Option<Thread>, StoreError>;
+    async fn list_threads(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Thread>, StoreError>;
+
+    async fn get_message(&self, tenant: Uuid, id: Uuid) -> Result<Option<Message>, StoreError>;
+    async fn list_messages(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

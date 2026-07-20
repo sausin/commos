@@ -29,6 +29,8 @@ pub enum MediaCommand {
     Hold { call_id: Uuid },
     /// Resume held media.
     Resume { call_id: Uuid },
+    /// Redirect the Call's media leg to a new target (REFER / re-INVITE).
+    Transfer { call_id: Uuid, to_ref: String },
     /// Tear the Call down (BYE / hangup).
     Hangup { call_id: Uuid },
 }
@@ -47,6 +49,14 @@ pub enum MediaAck {
 /// gRPC to a media node, …) is swappable without touching Routing.
 pub trait MediaPlane: Send + Sync {
     fn dispatch(&self, cmd: MediaCommand) -> MediaAck;
+
+    /// Whether this binding answers an originated Call immediately. The loopback binding
+    /// does (it has no real peer), so Routing can drive the ring→answer progression and the
+    /// full lifecycle is observable without a real SIP peer. A real media plane returns
+    /// `false`: those facts arrive asynchronously from the network.
+    fn auto_answers(&self) -> bool {
+        false
+    }
 }
 
 /// In-process media binding. It acknowledges commands so the control-plane vertical slice
@@ -54,6 +64,10 @@ pub trait MediaPlane: Send + Sync {
 pub struct LoopbackMedia;
 
 impl MediaPlane for LoopbackMedia {
+    fn auto_answers(&self) -> bool {
+        true
+    }
+
     fn dispatch(&self, cmd: MediaCommand) -> MediaAck {
         match cmd {
             MediaCommand::Originate { call_id, from_ref, to_ref } => {
@@ -62,6 +76,10 @@ impl MediaPlane for LoopbackMedia {
             }
             MediaCommand::Hold { call_id } => MediaAck::Accepted { call_id },
             MediaCommand::Resume { call_id } => MediaAck::Accepted { call_id },
+            MediaCommand::Transfer { call_id, to_ref } => {
+                tracing::info!(%call_id, to = %to_ref, "media: transfer");
+                MediaAck::Accepted { call_id }
+            }
             MediaCommand::Hangup { call_id } => MediaAck::Accepted { call_id },
         }
     }

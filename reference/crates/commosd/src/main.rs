@@ -157,9 +157,10 @@ async fn run(cfg: Config) -> i32 {
     let media = Arc::new(LoopbackMedia);
     let signal = RelaySignal::new();
     let routing = Routing::new(store.clone(), media, signal.clone());
+    let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
 
     let bind = cfg.listen.to_string();
-    let app_state = AppState::new(store.clone(), routing, bus.clone(), recent);
+    let app_state = AppState::new(store.clone(), routing, messaging, bus.clone(), recent);
 
     // --- shutdown plumbing -----------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

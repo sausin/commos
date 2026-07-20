@@ -9,8 +9,58 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::channel::Channel;
+use commos_core::entities::message::Message;
+use commos_core::entities::thread::Thread;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
+
+/// Shared cursor-paging over an insertion-ordered index, keyed by (tenant, id). Mirrors
+/// `list_calls`: resume strictly after the cursor id, tenant-scoped, and offer a next
+/// cursor only when more rows remain for the tenant.
+fn page_from<T: Clone>(
+    order: &[(Uuid, Uuid)],
+    lookup: impl Fn(&(Uuid, Uuid)) -> Option<T>,
+    tenant: Uuid,
+    limit: usize,
+    cursor: Option<String>,
+) -> Page<T> {
+    let start = match cursor.as_deref() {
+        None => 0,
+        Some(c) => order
+            .iter()
+            .position(|(t, id)| *t == tenant && id.to_string() == c)
+            .map(|p| p + 1)
+            .unwrap_or(0),
+    };
+
+    let mut items = Vec::new();
+    let mut last_key: Option<(Uuid, Uuid)> = None;
+    for key in order.iter().skip(start) {
+        if key.0 != tenant {
+            continue;
+        }
+        if items.len() == limit {
+            break;
+        }
+        if let Some(item) = lookup(key) {
+            items.push(item);
+            last_key = Some(*key);
+        }
+    }
+
+    let more_remain = last_key
+        .and_then(|lk| order.iter().position(|k| k == &lk))
+        .map(|p| order.iter().skip(p + 1).any(|(t, _)| *t == tenant))
+        .unwrap_or(false);
+    let next_cursor = if more_remain {
+        last_key.map(|(_, id)| id.to_string())
+    } else {
+        None
+    };
+
+    Page { items, next_cursor }
+}
 
 /// In-memory system of record + outbox. State is not durable across restarts.
 pub struct MemStore {
@@ -23,6 +73,13 @@ struct Inner {
     calls: HashMap<(Uuid, Uuid), Call>,
     /// Insertion order of ids for stable, time-ordered listing (UUIDv7 ≈ creation order).
     order: Vec<(Uuid, Uuid)>,
+    /// Messaging workload tables, each with their own insertion-order index.
+    channels: HashMap<(Uuid, Uuid), Channel>,
+    channel_order: Vec<(Uuid, Uuid)>,
+    threads: HashMap<(Uuid, Uuid), Thread>,
+    thread_order: Vec<(Uuid, Uuid)>,
+    messages: HashMap<(Uuid, Uuid), Message>,
+    message_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -73,6 +130,37 @@ impl Store for MemStore {
                 });
             }
         }
+        // Messaging entities are created at version 0 → an id collision is a conflict.
+        for ch in &tx.channels {
+            let key = (ch.base.tenant_id, ch.base.id);
+            if g.channels.contains_key(&key) || ch.base.version != 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Channel",
+                    id: ch.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+        for th in &tx.threads {
+            let key = (th.base.tenant_id, th.base.id);
+            if g.threads.contains_key(&key) || th.base.version != 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Thread",
+                    id: th.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+        for m in &tx.messages {
+            let key = (m.base.tenant_id, m.base.id);
+            if g.messages.contains_key(&key) || m.base.version != 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Message",
+                    id: m.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -81,6 +169,21 @@ impl Store for MemStore {
                 g.order.push(key);
             }
             g.calls.insert(key, call);
+        }
+        for ch in tx.channels {
+            let key = (ch.base.tenant_id, ch.base.id);
+            g.channel_order.push(key);
+            g.channels.insert(key, ch);
+        }
+        for th in tx.threads {
+            let key = (th.base.tenant_id, th.base.id);
+            g.thread_order.push(key);
+            g.threads.insert(key, th);
+        }
+        for m in tx.messages {
+            let key = (m.base.tenant_id, m.base.id);
+            g.message_order.push(key);
+            g.messages.insert(key, m);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -145,6 +248,69 @@ impl Store for MemStore {
         Ok(Page { items, next_cursor })
     }
 
+    async fn get_channel(&self, tenant: Uuid, id: Uuid) -> Result<Option<Channel>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.channels.get(&(tenant, id)).cloned())
+    }
+
+    async fn list_channels(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Channel>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(
+            &g.channel_order,
+            |k| g.channels.get(k).cloned(),
+            tenant,
+            limit,
+            cursor,
+        ))
+    }
+
+    async fn get_thread(&self, tenant: Uuid, id: Uuid) -> Result<Option<Thread>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.threads.get(&(tenant, id)).cloned())
+    }
+
+    async fn list_threads(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Thread>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(
+            &g.thread_order,
+            |k| g.threads.get(k).cloned(),
+            tenant,
+            limit,
+            cursor,
+        ))
+    }
+
+    async fn get_message(&self, tenant: Uuid, id: Uuid) -> Result<Option<Message>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.messages.get(&(tenant, id)).cloned())
+    }
+
+    async fn list_messages(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(
+            &g.message_order,
+            |k| g.messages.get(k).cloned(),
+            tenant,
+            limit,
+            cursor,
+        ))
+    }
+
     async fn call_for_idempotency_key(
         &self,
         tenant: Uuid,
@@ -193,6 +359,7 @@ mod tests {
                 calls: vec![c],
                 events: vec![serde_json::json!({"type": "CallStarted"})],
                 idempotency: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -247,6 +414,7 @@ mod tests {
                 calls: vec![call(tenant)],
                 events: vec![serde_json::json!({"n": 0}), serde_json::json!({"n": 1})],
                 idempotency: None,
+                ..Default::default()
             })
             .await
             .unwrap();

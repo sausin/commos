@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bus::EventBus;
+use crate::control::messaging::MessagingService;
 use crate::control::routing::Routing;
 use crate::introspect::RecentEvents;
 use crate::store::Store;
@@ -16,6 +17,7 @@ use crate::store::Store;
 pub struct AppState {
     pub store: Arc<dyn Store>,
     pub routing: Routing,
+    pub messaging: MessagingService,
     pub bus: EventBus,
     pub recent: RecentEvents,
     /// Readiness flag — a node reports not-ready before it can serve and again while
@@ -28,12 +30,14 @@ impl AppState {
     pub fn new(
         store: Arc<dyn Store>,
         routing: Routing,
+        messaging: MessagingService,
         bus: EventBus,
         recent: RecentEvents,
     ) -> Self {
         AppState {
             store,
             routing,
+            messaging,
             bus,
             recent,
             ready: Arc::new(AtomicBool::new(false)),

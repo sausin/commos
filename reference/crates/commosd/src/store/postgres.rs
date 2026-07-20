@@ -13,8 +13,19 @@ use sqlx::{PgPool, Row};
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::channel::Channel;
+use commos_core::entities::message::Message;
+use commos_core::entities::thread::Thread;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
+
+/// Deserialise an entity from its `data` jsonb column (the lossless contract image).
+fn entity_from_row<T: serde::de::DeserializeOwned>(
+    row: &sqlx::postgres::PgRow,
+) -> Result<T, StoreError> {
+    let data: serde_json::Value = row.try_get("data").map_err(be)?;
+    serde_json::from_value(data).map_err(be)
+}
 
 /// Schema, applied idempotently at boot. Backward-compatible `IF NOT EXISTS` DDL so old and
 /// new binaries can run concurrently during a rolling upgrade (CMOS-14-DEP-052).
@@ -28,6 +39,36 @@ CREATE TABLE IF NOT EXISTS calls (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS calls_tenant_id_idx ON calls (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS channels (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS channels_tenant_id_idx ON channels (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS threads (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS threads_tenant_id_idx ON threads (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_tenant_id_idx ON messages (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
@@ -68,6 +109,48 @@ impl PgStore {
     fn call_from_row(row: &sqlx::postgres::PgRow) -> Result<Call, StoreError> {
         let data: serde_json::Value = row.try_get("data").map_err(be)?;
         serde_json::from_value(data).map_err(be)
+    }
+
+    /// Keyset-paginated read of a messaging entity table (`table` is a fixed literal from
+    /// this module, never caller input). UUIDv7 ids sort by creation time, so `id > cursor`
+    /// resumes strictly after the last row — the same stable cursor as `list_calls`.
+    async fn list_entities<T: serde::de::DeserializeOwned>(
+        &self,
+        table: &str,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Vec<T>, StoreError> {
+        let limit_i = limit as i64;
+        let rows = match cursor {
+            Some(c) => {
+                let cur = uuid::Uuid::parse_str(&c)
+                    .map_err(|_| StoreError::Backend("invalid cursor".into()))?;
+                let sql = format!(
+                    "SELECT data FROM {table} WHERE tenant_id = $1 AND id > $2 \
+                     ORDER BY id ASC LIMIT $3"
+                );
+                sqlx::query(&sql)
+                    .bind(tenant.as_uuid())
+                    .bind(cur)
+                    .bind(limit_i)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            None => {
+                let sql = format!(
+                    "SELECT data FROM {table} WHERE tenant_id = $1 ORDER BY id ASC LIMIT $2"
+                );
+                sqlx::query(&sql)
+                    .bind(tenant.as_uuid())
+                    .bind(limit_i)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+        }
+        .map_err(be)?;
+
+        rows.iter().map(entity_from_row).collect()
     }
 }
 
@@ -130,6 +213,80 @@ impl Store for PgStore {
                         expected: call.base.version,
                     });
                 }
+            }
+        }
+
+        // Messaging entities are created at version 0 → a plain insert. A colliding id
+        // means someone else already created it (mirrors the Call v0 path).
+        for ch in &tx.channels {
+            let data = serde_json::to_value(ch).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO channels (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(ch.base.id.as_uuid())
+            .bind(ch.base.tenant_id.as_uuid())
+            .bind(ch.base.version as i64)
+            .bind(ch.base.created_at.into_offset())
+            .bind(ch.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Channel",
+                    id: ch.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+
+        for th in &tx.threads {
+            let data = serde_json::to_value(th).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO threads (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(th.base.id.as_uuid())
+            .bind(th.base.tenant_id.as_uuid())
+            .bind(th.base.version as i64)
+            .bind(th.base.created_at.into_offset())
+            .bind(th.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Thread",
+                    id: th.base.id.to_string(),
+                    expected: 0,
+                });
+            }
+        }
+
+        for m in &tx.messages {
+            let data = serde_json::to_value(m).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO messages (id, tenant_id, version, created_at, updated_at, data) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(m.base.id.as_uuid())
+            .bind(m.base.tenant_id.as_uuid())
+            .bind(m.base.version as i64)
+            .bind(m.base.created_at.into_offset())
+            .bind(m.base.updated_at.into_offset())
+            .bind(&data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "Message",
+                    id: m.base.id.to_string(),
+                    expected: 0,
+                });
             }
         }
 
@@ -208,6 +365,87 @@ impl Store for PgStore {
         // Offer a cursor only when the page was full (more may remain).
         let next_cursor = if items.len() == limit {
             items.last().map(|c| c.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_channel(&self, tenant: Uuid, id: Uuid) -> Result<Option<Channel>, StoreError> {
+        let row = sqlx::query("SELECT data FROM channels WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_channels(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Channel>, StoreError> {
+        let items = self
+            .list_entities::<Channel>("channels", tenant, limit, cursor)
+            .await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|c| c.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_thread(&self, tenant: Uuid, id: Uuid) -> Result<Option<Thread>, StoreError> {
+        let row = sqlx::query("SELECT data FROM threads WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_threads(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Thread>, StoreError> {
+        let items = self
+            .list_entities::<Thread>("threads", tenant, limit, cursor)
+            .await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|t| t.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_message(&self, tenant: Uuid, id: Uuid) -> Result<Option<Message>, StoreError> {
+        let row = sqlx::query("SELECT data FROM messages WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid())
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+
+    async fn list_messages(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Message>, StoreError> {
+        let items = self
+            .list_entities::<Message>("messages", tenant, limit, cursor)
+            .await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|m| m.base.id.to_string())
         } else {
             None
         };
