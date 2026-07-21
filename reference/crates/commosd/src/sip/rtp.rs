@@ -121,19 +121,42 @@ pub async fn bind_bridge(capture: Option<Capture>) -> std::io::Result<Bridge> {
 
 /// Bind an ephemeral UDP socket for a Call's RTP and echo datagrams back to their sender.
 /// Returns the bound port (to advertise in SDP) and the task handle (abort on hangup).
-pub async fn bind_echo(capture: Option<Capture>) -> std::io::Result<(u16, JoinHandle<()>)> {
+///
+/// When `srtp` is `Some`, CommOS is the SRTP endpoint: each inbound packet is authenticated and
+/// decrypted with the caller's key before it is captured/echoed, and each outbound packet is
+/// re-encrypted with CommOS's key. Capture therefore always stores plaintext G.711 (as before);
+/// only the wire is protected. A packet that fails authentication is dropped.
+pub async fn bind_echo(
+    capture: Option<Capture>,
+    srtp: Option<super::srtp::SrtpSession>,
+) -> std::io::Result<(u16, JoinHandle<()>)> {
     // Bind all interfaces on an OS-assigned port; SDP advertises the configured media IP.
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     let port = sock.local_addr()?.port();
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
+        let mut srtp = srtp;
         // Reflect each RTP packet straight back to the caller (echo) until the socket errors,
         // capturing the caller's payload when recording is on.
         while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            if let Some(cap) = &capture {
-                capture_payload(cap, &buf[..n]);
+            match &mut srtp {
+                Some(s) => {
+                    // Drop packets that don't authenticate (forged/corrupt).
+                    let Some(plain) = s.inbound.unprotect(&buf[..n]) else { continue };
+                    if let Some(cap) = &capture {
+                        capture_payload(cap, &plain);
+                    }
+                    if let Some(enc) = s.outbound.protect(&plain) {
+                        let _ = sock.send_to(&enc, peer).await;
+                    }
+                }
+                None => {
+                    if let Some(cap) = &capture {
+                        capture_payload(cap, &buf[..n]);
+                    }
+                    let _ = sock.send_to(&buf[..n], peer).await;
+                }
             }
-            let _ = sock.send_to(&buf[..n], peer).await;
         }
     });
     Ok((port, handle))
@@ -203,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn echo_captures_caller_payload() {
         let cap: Capture = Arc::new(Mutex::new(Vec::new()));
-        let (port, task) = bind_echo(Some(cap.clone())).await.unwrap();
+        let (port, task) = bind_echo(Some(cap.clone()), None).await.unwrap();
         let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         // Send an RTP-shaped packet (12B header + payload); expect it echoed + captured.

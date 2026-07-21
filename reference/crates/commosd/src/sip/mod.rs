@@ -11,8 +11,13 @@
 //! bridge to a registered callee), and answers `200 OK` with SDP. OPTIONS/BYE/CANCEL are
 //! answered; BYE produces the CDR.
 //!
+//! Media is encrypted with **SRTP** ([`srtp`], RFC 3711 `AES_CM_128_HMAC_SHA1_80`) on the
+//! endpoint paths CommOS terminates (echo/voicemail) when a caller offers the secure `RTP/SAVP`
+//! profile with an SDES key ([`sdes`], RFC 4568); plain-RTP callers are unaffected.
+//!
 //! **What comes next:** the B2BUA bridge is best-effort (see the `TODO(B2BUA)` in [`server`]);
-//! full mid-dialog correctness, PSTN trunking, and SRTP are the remaining media-plane work.
+//! full mid-dialog correctness, SRTP for the two-leg bridge/trunk relay, and SIP-over-TLS
+//! (to protect the SDES key in transit) are the remaining media-plane work.
 
 pub mod codec;
 pub mod digest;
@@ -21,6 +26,8 @@ pub mod g711;
 pub mod ivr;
 pub mod message;
 pub mod rtp;
+pub mod sdes;
 pub mod server;
+pub mod srtp;
 
 pub use server::SipServer;

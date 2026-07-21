@@ -182,6 +182,7 @@ media_ip: "192.168.1.10"                          # the address advertised to ph
 sip_listen: "0.0.0.0:5060"                        # SIP/UDP ingress (null disables it)
 record_calls: true                                # capture call audio as objects
 voicemail_enabled: true                           # record-on-no-answer + MWI
+srtp: true                                        # encrypt RTP (SRTP/SDES) when a phone offers RTP/SAVP
 object_storage: "s3://my-bucket"                  # local filesystem by default (any S3-compatible service)
 database_url: { ref_uri: "env://DATABASE_URL" }   # embedded SQLite if unset
 ```

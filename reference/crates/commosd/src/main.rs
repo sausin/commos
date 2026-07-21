@@ -252,6 +252,7 @@ async fn run(cfg: Config) -> i32 {
             ivrs.clone(),
             objects.clone(),
             cfg.default_country_code.clone(),
+            cfg.srtp,
         );
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
@@ -265,6 +266,11 @@ async fn run(cfg: Config) -> i32 {
             tracing::info!("voicemail: ENABLED (record-on-no-answer for internal extensions; MWI via SIP NOTIFY)");
         } else {
             tracing::info!("voicemail: DISABLED (no-answer falls back to the echo path)");
+        }
+        if cfg.srtp {
+            tracing::info!("SRTP: ENABLED (encrypt echo/voicemail media when the caller offers RTP/SAVP + SDES)");
+        } else {
+            tracing::info!("SRTP: DISABLED (media answered in the clear even when offered)");
         }
         tokio::spawn(async move {
             if let Err(e) = server.run(sip_addr).await {

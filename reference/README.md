@@ -178,6 +178,13 @@ Verified: `INVITE → 100 Trying → 200 OK (SDP)`, RTP echoed back, `BYE → 20
 the two-leg bridge relays A↔B in a unit test. Full mid-dialog B2BUA correctness (transactions,
 re-INVITE/hold, transcoding, conferencing) are the next media steps.
 
+Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) on the endpoint paths
+CommOS terminates — the echo test and voicemail — whenever a phone offers the secure `RTP/SAVP`
+profile with an SDES key (`a=crypto`, RFC 4568); a plain-RTP caller is answered in the clear
+exactly as before. The crypto is pure-Rust (RustCrypto), validated against the RFC 3711 key-
+derivation vectors and cross-checked end-to-end by an independent SRTP implementation. SRTP for
+the two-leg bridge/trunk relay, and SIP-over-TLS to protect the SDES key in transit, come next.
+
 All `/v1` routes are bearer-authenticated and tenant-scoped. Auth verifies **HS256 JWTs** when a
 `jwt_secret` is configured (tenant from the `tenant_id` claim); with none configured it accepts the
 `tenant:<uuidv7>` dev token, so local dev and the dashboards work with zero setup.

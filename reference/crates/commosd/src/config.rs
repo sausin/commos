@@ -58,6 +58,17 @@ pub struct Config {
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
 
+    /// Encrypt the RTP media path with SRTP (RFC 3711) when a caller offers it — the secure
+    /// `RTP/SAVP` profile keyed by an SDES `a=crypto` line (RFC 4568, `AES_CM_128_HMAC_SHA1_80`).
+    /// Default `true`: worth doing even on a trusted LAN, since it stops a passive sniffer from
+    /// capturing call audio. SRTP is only ever *offered* by the phone, so this default never
+    /// breaks a plain-RTP caller — a plain `RTP/AVP` INVITE is still answered in the clear. It
+    /// applies to the endpoint media paths CommOS terminates (echo test and voicemail); SRTP for
+    /// two-leg extension bridges and carrier trunks is forthcoming. Because SDES carries the key
+    /// in the SDP, pair this with SIP-over-TLS once available to protect the key in transit.
+    #[serde(default = "default_true")]
+    pub srtp: bool,
+
     /// HS256 JWT signing secret — a **reference**, never inline (CMOS-14-DEP-083). When set,
     /// `/v1` bearer tokens are verified as JWTs (Volume 9). When unset (default), only the
     /// `tenant:<uuid>` dev token is accepted (see `dev_tokens`).
@@ -199,6 +210,7 @@ impl Default for Config {
             record_calls: false,
             voicemail_enabled: true,
             media_ip: default_media_ip(),
+            srtp: true,
             jwt_secret: None,
             dev_tokens: default_true(),
             database_url: None,

@@ -40,7 +40,7 @@ fn now_unix() -> i64 {
 }
 
 use super::message::{self, SipMessage};
-use super::{codec, dtmf, g711, ivr, rtp};
+use super::{codec, dtmf, g711, ivr, rtp, sdes, srtp};
 
 /// Largest UDP SIP datagram we accept (the UDP ceiling; ample for INVITE+SDP).
 const MAX_DATAGRAM: usize = 65_535;
@@ -171,6 +171,9 @@ pub struct SipServer {
     /// Home country code (digits) used to classify a dialled number as external (E.164) for
     /// outbound trunk routing and to normalise inbound DID numbers.
     default_cc: String,
+    /// Encrypt the endpoint media path with SRTP when a caller offers `RTP/SAVP` + SDES
+    /// ([`srtp`]/[`sdes`], RFC 3711/4568). Plain-RTP callers are unaffected.
+    srtp_enabled: bool,
 }
 
 impl SipServer {
@@ -190,6 +193,7 @@ impl SipServer {
         ivrs: IvrService,
         objects: ObjectService,
         default_cc: impl Into<String>,
+        srtp_enabled: bool,
     ) -> Self {
         SipServer {
             registrations,
@@ -209,6 +213,7 @@ impl SipServer {
             ivrs,
             objects,
             default_cc: default_cc.into(),
+            srtp_enabled,
         }
     }
 
@@ -496,7 +501,8 @@ impl SipServer {
         // payload type; `g711` is the G.711 variant CommOS synthesises where it is itself the
         // endpoint (IVR/voicemail); `reflect` is the caller's preferred codec, answered verbatim
         // on the echo path (byte-transparent). Bridge/trunk pass the whole offer through.
-        let offer = codec::AudioMedia::parse(&String::from_utf8_lossy(msg.body()));
+        let body = String::from_utf8_lossy(msg.body()).into_owned();
+        let offer = codec::AudioMedia::parse(&body);
         let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
         let g711 = offer
             .select_g711()
@@ -561,7 +567,7 @@ impl SipServer {
                             bridge.abort();
                         }
                         // Answer the caller with the codec the callee selected (transparent relay).
-                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te);
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, None);
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
                             codec = %sel_codec.name, "SIP INVITE bridged to registered callee");
@@ -616,7 +622,7 @@ impl SipServer {
                         bridge.abort();
                     }
                     // Answer the caller with the carrier's selected codec (transparent relay).
-                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te);
+                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, None);
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
                     tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, "SIP INVITE routed outbound via trunk");
                     return self.send(socket, ok.as_bytes(), src).await;
@@ -631,7 +637,13 @@ impl SipServer {
         // caller is connected to a capturing echo, exactly as the recording path is.
         if let Some(vmbox) = voicemail_target {
             let vm_capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
-            let rtp_port = match rtp::bind_echo(Some(vm_capture.clone())).await {
+            // Encrypt the voicemail media path when the caller offers SRTP: the capture stores the
+            // decrypted G.711 (as before), only the wire is protected.
+            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body) {
+                Some((c, s)) => (Some(c), Some(s)),
+                None => (None, None),
+            };
+            let rtp_port = match rtp::bind_echo(Some(vm_capture.clone()), vm_srtp).await {
                 Ok((port, task)) => {
                     if !call_id_hdr.is_empty() {
                         self.dialogs.lock().expect("dialogs mutex").insert(
@@ -656,15 +668,20 @@ impl SipServer {
                 }
             };
             // Answer with G.711 so the captured voicemail is a storable/playable codec.
-            let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt);
+            let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, vm_crypto.as_ref());
             let ok = self.build_invite_ok(msg, &sdp, call_id);
-            tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, "SIP INVITE answered (voicemail)");
+            tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, srtp = vm_crypto.is_some(), "SIP INVITE answered (voicemail)");
             return self.send(socket, ok.as_bytes(), src).await;
         }
 
         // Echo path: non-mailbox destination (PSTN-style / +E.164), or a no-answer with
-        // voicemail disabled. One UDP socket reflecting RTP back to the caller.
-        let rtp_port = match rtp::bind_echo(capture.clone()).await {
+        // voicemail disabled. One UDP socket reflecting RTP back to the caller — decrypting then
+        // re-encrypting each packet when the caller negotiated SRTP.
+        let (echo_crypto, echo_srtp) = match self.negotiate_srtp(&body) {
+            Some((c, s)) => (Some(c), Some(s)),
+            None => (None, None),
+        };
+        let rtp_port = match rtp::bind_echo(capture.clone(), echo_srtp).await {
             Ok((port, task)) => {
                 if !call_id_hdr.is_empty() {
                     self.dialogs.lock().expect("dialogs mutex").insert(
@@ -690,9 +707,9 @@ impl SipServer {
         };
 
         // Answer with the caller's preferred codec — the echo path reflects it byte-for-byte.
-        let sdp = self.build_sdp(rtp_port, &reflect, te_pt);
+        let sdp = self.build_sdp(rtp_port, &reflect, te_pt, echo_crypto.as_ref());
         let ok = self.build_invite_ok(msg, &sdp, call_id);
-        tracing::info!(%call_id, rtp_port, codec = %reflect.name, "SIP INVITE answered (RTP echo)");
+        tracing::info!(%call_id, rtp_port, codec = %reflect.name, srtp = echo_crypto.is_some(), "SIP INVITE answered (RTP echo)");
         self.send(socket, ok.as_bytes(), src).await
     }
 
@@ -864,7 +881,7 @@ impl SipServer {
         }
 
         let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
-        let sdp = self.build_sdp(rtp_port, &audio, te_pt);
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, %ivr_id, rtp_port, codec = %g711.sdp_name(), "SIP INVITE answered (IVR menu)");
         self.send(socket, ok.as_bytes(), src).await
@@ -944,7 +961,7 @@ impl SipServer {
         call_id: Uuid,
         call_id_hdr: &str,
     ) -> std::io::Result<()> {
-        let rtp_port = match rtp::bind_echo(None).await {
+        let rtp_port = match rtp::bind_echo(None, None).await {
             Ok((port, task)) => {
                 if !call_id_hdr.is_empty() {
                     self.dialogs.lock().expect("dialogs mutex").insert(
@@ -972,7 +989,7 @@ impl SipServer {
         let offer = codec::AudioMedia::parse(&String::from_utf8_lossy(msg.body()));
         let audio = offer.preferred_audio().unwrap_or_else(default_codec);
         let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
-        let sdp = self.build_sdp(rtp_port, &audio, te_pt);
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         self.send(socket, ok.as_bytes(), src).await
     }
@@ -1450,9 +1467,31 @@ impl SipServer {
     }
 
     /// Build the SDP answer advertising `rtp_port` for the negotiated `audio` codec + DTMF
-    /// payload type `te_pt` (see [`media_sdp`]).
-    fn build_sdp(&self, rtp_port: u16, audio: &codec::Codec, te_pt: u8) -> String {
-        media_sdp(self.media_ip, rtp_port, audio, te_pt)
+    /// payload type `te_pt` (see [`media_sdp`]). Passes `crypto` through so an SRTP-negotiated
+    /// endpoint answers over `RTP/SAVP` with its SDES key.
+    fn build_sdp(&self, rtp_port: u16, audio: &codec::Codec, te_pt: u8, crypto: Option<&sdes::CryptoAttr>) -> String {
+        media_sdp(self.media_ip, rtp_port, audio, te_pt, crypto)
+    }
+
+    /// Negotiate SRTP for an endpoint media path from the caller's SDP `body`: when SRTP is
+    /// enabled and the caller offers the secure profile with a supported SDES key, return the
+    /// `a=crypto` line to advertise back (a fresh CommOS key) and the [`srtp::SrtpSession`] that
+    /// keys the media task — `inbound` from the caller's key, `outbound` from ours. `None` when
+    /// SRTP is off or the caller offered plain RTP (which is then answered in the clear).
+    fn negotiate_srtp(&self, body: &str) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
+        if !self.srtp_enabled || !sdes::offers_savp(body) {
+            return None;
+        }
+        let theirs = sdes::CryptoAttr::from_sdp(body)?;
+        let (their_key, their_salt) = srtp::split_key_salt(&theirs.key_salt);
+        let ours = srtp::random_key_salt();
+        let (our_key, our_salt) = srtp::split_key_salt(&ours);
+        let session = srtp::SrtpSession {
+            inbound: srtp::SrtpContext::new(&their_key, &their_salt),
+            outbound: srtp::SrtpContext::new(&our_key, &our_salt),
+        };
+        // Echo the caller's crypto tag so the peer correlates our answer with its offer.
+        Some((sdes::CryptoAttr { tag: theirs.tag, key_salt: ours }, session))
     }
 
     /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
@@ -1532,18 +1571,24 @@ fn default_codec() -> codec::Codec {
 
 /// The SDP body advertising `port` at `media_ip` for a single negotiated `audio` codec plus RFC
 /// 4733 `telephone-event/8000` at `te_pt` (for in-band DTMF). Used for the answer CommOS sends
-/// the caller and for the single-codec offer on the IVR-transfer leg.
-fn media_sdp(media_ip: IpAddr, port: u16, audio: &codec::Codec, te_pt: u8) -> String {
+/// the caller and for the single-codec offer on the IVR-transfer leg. When `crypto` is `Some`, the
+/// media is offered over the secure `RTP/SAVP` profile with an SDES `a=crypto` key (SRTP).
+fn media_sdp(media_ip: IpAddr, port: u16, audio: &codec::Codec, te_pt: u8, crypto: Option<&sdes::CryptoAttr>) -> String {
+    let (proto, crypto_line) = match crypto {
+        Some(c) => ("RTP/SAVP", format!("{}\r\n", c.to_line())),
+        None => ("RTP/AVP", String::new()),
+    };
     format!(
         "v=0\r\n\
          o=commos 0 0 IN IP4 {ip}\r\n\
          s=CommOS\r\n\
          c=IN IP4 {ip}\r\n\
          t=0 0\r\n\
-         m=audio {port} RTP/AVP {apt} {te}\r\n\
+         m=audio {port} {proto} {apt} {te}\r\n\
          a=rtpmap:{apt} {rtpmap}\r\n\
          a=rtpmap:{te} telephone-event/8000\r\n\
          a=fmtp:{te} 0-16\r\n\
+         {crypto_line}\
          a=sendrecv\r\n",
         ip = media_ip,
         port = port,
@@ -1663,7 +1708,7 @@ async fn ivr_transfer(
     let from_hdr = format!("<sip:commos@{media_ip}>;tag={from_tag}");
     // Offer the callee the IVR caller's negotiated codec (the caller is already on it).
     let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
-    let sdp = media_sdp(media_ip, leg_b_port, &audio, te_pt);
+    let sdp = media_sdp(media_ip, leg_b_port, &audio, te_pt, None);
     let invite = message::request(
         "INVITE",
         &callee.contact,

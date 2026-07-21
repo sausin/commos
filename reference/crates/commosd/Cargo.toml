@@ -34,6 +34,14 @@ sha2 = "0.10"
 # SIP digest authentication (RFC 3261 §22) mandates MD5 for interop with phones. Pure-Rust
 # RustCrypto, cross-compiles cleanly — used ONLY for the SIP challenge/response, never elsewhere.
 md-5 = "0.10"
+# SRTP media encryption (RFC 3711): AES-CM-128 keystream (aes+ctr) and HMAC-SHA1-80 auth
+# (sha1 + the hmac above). All pure-Rust RustCrypto, so encrypting the media path costs the
+# arm64 cross-build nothing — no OpenSSL, no libsrtp. getrandom sources SRTP master keys from
+# the OS CSPRNG. Keyed via SDES (RFC 4568 a=crypto in SDP).
+aes = "0.8"
+ctr = "0.9"
+sha1 = "0.10"
+getrandom = "0.2"
 base64 = "0.22"
 
 # Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,
