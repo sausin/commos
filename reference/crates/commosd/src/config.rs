@@ -43,10 +43,58 @@ pub struct Config {
     #[serde(default)]
     pub record_calls: bool,
 
+    /// Take a voicemail when an internal callee does not answer (Volume 7). When `true`
+    /// (the default — voicemail is a core PBX feature), a call to a registered extension that
+    /// rings unanswered, or to a known-but-offline extension, is answered by the platform,
+    /// the caller's audio is captured as-is, stored as a voicemail on hangup, and a
+    /// message-waiting indication (MWI) is pushed to the phone. External/PSTN destinations
+    /// (no mailbox) still fall through to the echo path. Set `false` to restore the plain
+    /// no-answer→echo behaviour.
+    #[serde(default = "default_true")]
+    pub voicemail_enabled: bool,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
+
+    /// Encrypt the RTP media path with SRTP (RFC 3711) when a caller offers it — the secure
+    /// `RTP/SAVP` profile keyed by an SDES `a=crypto` line (RFC 4568, `AES_CM_128_HMAC_SHA1_80`).
+    /// Default `true`: worth doing even on a trusted LAN, since it stops a passive sniffer from
+    /// capturing call audio. SRTP is only ever *offered* by the phone, so this default never
+    /// breaks a plain-RTP caller — a plain `RTP/AVP` INVITE is still answered in the clear. It
+    /// applies to the endpoint media paths CommOS terminates (echo test and voicemail) and, per
+    /// leg, across the two-leg bridge/trunk relay. Because SDES carries the key in the SDP, pair
+    /// this with SIP-over-TLS below to protect the key in transit.
+    #[serde(default = "default_true")]
+    pub srtp: bool,
+
+    /// Attempt SRTP toward an **outbound carrier trunk** as well (default `false`). SDP cannot
+    /// downgrade the profile in an answer, so offering `RTP/SAVP` to a carrier that only speaks
+    /// plain RTP makes it reject the call. Carrier SRTP support is inconsistent, so by default the
+    /// carrier (trunk) leg is left **plaintext** — the caller's access leg is still encrypted when
+    /// they offered SRTP, and the outbound call always connects. Set `true` only when the carrier
+    /// is known to support `AES_CM_128_HMAC_SHA1_80` SDES.
+    #[serde(default)]
+    pub trunk_srtp: bool,
+
+    /// TLS address the SIP signalling ingress binds for **SIPS** (SIP over TLS, RFC 3261). `null`
+    /// (the default) disables it — TLS is opt-in and requires a build with `--features tls`. The
+    /// IANA SIPS port is `5061`. Encrypting the signalling channel protects the SDES SRTP keys
+    /// (and every header — who calls whom) from a passive network observer.
+    #[serde(default)]
+    pub sips_listen: Option<SocketAddr>,
+
+    /// PEM certificate chain served on the SIPS listener. A public certificate, so a plain path
+    /// (not a secret reference). Required when `sips_listen` is set.
+    #[serde(default)]
+    pub sip_tls_cert: Option<String>,
+
+    /// PEM private key for the SIPS certificate — a **reference**, never inline
+    /// (CMOS-14-DEP-083); e.g. `{ ref_uri: "file:///etc/commos/tls/sip-key.pem" }`. Required when
+    /// `sips_listen` is set.
+    #[serde(default)]
+    pub sip_tls_key: Option<SecretRef>,
 
     /// HS256 JWT signing secret — a **reference**, never inline (CMOS-14-DEP-083). When set,
     /// `/v1` bearer tokens are verified as JWTs (Volume 9). When unset (default), only the
@@ -187,7 +235,13 @@ impl Default for Config {
             require_sip_auth: false,
             sip_realm: default_sip_realm(),
             record_calls: false,
+            voicemail_enabled: true,
             media_ip: default_media_ip(),
+            srtp: true,
+            trunk_srtp: false,
+            sips_listen: None,
+            sip_tls_cert: None,
+            sip_tls_key: None,
             jwt_secret: None,
             dev_tokens: default_true(),
             database_url: None,

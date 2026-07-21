@@ -34,6 +34,14 @@ sha2 = "0.10"
 # SIP digest authentication (RFC 3261 §22) mandates MD5 for interop with phones. Pure-Rust
 # RustCrypto, cross-compiles cleanly — used ONLY for the SIP challenge/response, never elsewhere.
 md-5 = "0.10"
+# SRTP media encryption (RFC 3711): AES-CM-128 keystream (aes+ctr) and HMAC-SHA1-80 auth
+# (sha1 + the hmac above). All pure-Rust RustCrypto, so encrypting the media path costs the
+# arm64 cross-build nothing — no OpenSSL, no libsrtp. getrandom sources SRTP master keys from
+# the OS CSPRNG. Keyed via SDES (RFC 4568 a=crypto in SDP).
+aes = "0.8"
+ctr = "0.9"
+sha1 = "0.10"
+getrandom = "0.2"
 base64 = "0.22"
 
 # Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,
@@ -42,11 +50,21 @@ base64 = "0.22"
 # rustls, never OpenSSL, so an `s3`-enabled build still avoids native-tls.
 object_store = { version = "0.11", default-features = false, features = ["aws"], optional = true }
 
+# Optional SIP-over-TLS (SIPS) signalling ingress, gated behind the `tls` feature so the DEFAULT
+# binary stays pure-Rust and cross-compiles cleanly. rustls uses the `ring` provider selected
+# explicitly (default-features off keeps aws-lc-rs — cmake/C/NASM — out); `ring` still compiles
+# C/asm, so this is the same bargain as `s3`: C only in a `--features tls` build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
 [features]
 # S3-compatible object storage is ON by default. Opt OUT for the leanest, purest-Rust binary
 # with `cargo build --no-default-features` (local-filesystem object storage only).
 default = ["s3"]
 s3 = ["dep:object_store"]
+# SIP-over-TLS ingress. Build with `--features tls` to enable the SIPS listener (adds ring's C).
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

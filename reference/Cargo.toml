@@ -3,7 +3,10 @@ resolver = "2"
 members = ["crates/commos-core", "crates/commosd"]
 
 [workspace.package]
-version = "0.4.0"
+# The reference-implementation binary version, tracking the published release tag (v0.1.0).
+# This is intentionally distinct from the specification version in `spec/` (0.4.0): the spec is
+# contract-complete while the shipped binary is released independently.
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 # Source-available under the O'Saasy License (see /LICENSE): self-host and modify freely, but

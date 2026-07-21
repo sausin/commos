@@ -10,6 +10,8 @@ use crate::api::admin::{AdminAuth, HasAdminAuth};
 use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
+use crate::control::callflow::CallFlowService;
+use crate::control::ivr::IvrService;
 use crate::control::messaging::MessagingService;
 use crate::control::objects::ObjectService;
 use crate::control::provisioning::Provisioning;
@@ -18,6 +20,8 @@ use crate::control::realtime::RealtimeService;
 use crate::control::recordings::RecordingService;
 use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
+use crate::control::trunking::TrunkingService;
+use crate::control::voicemail::VoicemailService;
 use crate::control::webhooks::WebhookService;
 use crate::introspect::RecentEvents;
 use crate::metrics::Metrics;
@@ -31,6 +35,11 @@ pub struct AppState {
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
     pub queues: QueueService,
+    /// Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
+    pub call_flows: CallFlowService,
+    pub ivrs: IvrService,
+    /// PSTN / SIP trunking — carriers, gateways, trunks (outbound), and inbound DIDs.
+    pub trunking: TrunkingService,
     /// Directory write path — people, phones, extensions, routes and their lifecycle.
     pub provisioning: Provisioning,
     /// Outbound webhook subscriptions (register/list/delete).
@@ -39,6 +48,8 @@ pub struct AppState {
     pub objects: ObjectService,
     /// Call recordings — list/fetch captured audio and its metadata (Volume 7).
     pub recordings: RecordingService,
+    /// Voicemails — list/fetch/mark-read messages left on no-answer (Volume 7).
+    pub voicemails: VoicemailService,
     /// Prometheus metrics registry (scraped at `/metrics`).
     pub metrics: Metrics,
     /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
@@ -72,10 +83,14 @@ impl AppState {
         messaging: MessagingService,
         realtime: RealtimeService,
         queues: QueueService,
+        call_flows: CallFlowService,
+        ivrs: IvrService,
+        trunking: TrunkingService,
         provisioning: Provisioning,
         webhooks: WebhookService,
         objects: ObjectService,
         recordings: RecordingService,
+        voicemails: VoicemailService,
         metrics: Metrics,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
@@ -92,10 +107,14 @@ impl AppState {
             messaging,
             realtime,
             queues,
+            call_flows,
+            ivrs,
+            trunking,
             provisioning,
             webhooks,
             objects,
             recordings,
+            voicemails,
             metrics,
             agents,
             registrations,

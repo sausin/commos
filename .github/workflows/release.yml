@@ -75,7 +75,18 @@ jobs:
           bindir="target/${{ matrix.target }}/release"
           # Prove the artifact is the architecture we claim before we ship it.
           file "$bindir/${BIN}"
-          tar -C "$bindir" -czf "${out}/${name}.tar.gz" "$BIN"
+          # Stage the binary alongside the files an operator needs to actually run it, so the
+          # archive extracts to a self-contained directory (binary + example config + setup
+          # helper + quickstart + licence) rather than a bare binary.
+          stage="${out}/${name}"
+          mkdir -p "$stage"
+          cp "$bindir/${BIN}" "$stage/"
+          cp deploy/pbx.example.yaml "$stage/"
+          cp QUICKSTART.md "$stage/"
+          cp scripts/install.sh "$stage/"
+          cp ../LICENSE "$stage/"
+          tar -C "$out" -czf "${out}/${name}.tar.gz" "${name}"
+          rm -rf "$stage"
           ( cd "$out" && sha256sum "${name}.tar.gz" | tee "${name}.tar.gz.sha256" )
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
@@ -144,6 +155,17 @@ jobs:
 
             The **`musl`** builds are fully static — no glibc dependency, so they run on
             any Linux of that architecture out of the box.
+
+            ### What's in each archive
+            Each `.tar.gz` extracts to a self-contained directory:
+            ```
+            commosd            the binary
+            pbx.example.yaml   annotated runtime config — copy to pbx.yaml and edit
+            install.sh         one-shot LAN setup (auto-detects your IP, writes pbx.yaml)
+            QUICKSTART.md      how to run it and where extensions/users come from
+            LICENSE
+            ```
+            Fastest start: `./install.sh --bin ./commosd --media-ip <this-host-lan-ip>`.
 
             ### Verify a download
             ```sh

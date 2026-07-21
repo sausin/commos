@@ -175,8 +175,30 @@ An INVITE aimed at a **registered** endpoint is bridged B2BUA-style: CommOS plac
 INVITE to the callee, then relays RTP between the two legs (symmetric-RTP latching) so two
 softphones can talk; an INVITE to an external/unregistered number falls back to the echo test.
 Verified: `INVITE → 100 Trying → 200 OK (SDP)`, RTP echoed back, `BYE → 200 OK`, Call `ENDED` + CDR;
-the two-leg bridge relays A↔B in a unit test. Full mid-dialog B2BUA correctness (transactions,
-re-INVITE/hold, transcoding, conferencing) are the next media steps.
+the two-leg bridge relays A↔B in a unit test.
+
+Mid-dialog handling is transaction-aware: the outbound INVITE and the callee-leg BYE are sent as
+**reliable transactions** — retransmitted on SIP timers (T1 back-off) until the peer responds, so a
+lost request on UDP doesn't drop the call or leak the far leg. A **retransmitted INVITE** (a lost
+200) or a **re-INVITE** (media refresh / hold) is answered idempotently from the dialog's stored
+media, so it never spawns a duplicate `Call` — verified end-to-end (three INVITEs → one Call).
+Full re-negotiation of a hold's media direction, transcoding, and conferencing are the next steps.
+
+Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) whenever a phone offers the
+secure `RTP/SAVP` profile with an SDES key (`a=crypto`, RFC 4568): on the endpoint paths CommOS
+terminates (echo test, voicemail), and across the **two-leg bridge/trunk relay**, where SRTP is
+terminated independently per leg — CommOS decrypts the caller leg and re-encrypts for the callee
+leg, so the two legs never share key material and the media is only plaintext inside CommOS. A
+plain-RTP caller is answered in the clear exactly as before. The crypto is pure-Rust (RustCrypto),
+validated against the RFC 3711 key-derivation vectors and cross-checked end-to-end (endpoint *and*
+two-phone bridge) by an independent SRTP implementation.
+
+The signalling channel itself can run over **SIP-over-TLS** (SIPS) — build with `--features tls`,
+set `sips_listen` plus `sip_tls_cert`/`sip_tls_key`, and CommOS serves the same request handlers
+over a TLS stream (rustls, ring provider), re-framing messages by `Content-Length` and replying on
+the same connection. This encrypts every header and the SDES SRTP keys against a passive observer.
+TLS stays behind a feature so the default binary is pure-Rust and cross-compiles clean, exactly
+like `s3`. Two-leg bridge/trunk SRTP, and *outbound* TLS on trunk legs, come next.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped. Auth verifies **HS256 JWTs** when a
 `jwt_secret` is configured (tenant from the `tenant_id` claim); with none configured it accepts the

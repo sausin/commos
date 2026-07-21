@@ -23,11 +23,17 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
+use commos_core::entities::carrier::Carrier;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
+use commos_core::entities::did::Did;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::gateway::Gateway;
+use commos_core::entities::ivr::Ivr;
 use commos_core::entities::message::Message;
+use commos_core::entities::trunk::Trunk;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
@@ -36,6 +42,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
 
 pub use mem::MemStore;
@@ -56,6 +63,16 @@ pub struct Tx {
     /// Billing (CDR) and contact-centre (Queue) entities.
     pub cdrs: Vec<Cdr>,
     pub queues: Vec<Queue>,
+    /// Routing programs — versioned CallFlows and IVR menu nodes.
+    pub call_flows: Vec<CallFlow>,
+    pub ivrs: Vec<Ivr>,
+    /// Immutable published CallFlow snapshots (append-only history; never updated).
+    pub call_flow_revisions: Vec<CallFlowRevision>,
+    /// PSTN / SIP trunking — carriers, their gateways and trunks, and inbound DIDs.
+    pub carriers: Vec<Carrier>,
+    pub gateways: Vec<Gateway>,
+    pub trunks: Vec<Trunk>,
+    pub dids: Vec<Did>,
     /// Provisioning entities — people, extensions, phones, and routes (onboarding).
     pub users: Vec<User>,
     pub extensions: Vec<Extension>,
@@ -67,6 +84,8 @@ pub struct Tx {
     pub objects: Vec<Object>,
     /// Call recordings — a Call ↔ audio Object link.
     pub recordings: Vec<Recording>,
+    /// Voicemails — a mailbox ↔ audio Object link; the `read` flag versions forward.
+    pub voicemails: Vec<Voicemail>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -183,6 +202,55 @@ pub trait Store: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Page<Queue>, StoreError>;
 
+    // Routing programs — CallFlows (versioned) and IVR menu nodes, tenant-scoped.
+    async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError>;
+    async fn list_call_flows(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<CallFlow>, StoreError>;
+
+    async fn get_ivr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Ivr>, StoreError>;
+    async fn list_ivrs(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Ivr>, StoreError>;
+    async fn delete_ivr(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    /// Fetch one immutable published CallFlow revision by `(call_flow_id, version)`.
+    async fn get_call_flow_revision(
+        &self,
+        tenant: Uuid,
+        call_flow_id: Uuid,
+        version: u64,
+    ) -> Result<Option<CallFlowRevision>, StoreError>;
+    /// All revisions of a CallFlow, ascending by version (its append-only publish history).
+    async fn list_call_flow_revisions(
+        &self,
+        tenant: Uuid,
+        call_flow_id: Uuid,
+    ) -> Result<Vec<CallFlowRevision>, StoreError>;
+
+    // PSTN / SIP trunking — carriers, gateways, trunks, DIDs. Config CRUD, tenant-scoped.
+    async fn get_carrier(&self, tenant: Uuid, id: Uuid) -> Result<Option<Carrier>, StoreError>;
+    async fn list_carriers(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Carrier>, StoreError>;
+    async fn delete_carrier(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_gateway(&self, tenant: Uuid, id: Uuid) -> Result<Option<Gateway>, StoreError>;
+    async fn list_gateways(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Gateway>, StoreError>;
+    async fn delete_gateway(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_trunk(&self, tenant: Uuid, id: Uuid) -> Result<Option<Trunk>, StoreError>;
+    async fn list_trunks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Trunk>, StoreError>;
+    async fn delete_trunk(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_did(&self, tenant: Uuid, id: Uuid) -> Result<Option<Did>, StoreError>;
+    async fn list_dids(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Did>, StoreError>;
+    async fn delete_did(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
     // Provisioning (user/extension/device) reads — tenant-scoped.
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError>;
     async fn list_users(
@@ -248,6 +316,14 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Recording>, StoreError>;
+
+    async fn get_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<Option<Voicemail>, StoreError>;
+    async fn list_voicemails(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Voicemail>, StoreError>;
 
     /// SIP shared-secret credentials (Volume 9), keyed by `(tenant, sip username)`. Not a
     /// frozen contract entity — a per-device secret used to authenticate SIP digest and served

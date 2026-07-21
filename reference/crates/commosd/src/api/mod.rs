@@ -7,10 +7,12 @@
 pub mod admin;
 pub mod agents;
 pub mod auth;
+pub mod call_flows;
 pub mod calls;
 pub mod cdrs;
 pub mod channels;
 pub mod config;
+pub mod ivrs;
 pub mod dashboard;
 pub mod directory;
 pub mod health;
@@ -25,7 +27,9 @@ pub mod queues;
 pub mod recordings;
 pub mod registrations;
 pub mod threads;
+pub mod trunking;
 pub mod video_rooms;
+pub mod voicemail;
 pub mod webhooks;
 
 use axum::extract::State;
@@ -83,6 +87,27 @@ pub fn router(state: AppState) -> Router {
         .route("/queues", get(queues::list_queues).post(queues::create_queue))
         .route("/queues/:id", get(queues::get_queue))
         .route("/queues/:id/enqueue", post(queues::enqueue_call))
+        // Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
+        // `:action` sub-paths (`/publish`, `/rollback`) mirror the frozen `{id}:publish`.
+        .route("/call-flows", get(call_flows::list_call_flows).post(call_flows::create_call_flow))
+        .route(
+            "/call-flows/:id",
+            get(call_flows::get_call_flow).patch(call_flows::patch_call_flow),
+        )
+        .route("/call-flows/:id/publish", post(call_flows::publish_call_flow))
+        .route("/call-flows/:id/rollback", post(call_flows::rollback_call_flow))
+        .route("/call-flows/:id/revisions", get(call_flows::list_call_flow_revisions))
+        .route("/ivrs", get(ivrs::list_ivrs).post(ivrs::create_ivr))
+        .route("/ivrs/:id", get(ivrs::get_ivr).patch(ivrs::patch_ivr).delete(ivrs::delete_ivr))
+        // PSTN / SIP trunking — carriers, gateways, trunks (outbound), and inbound DIDs.
+        .route("/carriers", get(trunking::list_carriers).post(trunking::create_carrier))
+        .route("/carriers/:id", get(trunking::get_carrier).delete(trunking::delete_carrier))
+        .route("/gateways", get(trunking::list_gateways).post(trunking::create_gateway))
+        .route("/gateways/:id", get(trunking::get_gateway).patch(trunking::patch_gateway).delete(trunking::delete_gateway))
+        .route("/trunks", get(trunking::list_trunks).post(trunking::create_trunk))
+        .route("/trunks/:id", get(trunking::get_trunk).delete(trunking::delete_trunk))
+        .route("/dids", get(trunking::list_dids).post(trunking::create_did))
+        .route("/dids/:id", get(trunking::get_did).delete(trunking::delete_did))
         .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
         .route("/agents/:id", get(agents::get_agent))
         // Admin onboarding wizard — auto-detected suggestions + one-click apply.
@@ -132,7 +157,13 @@ pub fn router(state: AppState) -> Router {
         // Call recordings — captured audio + metadata (read-only; produced by the SIP plane).
         .route("/recordings", get(recordings::list_recordings))
         .route("/recordings/:id", get(recordings::get_recording))
-        .route("/recordings/:id/content", get(recordings::get_recording_content));
+        .route("/recordings/:id/content", get(recordings::get_recording_content))
+        // Voicemails — captured audio + metadata (produced by the SIP plane on no-answer).
+        // Read/mark-read only; `POST /voicemails/:id/read` clears the message-waiting state.
+        .route("/voicemails", get(voicemail::list_voicemails))
+        .route("/voicemails/:id", get(voicemail::get_voicemail))
+        .route("/voicemails/:id/content", get(voicemail::get_voicemail_content))
+        .route("/voicemails/:id/read", post(voicemail::mark_voicemail_read));
 
     Router::new()
         .nest("/v1", v1)
