@@ -21,6 +21,13 @@
 #   --data-dir <path>      State dir for the SQLite DB, objects, config (default: /var/lib/commos
 #                          as root, else ./commos-data)
 #   --admin-password <pw>  Enable admin auth; stored as a 0600 file secret, referenced from config
+#   --tls                  Enable SIP-over-TLS (SIPS). With no --tls-cert, a self-signed cert is
+#                          generated (openssl required); builds the binary with --features tls.
+#   --tls-cert <path>      Use this PEM certificate chain for SIPS (e.g. a Let's Encrypt
+#                          fullchain.pem). Implies --tls.
+#   --tls-key <path>       PEM private key for --tls-cert (e.g. Let's Encrypt privkey.pem). Stored
+#                          0600 and referenced from config. Implies --tls.
+#   --sip-tls-port <port>  SIPS (SIP/TLS) port (default: 5061)
 #   --bin <path>           Path to the commosd binary (default: auto-locate on PATH / target dir)
 #   --config <path>        Where to write pbx.yaml (default: <data-dir>/pbx.yaml)
 #   --build                Build the binary from source with cargo if none is found
@@ -33,6 +40,7 @@ set -euo pipefail
 # ---- defaults ---------------------------------------------------------------------------
 HTTP_PORT=8080
 SIP_PORT=5060
+SIP_TLS_PORT=5061
 MEDIA_IP=""
 ADMIN_PASSWORD=""
 BIN=""
@@ -40,6 +48,9 @@ CONFIG=""
 DATA_DIR=""
 DO_BUILD=0
 DO_SYSTEMD=0
+DO_TLS=0
+TLS_CERT=""
+TLS_KEY=""
 FORCE=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +71,10 @@ while [ $# -gt 0 ]; do
     --sip-port) SIP_PORT="$2"; shift 2;;
     --data-dir) DATA_DIR="$2"; shift 2;;
     --admin-password) ADMIN_PASSWORD="$2"; shift 2;;
+    --tls) DO_TLS=1; shift;;
+    --tls-cert) TLS_CERT="$2"; DO_TLS=1; shift 2;;
+    --tls-key) TLS_KEY="$2"; DO_TLS=1; shift 2;;
+    --sip-tls-port) SIP_TLS_PORT="$2"; shift 2;;
     --bin) BIN="$2"; shift 2;;
     --config) CONFIG="$2"; shift 2;;
     --build) DO_BUILD=1; shift;;
@@ -114,8 +129,12 @@ if [ -z "$BIN" ]; then
 fi
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
   if [ "$DO_BUILD" = "1" ] && command -v cargo >/dev/null 2>&1; then
-    log "building commosd (release) — this can take a few minutes…"
-    ( cd "$REPO_DIR" && cargo build --release --bin commosd )
+    # SIP-over-TLS needs the `tls` cargo feature compiled in; keep the default features too.
+    FEATURES_ARG=""
+    [ "$DO_TLS" = "1" ] && FEATURES_ARG="--features tls"
+    log "building commosd (release${FEATURES_ARG:+, $FEATURES_ARG}) — this can take a few minutes…"
+    # shellcheck disable=SC2086
+    ( cd "$REPO_DIR" && cargo build --release --bin commosd $FEATURES_ARG )
     BIN="$REPO_DIR/target/release/commosd"
   else
     die "commosd binary not found. Provide --bin <path>, put it on PATH, or pass --build (needs cargo)."
@@ -137,6 +156,51 @@ if [ -n "$ADMIN_PASSWORD" ]; then
   ok "admin auth enabled (secret at $PW_FILE, referenced from config)"
 fi
 
+# ---- SIP-over-TLS (SIPS) certificate ----------------------------------------------------
+# Encrypting the SIP signalling channel protects the SDES SRTP keys and call metadata in
+# transit. The operator can bring their own cert (e.g. Let's Encrypt) with --tls-cert/--tls-key;
+# otherwise, with --tls we generate a self-signed cert so SIPS works out of the box. The private
+# key is a file-referenced secret (never inlined — CMOS-14-DEP-083); the cert is a public path.
+SIPS_YAML=""
+if [ "$DO_TLS" = "1" ]; then
+  # Bring-your-own cert (Let's Encrypt / internal CA): use the operator's files as-is.
+  if [ -n "$TLS_CERT" ] || [ -n "$TLS_KEY" ]; then
+    [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ] || die "TLS: --tls-cert and --tls-key must be given together"
+    [ -f "$TLS_CERT" ] || die "TLS: cert not found: $TLS_CERT"
+    [ -f "$TLS_KEY" ]  || die "TLS: key not found: $TLS_KEY"
+    CERT_PATH="$TLS_CERT"
+    KEY_PATH="$TLS_KEY"
+    ok "SIPS enabled with your certificate: $CERT_PATH"
+    warn "ensure the key ($KEY_PATH) is readable by the commosd service user and kept 0600."
+  else
+    # Self-signed fallback — needs openssl.
+    command -v openssl >/dev/null 2>&1 || die "TLS: openssl not found. Install it, or pass --tls-cert/--tls-key."
+    TLS_DIR="$DATA_DIR/tls"
+    mkdir -p "$TLS_DIR"
+    CERT_PATH="$TLS_DIR/sip-cert.pem"
+    KEY_PATH="$TLS_DIR/sip-key.pem"
+    # SAN covers the media/registrar IP phones connect to (and localhost). 825 days is the max a
+    # public CA would issue; fine for a self-signed cert phones are told to trust.
+    SAN="subjectAltName=IP:$MEDIA_IP,DNS:localhost,IP:127.0.0.1"
+    log "generating a self-signed SIPS certificate (CN=$MEDIA_IP)…"
+    if openssl req -x509 -newkey rsa:2048 -nodes \
+         -keyout "$KEY_PATH" -out "$CERT_PATH" -days 825 \
+         -subj "/CN=$MEDIA_IP" -addext "$SAN" >/dev/null 2>&1; then
+      :
+    else
+      # Older OpenSSL without -addext: fall back to a CN-only cert.
+      warn "openssl -addext unsupported; issuing a CN-only cert (no SAN). Upgrade openssl for SAN."
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$KEY_PATH" -out "$CERT_PATH" -days 825 -subj "/CN=$MEDIA_IP" >/dev/null 2>&1 \
+        || die "TLS: self-signed certificate generation failed"
+    fi
+    chmod 600 "$KEY_PATH"
+    ok "self-signed SIPS certificate: $CERT_PATH (key $KEY_PATH, 0600)"
+    warn "self-signed cert: phones must be set to trust it (or disable cert validation on the LAN)."
+  fi
+  SIPS_YAML="sips_listen: \"0.0.0.0:$SIP_TLS_PORT\""$'\n'"sip_tls_cert: \"$CERT_PATH\""$'\n'"sip_tls_key:"$'\n'"  ref_uri: \"file://$KEY_PATH\""
+fi
+
 # ---- write pbx.yaml ---------------------------------------------------------------------
 if [ -e "$CONFIG" ] && [ "$FORCE" != "1" ]; then
   die "config already exists: $CONFIG (use --force to overwrite)"
@@ -150,6 +214,11 @@ fi
   echo "# media_ip is the address phones send RTP audio to — MUST be reachable from the phones."
   echo "media_ip: \"$MEDIA_IP\""
   echo "data_dir: \"$DATA_DIR\""
+  if [ "$DO_TLS" = "1" ]; then
+    echo "# SIP-over-TLS (SIPS): protects SDES SRTP keys + call metadata in transit."
+    echo "$SIPS_YAML"
+    echo "require_sip_auth: true   # TLS is exposed beyond the LAN; demand per-device SIP credentials."
+  fi
   [ -n "$ADMIN_YAML" ] && echo "$ADMIN_YAML"
 } > "$CONFIG"
 ok "wrote config: $CONFIG"
@@ -197,6 +266,9 @@ echo "    • Health/metrics:   http://$MEDIA_IP:$HTTP_PORT/livez   http://$MEDI
 echo
 log "Point each phone's SIP account at:"
 echo "    • Server / registrar: $MEDIA_IP:$SIP_PORT   (UDP)"
+if [ "$DO_TLS" = "1" ]; then
+  echo "    • Or over TLS (SIPS): $MEDIA_IP:$SIP_TLS_PORT   (TLS) — encrypts signalling + SRTP keys"
+fi
 echo "    • Username:           the extension number you assigned in the wizard"
 echo "    • (Auto-provision:    set DHCP option 66 to http://$MEDIA_IP:$HTTP_PORT/provision)"
 echo
@@ -204,6 +276,18 @@ log "Test the call path:"
 echo "    • Dial your own number  → echo test (you hear yourself = signalling + audio OK)"
 echo "    • Dial another phone's extension → two-way call"
 echo
-warn "LAN posture: SIP/RTP are unencrypted (no TLS/SRTP yet), so keep UDP $SIP_PORT off the public"
-warn "internet — open it and the RTP range to phones only. SIP digest auth is available: set"
-warn "\`require_sip_auth: true\` in $CONFIG once phones are onboarded (each gets a generated secret)."
+log "Security posture (secure-by-default — no extra config needed):"
+echo "    • The API auto-generates a JWT signing secret at $DATA_DIR/secrets/jwt.key on first boot."
+echo "    • From the LAN/loopback, the tenant:<uuid> dev token, dashboard, introspection, and phone"
+echo "      auto-provisioning work with zero setup."
+echo "    • From a PUBLIC source address, those conveniences are refused automatically: /v1 needs a"
+echo "      signed JWT, admin needs an admin session, and provisioning/introspection are LAN-only."
+echo "    • SIP digest auth is auto-required for any non-LAN source address (identity is bound to"
+echo "      the credential, so one device cannot register or dial as another)."
+echo
+if [ "$DO_TLS" = "1" ]; then
+  ok "SIPS (SIP-over-TLS) is enabled on port $SIP_TLS_PORT."
+else
+  warn "SIP/RTP signalling is unencrypted over UDP $SIP_PORT. Keep it off the public internet, or"
+  warn "re-run with --tls (self-signed) or --tls-cert/--tls-key (e.g. Let's Encrypt) to enable SIPS."
+fi

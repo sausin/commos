@@ -36,7 +36,9 @@
 //! The SIP password is a placeholder (`CHANGEME`): per-device credentials are not stored yet.
 //! Real per-device secrets (and their rotation) come from Volume 9.
 
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -64,7 +66,22 @@ const PAGE_SIZE: usize = 200;
 /// case. We normalise it to 12 lowercase hex chars, find the Extension bound to it, and
 /// return a generic provisioning block. Panic-free: bad input → 404, store error → 500,
 /// both as plain text a phone's log can surface.
-pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> Response {
+pub async fn provision(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(file): Path<String>,
+) -> Response {
+    // 0. Phone auto-provisioning hands back the extension's *real* SIP secret in cleartext, so
+    //    it must never be reachable from the public internet — a guessed MAC would otherwise
+    //    leak a working credential (registration hijack / toll fraud). Phones provision from the
+    //    LAN, so restrict this to trusted (loopback/private) peers. An unknown peer fails closed.
+    if !crate::api::peer::is_trusted_ip(&peer.ip()) {
+        return text(
+            StatusCode::FORBIDDEN,
+            "provisioning is restricted to the local/private network\n".to_string(),
+        );
+    }
+
     // 1. Parse the MAC out of the requested filename.
     let mac = match normalize_mac(&file) {
         Some(m) => m,

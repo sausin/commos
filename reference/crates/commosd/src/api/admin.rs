@@ -142,6 +142,7 @@ where
     type Rejection = Problem;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let trusted = super::peer::is_trusted_peer(parts);
         let header = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
@@ -151,8 +152,17 @@ where
         let admin = state.admin_auth();
 
         if admin.is_dev_mode() {
-            // Dev mode: any valid tenant/dev bearer is treated as admin (zero setup).
-            let ctx = verify_bearer(header, state.auth_config())?;
+            // Dev mode: a valid tenant/dev bearer is treated as admin (zero setup) — but ONLY
+            // from a trusted (loopback/LAN) peer. A public peer can never gain admin without a
+            // configured admin password, so an internet-exposed daemon is not silently open.
+            if !trusted {
+                return Err(Problem::unauthorized(
+                    "admin access from a public network requires a configured admin session; \
+                     set admin_password and POST /admin/login",
+                ));
+            }
+            // `verify_bearer` is called with `trusted = true` here since we already gated on it.
+            let ctx = verify_bearer(header, state.auth_config(), true)?;
             return Ok(AdminContext {
                 tenant_id: ctx.tenant_id,
                 dev_mode: true,

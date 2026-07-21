@@ -237,7 +237,10 @@ pub fn evaluate(
 
 /// `true` when the dialled digits of `to_ref` (scheme + `@host` stripped, visual
 /// separators removed) exactly match a recognised emergency number.
-fn is_emergency(to_ref: &str) -> bool {
+///
+/// Exposed to the router so it can mirror the emergency **cap bypass** when reserving a
+/// concurrency slot (an emergency call must never be denied by the velocity guardrail).
+pub(crate) fn is_emergency(to_ref: &str) -> bool {
     // Unwrap a name-addr ("Display" <sip:user@host>) to its addr-spec.
     let addr = match (to_ref.find('<'), to_ref.find('>')) {
         (Some(open), Some(close)) if close > open => to_ref[open + 1..close].trim(),

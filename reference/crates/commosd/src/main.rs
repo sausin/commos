@@ -16,6 +16,7 @@ mod control;
 mod introspect;
 mod media;
 mod metrics;
+mod net;
 mod objectstore;
 mod relay;
 mod sip;
@@ -182,6 +183,11 @@ async fn run(cfg: Config) -> i32 {
     let registrations = control::registrations::RegistrationRegistry::new();
 
     // Bearer-auth config: resolve the JWT secret (if any); dev tokens on by default.
+    //
+    // Secure-by-default with zero operator burden: when no `jwt_secret` is configured we
+    // auto-generate a strong one and persist it under the data dir, so real signed-JWT auth is
+    // always available for remote callers out of the box. The unsigned `tenant:<uuid>` dev
+    // token still works, but only from a trusted (loopback/LAN) peer — see `api::peer`.
     let jwt_secret = match &cfg.jwt_secret {
         Some(secret) => match secret.resolve() {
             Ok(s) => Some(s.into_bytes()),
@@ -190,7 +196,13 @@ async fn run(cfg: Config) -> i32 {
                 return exit::CONFIG;
             }
         },
-        None => None,
+        None => match ensure_jwt_secret(&cfg.data_dir) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("cannot establish a JWT signing secret: {e}");
+                return exit::CONFIG;
+            }
+        },
     };
     let auth = api::auth::AuthConfig { jwt_secret, dev_tokens: cfg.dev_tokens };
     if auth.jwt_secret.is_some() {
@@ -423,7 +435,13 @@ async fn run(cfg: Config) -> i32 {
         let _ = shutdown_tx.send(true);
     };
 
-    let serve = axum::serve(listener, router).with_graceful_shutdown(graceful);
+    // Serve with peer connection info so extractors can classify each request by its source
+    // address (loopback/private = trusted LAN, public = must authenticate). See `api::peer`.
+    let serve = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful);
     if let Err(e) = serve.await {
         tracing::error!("server error: {e}");
         return exit::UNAVAILABLE;
@@ -453,6 +471,58 @@ fn load_sip_tls(cfg: &Config) -> Result<Arc<tokio_rustls::rustls::ServerConfig>,
     let key_pem = key_ref.resolve().map_err(|e| e.to_string())?.into_bytes();
     let config = sip::tls::load_server_config(&cert_pem, &key_pem).map_err(|e| e.to_string())?;
     Ok(Arc::new(config))
+}
+
+/// Establish an HS256 JWT signing secret when the operator has not configured one, so signed
+/// bearer auth works for remote callers with zero setup. The secret is generated once from the
+/// OS CSPRNG and persisted at `{data_dir}/secrets/jwt.key` (0600 on unix) so tokens survive
+/// restarts; subsequent boots reuse it. A configured `jwt_secret` reference always takes
+/// precedence over this and this path is not reached.
+fn ensure_jwt_secret(data_dir: &str) -> Result<Vec<u8>, String> {
+    let dir = format!("{}/secrets", data_dir.trim_end_matches('/'));
+    let path = format!("{dir}/jwt.key");
+
+    // Reuse an existing secret if we already generated one.
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() >= 32 {
+            tracing::info!(path = %path, "bearer auth: using auto-generated JWT secret");
+            return Ok(bytes);
+        }
+        // A too-short/truncated file is unusable; fall through and regenerate.
+        tracing::warn!(path = %path, "existing JWT secret is too short; regenerating");
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {dir}: {e}"))?;
+
+    // 32 bytes (256 bits) from the OS CSPRNG.
+    let mut secret = [0u8; 32];
+    getrandom::getrandom(&mut secret).map_err(|e| format!("CSPRNG: {e}"))?;
+
+    // Write restrictively: the secret must not be world-readable.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("writing {path}: {e}"))?;
+        f.write_all(&secret).map_err(|e| format!("writing {path}: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, secret).map_err(|e| format!("writing {path}: {e}"))?;
+    }
+
+    tracing::warn!(
+        path = %path,
+        "bearer auth: generated a new JWT signing secret (persisted). Mint tenant JWTs with it \
+         for remote API access; the tenant:<uuid> dev token works only from the local network."
+    );
+    Ok(secret.to_vec())
 }
 
 /// Choose the system-of-record binding from config, connecting/opening it.

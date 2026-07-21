@@ -97,6 +97,21 @@ impl Routing {
         }
     }
 
+    /// Atomically reserve one concurrency slot for `tenant` if the tenant is below `cap`. The
+    /// check-and-increment happen under a single lock, so N parallel originations cannot each
+    /// observe the same stale count and all slip past the cap (the velocity-guardrail TOCTOU).
+    /// Returns `true` iff a slot was reserved; a `false` return has NOT incremented the count.
+    fn try_reserve(&self, tenant: Uuid, cap: u32) -> bool {
+        let mut g = self.active.lock().expect("active-calls mutex");
+        let n = g.entry(tenant).or_insert(0);
+        if *n >= cap {
+            false
+        } else {
+            *n += 1;
+            true
+        }
+    }
+
     /// Originate a Call: create it in `INITIATED`, emit `CallStarted`, command media.
     ///
     /// Atomicity: the Call and its `CallStarted` event are written in one [`Tx`]. The media
@@ -137,6 +152,28 @@ impl Routing {
             tracing::info!(obligations = ?pol.obligations, reason = %pol.reason,
                 "call permitted with obligations");
         }
+
+        // Atomically reserve a concurrency slot NOW, before the call is persisted, so parallel
+        // originations cannot each pass the stale-count check above and overshoot the cap. This
+        // is the authoritative velocity guardrail (the `evaluate` cap check above is only a
+        // fast-path). Emergency calls bypass the cap, mirroring `policy::evaluate`. The
+        // reservation is held by an RAII guard that releases the slot on any early-return/error
+        // below, and is kept (left counted) only once the call is successfully originated.
+        let slot = match self.policy.max_concurrent_calls {
+            Some(cap) if !policy::is_emergency(&req.to_ref) => {
+                if !self.try_reserve(tenant, cap) {
+                    return Err(RoutingError::PolicyDenied(format!(
+                        "concurrency cap reached: at or above the limit of {cap}"
+                    )));
+                }
+                SlotReservation::new(self, tenant)
+            }
+            // No cap configured, or an emergency call (cap bypassed): count it unconditionally.
+            _ => {
+                self.active_inc(tenant);
+                SlotReservation::new(self, tenant)
+            }
+        };
 
         let call = Call::originate(tenant, req.direction, &req.from_ref, &req.to_ref);
 
@@ -182,7 +219,8 @@ impl Routing {
         if let crate::media::MediaAck::Rejected { reason, .. } = ack {
             return Err(RoutingError::MediaRejected(reason));
         }
-        self.active_inc(tenant);
+        // The call is live — keep the reserved slot counted (released when the call ends).
+        slot.keep();
 
         // The Call starts INITIATED. Ring and answer arrive asynchronously as media facts
         // and are applied by `apply_fact` (media→control, CMOS-03-ARCH-003) — not computed
@@ -424,6 +462,39 @@ impl Routing {
         self.media
             .dispatch(MediaCommand::Transfer { call_id: call.base.id, to_ref });
         Ok(call)
+    }
+}
+
+/// RAII reservation of one active-call concurrency slot.
+///
+/// A reserved slot is released (the tenant's active count decremented) automatically when this
+/// guard drops — which happens on **every** early-return/error path in `originate` after the
+/// reservation is taken. Once the call is successfully originated, [`keep`](Self::keep)
+/// disarms the guard so the slot stays counted until the call ends (`active_dec` on hangup).
+/// This makes the reserve-then-commit sequence leak-free: a failed origination never strands a
+/// slot that would otherwise wedge the cap for the tenant.
+struct SlotReservation<'a> {
+    routing: &'a Routing,
+    tenant: Uuid,
+    armed: bool,
+}
+
+impl<'a> SlotReservation<'a> {
+    fn new(routing: &'a Routing, tenant: Uuid) -> Self {
+        SlotReservation { routing, tenant, armed: true }
+    }
+
+    /// Keep the reservation: the call is live, so the slot stays counted (released on hangup).
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SlotReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.routing.active_dec(self.tenant);
+        }
     }
 }
 

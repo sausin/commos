@@ -20,6 +20,7 @@ pub mod introspect;
 pub mod messages;
 pub mod objects;
 pub mod onboarding;
+pub mod peer;
 pub mod presence;
 pub mod problem;
 pub mod provision;

@@ -31,6 +31,11 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone, Copy, Debug)]
 pub struct TenantContext {
     pub tenant_id: Uuid,
+    /// The authenticated *subject* (user) when the token carries a `sub` claim that is a
+    /// UUIDv7. `None` for tenant-wide tokens (the dev bearer and service/admin JWTs that omit
+    /// `sub`). Handlers guarding per-user data (e.g. voicemail) require this to match the
+    /// resource owner; tenant-wide tokens are treated as tenant-scoped service credentials.
+    pub subject: Option<Uuid>,
 }
 
 /// Verifier configuration — the shared secret for HS256 JWTs and whether the legacy
@@ -68,7 +73,16 @@ pub trait HasAuthConfig {
 ///
 /// `auth_header` is the raw header value (e.g. `"Bearer eyJ...".`). This is the pure,
 /// side-effect-free core of authentication — see the unit tests below.
-pub fn verify_bearer(auth_header: &str, cfg: &AuthConfig) -> Result<TenantContext, Problem> {
+/// `trusted_peer` is whether the request arrived from a trusted network (loopback/private
+/// LAN — see [`super::peer`]). The unsigned `tenant:<uuid>` dev bearer is a convenience for
+/// local development only and is **rejected from untrusted (public) peers** regardless of the
+/// `dev_tokens` flag, so an internet-exposed daemon can never be authenticated by a bare,
+/// attacker-chosen tenant id. Signed JWTs are accepted from any peer.
+pub fn verify_bearer(
+    auth_header: &str,
+    cfg: &AuthConfig,
+    trusted_peer: bool,
+) -> Result<TenantContext, Problem> {
     let token = auth_header
         .strip_prefix("Bearer ")
         .ok_or_else(|| Problem::unauthorized("expected a Bearer token"))?
@@ -84,16 +98,23 @@ pub fn verify_bearer(auth_header: &str, cfg: &AuthConfig) -> Result<TenantContex
         return verify_jwt(&segments, cfg);
     }
 
-    // Not a JWT — fall back to the development token shape `tenant:<uuidv7>`.
+    // Not a JWT — fall back to the development token shape `tenant:<uuidv7>`. This carries no
+    // proof of anything (the tenant is whatever the caller typed), so it is honoured only
+    // when dev tokens are enabled AND the request came from a trusted peer.
     if !cfg.dev_tokens {
         return Err(Problem::unauthorized("unrecognised token"));
+    }
+    if !trusted_peer {
+        return Err(Problem::unauthorized(
+            "the tenant:<uuid> dev token is not accepted from a public network; present a signed JWT",
+        ));
     }
     let raw = token
         .strip_prefix("tenant:")
         .ok_or_else(|| Problem::unauthorized("unrecognised token"))?;
     let tenant_id = Uuid::parse(raw)
         .map_err(|_| Problem::unauthorized("token tenant is not a valid UUIDv7"))?;
-    Ok(TenantContext { tenant_id })
+    Ok(TenantContext { tenant_id, subject: None })
 }
 
 /// Verify an HS256 JWT given its three base64url segments.
@@ -156,7 +177,15 @@ fn verify_jwt(segments: &[&str], cfg: &AuthConfig) -> Result<TenantContext, Prob
     let tenant_id = Uuid::parse(tenant_raw)
         .map_err(|_| Problem::unauthorized("JWT tenant claim is not a valid UUIDv7"))?;
 
-    Ok(TenantContext { tenant_id })
+    // Optional `sub` (subject / user) claim. When present and a valid UUIDv7 it identifies the
+    // authenticated user, letting handlers enforce per-user ownership (e.g. voicemail). A `sub`
+    // that is absent or not a UUID leaves the token tenant-wide (a service credential).
+    let subject = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse(s).ok());
+
+    Ok(TenantContext { tenant_id, subject })
 }
 
 /// Base64url-decode (no padding, per RFC 7515) a JWT segment.
@@ -178,13 +207,14 @@ where
     type Rejection = Problem;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let trusted = super::peer::is_trusted_peer(parts);
         let header = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Problem::unauthorized("missing Authorization header"))?;
 
-        verify_bearer(header, state.auth_config())
+        verify_bearer(header, state.auth_config(), trusted)
     }
 }
 
@@ -225,20 +255,38 @@ mod tests {
         time::OffsetDateTime::now_utc().unix_timestamp() - 3600
     }
 
+    // Trusted-peer flag for the dev-token convenience path. JWT tests pass `false` to prove
+    // signed tokens are accepted from any peer; dev-token tests pass `true` for the LAN case.
+    const TRUSTED: bool = true;
+    const UNTRUSTED: bool = false;
+
     #[test]
     fn valid_hs256_token_passes() {
         let token = mint(
             &format!(r#"{{"tenant_id":"{TENANT}","exp":{}}}"#, future()),
             SECRET,
         );
-        let ctx = verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).unwrap();
+        // A signed JWT is accepted even from an untrusted (public) peer.
+        let ctx = verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), UNTRUSTED).unwrap();
         assert_eq!(ctx.tenant_id.to_string(), TENANT);
+        assert!(ctx.subject.is_none());
+    }
+
+    #[test]
+    fn sub_claim_populates_subject() {
+        const SUB: &str = "0192aaaa-0000-7000-8000-000000000009";
+        let token = mint(
+            &format!(r#"{{"tenant_id":"{TENANT}","sub":"{SUB}","exp":{}}}"#, future()),
+            SECRET,
+        );
+        let ctx = verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), UNTRUSTED).unwrap();
+        assert_eq!(ctx.subject.map(|s| s.to_string()).as_deref(), Some(SUB));
     }
 
     #[test]
     fn tid_claim_alias_is_accepted() {
         let token = mint(&format!(r#"{{"tid":"{TENANT}","exp":{}}}"#, future()), SECRET);
-        let ctx = verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).unwrap();
+        let ctx = verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), UNTRUSTED).unwrap();
         assert_eq!(ctx.tenant_id.to_string(), TENANT);
     }
 
@@ -253,7 +301,7 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] = if bytes[last] == 'A' { 'B' } else { 'A' };
         let tampered: String = bytes.into_iter().collect();
-        assert!(verify_bearer(&format!("Bearer {tampered}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {tampered}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
@@ -262,7 +310,7 @@ mod tests {
             &format!(r#"{{"tenant_id":"{TENANT}","exp":{}}}"#, future()),
             b"a-different-secret",
         );
-        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
@@ -271,7 +319,7 @@ mod tests {
             &format!(r#"{{"tenant_id":"{TENANT}","exp":{}}}"#, past()),
             SECRET,
         );
-        let err = verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).unwrap_err();
+        let err = verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).unwrap_err();
         assert_eq!(err.status, 401);
     }
 
@@ -285,19 +333,19 @@ mod tests {
             ),
             SECRET,
         );
-        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
     fn missing_exp_fails() {
         let token = mint(&format!(r#"{{"tenant_id":"{TENANT}"}}"#), SECRET);
-        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
     fn missing_tenant_claim_fails() {
         let token = mint(&format!(r#"{{"exp":{}}}"#, future()), SECRET);
-        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
@@ -306,7 +354,7 @@ mod tests {
             &format!(r#"{{"tenant_id":"not-a-uuid","exp":{}}}"#, future()),
             SECRET,
         );
-        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg()).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &jwt_cfg(), TRUSTED).is_err());
     }
 
     #[test]
@@ -319,17 +367,27 @@ mod tests {
             jwt_secret: None,
             dev_tokens: true,
         };
-        assert!(verify_bearer(&format!("Bearer {token}"), &cfg).is_err());
+        assert!(verify_bearer(&format!("Bearer {token}"), &cfg, TRUSTED).is_err());
     }
 
     #[test]
-    fn dev_token_passes_when_dev_enabled() {
+    fn dev_token_passes_from_trusted_peer() {
         let cfg = AuthConfig {
             jwt_secret: None,
             dev_tokens: true,
         };
-        let ctx = verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg).unwrap();
+        let ctx = verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg, TRUSTED).unwrap();
         assert_eq!(ctx.tenant_id.to_string(), TENANT);
+    }
+
+    #[test]
+    fn dev_token_rejected_from_untrusted_peer() {
+        // Even with dev tokens enabled, a public/untrusted peer cannot use the bare dev token.
+        let cfg = AuthConfig {
+            jwt_secret: None,
+            dev_tokens: true,
+        };
+        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg, UNTRUSTED).is_err());
     }
 
     #[test]
@@ -338,18 +396,18 @@ mod tests {
             jwt_secret: Some(SECRET.to_vec()),
             dev_tokens: false,
         };
-        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg).is_err());
+        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg, TRUSTED).is_err());
     }
 
     #[test]
     fn malformed_header_fails() {
         let cfg = jwt_cfg();
         // No "Bearer " prefix.
-        assert!(verify_bearer("Basic abc123", &cfg).is_err());
+        assert!(verify_bearer("Basic abc123", &cfg, TRUSTED).is_err());
         // Prefix but empty token.
-        assert!(verify_bearer("Bearer ", &cfg).is_err());
+        assert!(verify_bearer("Bearer ", &cfg, TRUSTED).is_err());
         // JWT-shaped but garbage segments.
-        assert!(verify_bearer("Bearer a.b.c", &cfg).is_err());
+        assert!(verify_bearer("Bearer a.b.c", &cfg, TRUSTED).is_err());
     }
 
     #[test]
@@ -357,7 +415,9 @@ mod tests {
         let cfg = AuthConfig::default();
         assert!(cfg.dev_tokens);
         assert!(cfg.jwt_secret.is_none());
-        // A dev token still works out of the box.
-        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg).is_ok());
+        // A dev token still works out of the box from a trusted (LAN/loopback) peer...
+        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg, TRUSTED).is_ok());
+        // ...but never from a public peer.
+        assert!(verify_bearer(&format!("Bearer tenant:{TENANT}"), &cfg, UNTRUSTED).is_err());
     }
 }

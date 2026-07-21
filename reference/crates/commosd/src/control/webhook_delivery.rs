@@ -62,6 +62,11 @@ pub enum DeliveryError {
     /// The URL could not be parsed into host / port / path.
     #[error("invalid webhook URL: {0}")]
     InvalidUrl(String),
+    /// The target resolves to a disallowed (internal/loopback/link-local/metadata) address, so
+    /// the delivery is refused before any connection is made (SSRF guard). The message is
+    /// deliberately generic and does not reveal whether an internal host exists.
+    #[error("webhook target is not an allowed destination")]
+    Blocked,
     /// The TCP connection to the endpoint could not be established.
     #[error("failed to connect to webhook endpoint: {0}")]
     Connect(String),
@@ -88,11 +93,29 @@ pub async fn deliver(
     secret: Option<&str>,
     body: &[u8],
 ) -> Result<Delivered, DeliveryError> {
+    // Production always vets the target (public destinations only).
+    deliver_inner(url, secret, body, false).await
+}
+
+/// Delivery core. `allow_local` disables the SSRF egress vet and is set ONLY by in-crate tests
+/// that need to reach a throwaway loopback server; production always calls with `false`.
+async fn deliver_inner(
+    url: &str,
+    secret: Option<&str>,
+    body: &[u8],
+    allow_local: bool,
+) -> Result<Delivered, DeliveryError> {
     let (host, port, path) = parse_target(url)?;
     let started = Instant::now();
 
+    // SSRF guard: resolve the hostname ourselves and vet the concrete IP, then connect to *that*
+    // pinned address. This blocks targets pointing at the local host, the private LAN, or the
+    // cloud metadata service, and closes the DNS-rebinding gap (the vetted IP is the one we
+    // dial, so a name cannot resolve "public" for the check then "internal" for the connect).
+    let addr = resolve_vetted(&host, port, allow_local).await?;
+
     // Connect, bounded by TIMEOUT. `timeout` elapsing → Timeout; a connect error → Connect.
-    let stream = timeout(TIMEOUT, TcpStream::connect((host.as_str(), port)))
+    let stream = timeout(TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| DeliveryError::Timeout)?
         .map_err(|e| DeliveryError::Connect(e.to_string()))?;
@@ -226,6 +249,37 @@ fn parse_status_code(response: &[u8]) -> Result<u16, DeliveryError> {
         _ => Err(DeliveryError::BadResponse(format!(
             "unrecognised status line: {line:?}"
         ))),
+    }
+}
+
+/// Resolve `host:port` to a concrete socket address that is safe to connect to, or fail.
+///
+/// Every resolved candidate is vetted with [`crate::net::is_disallowed_egress`]; the first
+/// allowed (public, routable) address is returned and used for the connection (pinned). If the
+/// name resolves only to disallowed addresses, [`DeliveryError::Blocked`] is returned — a
+/// literal IP literal in the URL takes the same path, so `http://169.254.169.254/...`,
+/// `http://127.0.0.1/...`, and `http://10.0.0.5/...` are all refused.
+async fn resolve_vetted(
+    host: &str,
+    port: u16,
+    allow_local: bool,
+) -> Result<std::net::SocketAddr, DeliveryError> {
+    let candidates = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| DeliveryError::Connect(e.to_string()))?;
+
+    let mut saw_any = false;
+    for addr in candidates {
+        saw_any = true;
+        if allow_local || !crate::net::is_disallowed_egress(&addr.ip()) {
+            return Ok(addr);
+        }
+    }
+    if saw_any {
+        // Resolved, but every address is internal/loopback/metadata → SSRF attempt, refuse.
+        Err(DeliveryError::Blocked)
+    } else {
+        Err(DeliveryError::Connect("name did not resolve".to_string()))
     }
 }
 
@@ -382,11 +436,26 @@ mod tests {
         });
 
         let url = format!("http://{}/", addr);
-        let delivered = deliver(&url, Some(secret), body)
+        // `allow_local` lets this reach the loopback test server; production `deliver` vets it out.
+        let delivered = deliver_inner(&url, Some(secret), body, true)
             .await
             .expect("delivery succeeds against the throwaway server");
         assert_eq!(delivered.status_code, 200);
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deliver_blocks_ssrf_targets() {
+        // Loopback, private, and the cloud metadata address are all refused before any connect —
+        // and as `Blocked`, not a connection error that would leak internal reachability.
+        for url in [
+            "http://127.0.0.1:9/x",
+            "http://10.0.0.1:80/x",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let err = deliver(url, None, b"{}").await.expect_err("must be blocked");
+            assert!(matches!(err, DeliveryError::Blocked), "{url} -> {err:?}");
+        }
     }
 }
