@@ -33,5 +33,17 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 
+# Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,
+# Ceph). Gated behind the `s3` feature so the DEFAULT binary stays pure-Rust and
+# cross-compiles cleanly to every arch (this pulls in a reqwest/rustls HTTP+TLS stack). Uses
+# rustls, never OpenSSL, so an `s3`-enabled build still avoids native-tls.
+object_store = { version = "0.11", default-features = false, features = ["aws"], optional = true }
+
+[features]
+# S3-compatible object storage is ON by default. Opt OUT for the leanest, purest-Rust binary
+# with `cargo build --no-default-features` (local-filesystem object storage only).
+default = ["s3"]
+s3 = ["dep:object_store"]
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

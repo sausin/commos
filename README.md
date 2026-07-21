@@ -112,6 +112,29 @@ The `musl` builds are fully static — no glibc dependency, run on any Linux of 
 architecture out of the box, which is the single-self-contained-binary mandate
 (CMOS-14-DEP-001) at its strongest.
 
+### Object storage (local or S3-compatible)
+
+Blobs (recordings, voicemail, exports, diagnostics) are stored behind a pluggable
+`ObjectStore`. By default they live on the **local filesystem** under `{data_dir}/objects`.
+The default binary is also built with the **`s3`** feature, so pointing `pbx.yaml` at any
+**S3-compatible** service (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi, Ceph) is just
+configuration — credentials come from the environment, never the file (CMOS-14-DEP-083):
+
+```yaml
+# pbx.yaml
+object_storage: "s3://my-bucket"
+s3_endpoint: "https://s3.example.com"   # omit for AWS S3
+s3_region: "us-east-1"
+s3_path_style: true                      # safe default for S3-compatible servers
+```
+```sh
+export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
+```
+
+For the leanest, purest-Rust binary (local storage only, no TLS stack), opt out with
+`cargo build --no-default-features`. The S3 backend uses **rustls** (never OpenSSL/native-tls),
+so an `s3`-enabled build still cross-compiles cleanly to every published architecture.
+
 ## Status
 
 This is **v0.4** — **contract-complete**. The foundational spine (Philosophy, Domain,

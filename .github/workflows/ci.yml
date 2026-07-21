@@ -39,8 +39,10 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Build (release, native)
+      - name: Build (release, native — default features incl. S3)
         run: cargo build --release --locked --bin commosd
+      - name: Build (opt-out — no S3, leanest pure-Rust binary)
+        run: cargo build --locked --no-default-features --bin commosd
 
   cross:
     name: cross-compile ${{ matrix.target }}

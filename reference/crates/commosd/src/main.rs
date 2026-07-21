@@ -157,11 +157,12 @@ async fn run(cfg: Config) -> i32 {
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
     let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
     let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
-    // Object storage: bytes on the local filesystem under {data_dir}/objects (recordings,
-    // voicemail, exports, diagnostics); an S3/MinIO binding drops in behind the same trait.
-    let object_root = format!("{}/objects", cfg.data_dir.trim_end_matches('/'));
-    let blob_store: Arc<dyn objectstore::ObjectStore> =
-        Arc::new(objectstore::LocalObjectStore::new(object_root));
+    // Object storage: local filesystem by default; S3-compatible when configured + built with
+    // the `s3` feature. Recordings, voicemail, exports, and diagnostics all sit on it.
+    let blob_store = match select_object_store(&cfg) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let objects = control::objects::ObjectService::new(blob_store, store.clone(), signal.clone());
     let metrics = metrics::Metrics::new();
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
@@ -397,6 +398,63 @@ async fn select_store(cfg: &Config) -> Result<Arc<dyn store::Store>, i32> {
                 tracing::error!("cannot open SQLite database: {e}");
                 exit::UNAVAILABLE
             })
+    }
+}
+
+/// Choose the object-storage backend from config. Default (no `object_storage`): the local
+/// filesystem under `{data_dir}/objects` — durable with zero external dependency. `s3://<bucket>`
+/// selects S3-compatible storage, which requires a build with `--features s3` and credentials in
+/// the environment (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+fn select_object_store(cfg: &Config) -> Result<Arc<dyn objectstore::ObjectStore>, i32> {
+    match &cfg.object_storage {
+        Some(url) if url.starts_with("s3://") => {
+            #[cfg(feature = "s3")]
+            {
+                let bucket = url.trim_start_matches("s3://").trim_end_matches('/');
+                if bucket.is_empty() {
+                    tracing::error!("object_storage 's3://' requires a bucket name (e.g. s3://my-bucket)");
+                    return Err(exit::CONFIG);
+                }
+                let ak = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+                let sk = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+                if ak.is_empty() || sk.is_empty() {
+                    tracing::error!(
+                        "S3 object storage needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the environment"
+                    );
+                    return Err(exit::CONFIG);
+                }
+                match objectstore::S3ObjectStore::new(
+                    bucket,
+                    cfg.s3_region.clone(),
+                    cfg.s3_endpoint.clone(),
+                    ak,
+                    sk,
+                    cfg.s3_path_style,
+                ) {
+                    Ok(s) => {
+                        tracing::info!(bucket, endpoint = ?cfg.s3_endpoint, "object storage: S3-compatible");
+                        Ok(Arc::new(s))
+                    }
+                    Err(e) => {
+                        tracing::error!("cannot initialise S3 object storage: {e}");
+                        Err(exit::UNAVAILABLE)
+                    }
+                }
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = url;
+                tracing::error!(
+                    "object_storage is set to 's3://' but this binary was built without the `s3` feature — rebuild with `cargo build --features s3`"
+                );
+                Err(exit::CONFIG)
+            }
+        }
+        _ => {
+            let root = format!("{}/objects", cfg.data_dir.trim_end_matches('/'));
+            tracing::info!(path = %root, "object storage: local filesystem");
+            Ok(Arc::new(objectstore::LocalObjectStore::new(root)))
+        }
     }
 }
 

@@ -56,6 +56,23 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
+    /// Object-storage backend. `None` (default) stores blobs on the local filesystem under
+    /// `{data_dir}/objects`. Set to `s3://<bucket>` to use S3-compatible storage (requires a
+    /// build with `--features s3`); credentials come from the environment
+    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), never from this file (CMOS-14-DEP-083).
+    #[serde(default)]
+    pub object_storage: Option<String>,
+    /// S3 endpoint for S3-compatible services (MinIO/R2/B2/Wasabi/Ceph). Omit for AWS S3.
+    #[serde(default)]
+    pub s3_endpoint: Option<String>,
+    /// S3 region. Default `us-east-1` (many S3-compatible servers ignore it).
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+    /// Use path-style addressing (`endpoint/bucket/key`). Default `true` — the safe default for
+    /// most S3-compatible servers; set `false` for AWS virtual-hosted style.
+    #[serde(default = "default_true")]
+    pub s3_path_style: bool,
+
     /// Home country code (digits, no `+`) used to classify a dialled number as national vs
     /// international for the origination policy. Default `"1"`.
     #[serde(default = "default_country_code")]
@@ -157,6 +174,10 @@ impl Default for Config {
             dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
+            object_storage: None,
+            s3_endpoint: None,
+            s3_region: default_s3_region(),
+            s3_path_style: true,
             default_country_code: default_country_code(),
             allow_international: false,
             max_concurrent_calls: None,
@@ -180,6 +201,10 @@ fn default_data_dir() -> String {
 
 fn default_country_code() -> String {
     "1".to_string()
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_sip_listen() -> Option<SocketAddr> {
