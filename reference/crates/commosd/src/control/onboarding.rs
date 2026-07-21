@@ -570,13 +570,17 @@ pub fn mac_hex(s: &str) -> Option<String> {
     (hex.len() == 12).then_some(hex)
 }
 
-/// An explicit operator choice: this phone (by MAC) is *this* extension number. Collected in
-/// the wizard so the operator lines up handsets and numbers directly, rather than trusting the
-/// order phones happened to appear in the ARP table.
+/// An explicit operator choice: this phone (by MAC) is *this* extension number, optionally with
+/// a human display name. Collected in the wizard so the operator lines up handsets and numbers
+/// directly, rather than trusting the order phones happened to appear in the ARP table.
 #[derive(Clone, Debug, Deserialize)]
 pub struct MacBinding {
     pub mac: String,
     pub number: String,
+    /// The name shown on the phone's LCD after provisioning (e.g. `"Front Desk"`, `"Room 101"`).
+    /// Empty/absent → a default of `Ext <number>`.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// Build the people, extensions, routes, and phones for a confirmed onboarding choice. Each
@@ -601,11 +605,20 @@ pub fn build_entities(
         .filter_map(|d| mac_hex(&d.mac).map(|m| (m, d.clone())))
         .collect();
 
-    // Explicit operator bindings win: extension number → normalised MAC. Anything the operator
-    // aligned by hand is honoured exactly; nothing is guessed on top of it.
-    let bound_by_number: std::collections::HashMap<String, String> = bindings
+    // Explicit operator bindings win: extension number → (normalised MAC, display name).
+    // Anything the operator aligned by hand is honoured exactly; nothing is guessed on top of it.
+    let bound_by_number: std::collections::HashMap<String, (String, Option<String>)> = bindings
         .iter()
-        .filter_map(|b| mac_hex(&b.mac).map(|m| (b.number.clone(), m)))
+        .filter_map(|b| {
+            mac_hex(&b.mac).map(|m| {
+                let name = b
+                    .display_name
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                (b.number.clone(), (m, name))
+            })
+        })
         .collect();
 
     // Fallback only when the operator gave no explicit alignment: bind discovered likely-phones
@@ -623,7 +636,14 @@ pub fn build_entities(
 
     for i in 0..device_count {
         let number = (start + i).to_string();
-        let user = User::new(tenant, format!("Extension {number}"));
+
+        // The person behind this extension. When the operator gave a display name it becomes the
+        // User's name (and, via provisioning, the text on the phone's LCD); otherwise a default.
+        let display_name = bound_by_number
+            .get(&number)
+            .and_then(|(_, name)| name.clone())
+            .unwrap_or_else(|| format!("Extension {number}"));
+        let user = User::new(tenant, display_name);
 
         // A real route: dialing this number reaches the SIP endpoint that registers as it.
         let route = Route::new(tenant, format!("sip:{number}@{domain}"));
@@ -632,7 +652,7 @@ pub fn build_entities(
         // Resolve the MAC to bind to this extension: the operator's explicit choice first,
         // else the discovered phone at this position (only when no explicit bindings exist).
         let bound: Option<(String, Option<DiscoveredDevice>)> =
-            if let Some(mac) = bound_by_number.get(&number) {
+            if let Some((mac, _)) = bound_by_number.get(&number) {
                 Some((mac.clone(), by_mac.get(mac).cloned()))
             } else if let Some(phone) = auto_phones.get(i as usize) {
                 mac_hex(&phone.mac).map(|m| (m, Some((*phone).clone())))
@@ -723,6 +743,120 @@ pub fn suggest(
     }
 }
 
+// --- Reboot / re-provision -----------------------------------------------------------------
+
+/// A phone to nudge into re-provisioning, addressed by its LAN IP.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RebootTarget {
+    pub ip: String,
+    /// The extension the phone registers as, if known — used only to address the SIP request.
+    #[serde(default)]
+    pub number: Option<String>,
+}
+
+/// The result of a reboot sweep.
+#[derive(Clone, Debug, Serialize)]
+pub struct RebootOutcome {
+    pub attempted: usize,
+    pub sent: usize,
+    /// `"<ip>: <reason>"` for each target we could not reach.
+    pub failed: Vec<String>,
+    /// The source address the requests egressed from (the chosen interface).
+    pub source_ip: Option<String>,
+}
+
+/// Ask each phone to reboot and re-fetch its config, by sending an unsolicited SIP `NOTIFY`
+/// with `Event: check-sync;reboot=true` — the de-facto standard "resync now" nudge that Yealink,
+/// Grandstream, Polycom, Fanvil and Snom phones honour on the LAN. This is what makes onboarding
+/// feel instant: apply the plan, hit reboot, and the handsets come back registered on their new
+/// extension instead of waiting for the next power-cycle.
+///
+/// Best-effort and connectionless: we fire one datagram per target from `src_ip` (so it egresses
+/// the interface the operator aligned on) to `phone_sip_port` (5060 by convention). A phone that
+/// ignores unsolicited NOTIFYs simply won't reboot — it still provisions on its next boot. We do
+/// not wait for the `200 OK`.
+pub fn reboot_phones(
+    src_ip: Option<Ipv4Addr>,
+    targets: &[RebootTarget],
+    our_sip_port: u16,
+    phone_sip_port: u16,
+) -> RebootOutcome {
+    // Address the requests from the chosen interface when we have it, else the primary IP, so
+    // the Via/Contact carry a routable source and the packet leaves the right NIC.
+    let src = src_ip.or_else(|| match primary_host_ip() {
+        Some(IpAddr::V4(v4)) => Some(v4),
+        _ => None,
+    });
+
+    let mut sent = 0usize;
+    let mut failed = Vec::new();
+
+    // One socket for the whole sweep; bind to the chosen source so egress is deterministic.
+    let bind_addr = match src {
+        Some(ip) => format!("{ip}:0"),
+        None => "0.0.0.0:0".to_string(),
+    };
+    let sock = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            return RebootOutcome {
+                attempted: targets.len(),
+                sent: 0,
+                failed: vec![format!("could not open a socket on {bind_addr}: {e}")],
+                source_ip: src.map(|s| s.to_string()),
+            };
+        }
+    };
+    let src_str = src.map(|s| s.to_string()).unwrap_or_else(|| "commos".to_string());
+
+    for t in targets {
+        let ip = t.ip.trim();
+        if ip.parse::<Ipv4Addr>().is_err() {
+            failed.push(format!("{ip}: not an IPv4 address"));
+            continue;
+        }
+        let to = t.number.as_deref().filter(|n| !n.is_empty()).unwrap_or("phone");
+        let msg = check_sync_notify(&src_str, our_sip_port, ip, phone_sip_port, to);
+        match sock.send_to(msg.as_bytes(), format!("{ip}:{phone_sip_port}")) {
+            Ok(_) => sent += 1,
+            Err(e) => failed.push(format!("{ip}: {e}")),
+        }
+    }
+
+    RebootOutcome {
+        attempted: targets.len(),
+        sent,
+        failed,
+        source_ip: src.map(|s| s.to_string()),
+    }
+}
+
+/// Build a minimal, out-of-dialog SIP `NOTIFY … Event: check-sync;reboot=true` request. Unique
+/// branch/tag/Call-ID come from a UUID so retries don't collide. `\r\n` line endings per RFC 3261.
+fn check_sync_notify(
+    src_ip: &str,
+    src_port: u16,
+    phone_ip: &str,
+    phone_port: u16,
+    to: &str,
+) -> String {
+    let id = Uuid::now_v7().to_string().replace('-', "");
+    let (branch, tag, call_id) = (&id[0..16], &id[8..24], &id);
+    format!(
+        "NOTIFY sip:{to}@{phone_ip}:{phone_port} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {src_ip}:{src_port};branch=z9hG4bK{branch}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:commos@{src_ip}>;tag={tag}\r\n\
+         To: <sip:{to}@{phone_ip}:{phone_port}>\r\n\
+         Call-ID: {call_id}@{src_ip}\r\n\
+         CSeq: 1 NOTIFY\r\n\
+         Contact: <sip:commos@{src_ip}:{src_port}>\r\n\
+         Event: check-sync;reboot=true\r\n\
+         Content-Length: 0\r\n\
+         \r\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,8 +908,12 @@ mod tests {
     fn explicit_bindings_align_mac_to_number() {
         let tenant = Uuid::now_v7();
         let bindings = vec![
-            MacBinding { mac: "00:15:65:AA:BB:CC".into(), number: "101".into() },
-            MacBinding { mac: "0c-38-3e-11-22-33".into(), number: "103".into() },
+            MacBinding {
+                mac: "00:15:65:AA:BB:CC".into(),
+                number: "101".into(),
+                display_name: Some("Front Desk".into()),
+            },
+            MacBinding { mac: "0c-38-3e-11-22-33".into(), number: "103".into(), display_name: None },
         ];
         let built = build_entities(tenant, 5, "100", "commos.local", &bindings);
         // Extension 101 carries the first MAC as its provisioning label.
@@ -787,6 +925,37 @@ mod tests {
         // Two phones were bound to two devices; unbound extensions carry no label.
         assert_eq!(built.devices.len(), 2);
         assert!(built.extensions.iter().filter(|e| e.label.is_some()).count() == 2);
+        // The operator's display name becomes the person's name (→ the phone's LCD); an unnamed
+        // binding falls back to the default.
+        let ext101_dev = built
+            .devices
+            .iter()
+            .find(|d| d.mac.as_deref() == Some("001565aabbcc"))
+            .unwrap();
+        let user = built
+            .users
+            .iter()
+            .find(|u| Some(u.base.id) == ext101_dev.assigned_user_id)
+            .unwrap();
+        assert_eq!(user.display_name, "Front Desk");
+    }
+
+    #[test]
+    fn check_sync_notify_is_well_formed() {
+        let msg = check_sync_notify("192.168.1.10", 5060, "192.168.1.55", 5060, "101");
+        assert!(msg.starts_with("NOTIFY sip:101@192.168.1.55:5060 SIP/2.0\r\n"));
+        assert!(msg.contains("Event: check-sync;reboot=true\r\n"));
+        assert!(msg.contains("Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bK"));
+        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn reboot_rejects_bad_ip_but_still_reports() {
+        let targets = vec![RebootTarget { ip: "not-an-ip".into(), number: None }];
+        let out = reboot_phones(Some(Ipv4Addr::new(127, 0, 0, 1)), &targets, 5060, 5060);
+        assert_eq!(out.attempted, 1);
+        assert_eq!(out.sent, 0);
+        assert_eq!(out.failed.len(), 1);
     }
 
     #[test]

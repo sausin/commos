@@ -13,7 +13,8 @@ use super::admin::AdminContext;
 use super::auth::TenantContext;
 use super::problem::Problem;
 use crate::control::onboarding::{
-    self, Environment, EnvironmentProfile, MacBinding, OnboardingSuggestion,
+    self, Environment, EnvironmentProfile, MacBinding, OnboardingSuggestion, RebootOutcome,
+    RebootTarget,
 };
 use crate::state::AppState;
 use crate::store::Tx;
@@ -93,6 +94,9 @@ pub struct ApplyOutcome {
     pub devices_created: usize,
     pub routes_created: usize,
     pub extensions: Vec<String>,
+    /// Human-readable description of where this was persisted (e.g. the SQLite file path), so the
+    /// operator knows exactly where their configuration now lives.
+    pub storage_location: String,
 }
 
 /// `POST /v1/onboarding/apply` — mint the people, extensions, routes, and phones the operator
@@ -121,6 +125,7 @@ pub async fn apply(
         devices_created: built.devices.len(),
         routes_created: built.routes.len(),
         extensions: built.extensions.iter().map(|e| e.number.clone()).collect(),
+        storage_location: st.storage_location.clone(),
     };
     let extension_numbers: Vec<String> = built.extensions.iter().map(|e| e.number.clone()).collect();
     st.store
@@ -140,6 +145,64 @@ pub async fn apply(
             .await
             .map_err(|e| Problem::internal(e.to_string()))?;
     }
+    Ok(Json(outcome))
+}
+
+/// Body for `POST /v1/onboarding/reboot`.
+#[derive(Deserialize)]
+pub struct RebootBody {
+    /// Interface to send from (so the nudge egresses the LAN the phones are on). Omit for primary.
+    pub interface: Option<String>,
+    /// The phones' SIP port (where they listen). Defaults to 5060.
+    pub phone_sip_port: Option<u16>,
+    /// The phones to nudge, by IP. Omit/empty to sweep every likely phone discovered on the
+    /// selected interface (from the ARP table).
+    #[serde(default)]
+    pub targets: Vec<RebootTarget>,
+}
+
+/// `POST /v1/onboarding/reboot` — ask the phones to reboot and re-fetch their config now, via an
+/// unsolicited SIP `check-sync` NOTIFY. This is the "make them functional" button: after apply,
+/// the handsets come back registered on their new extension without a manual power-cycle.
+/// Privileged: requires an admin. Note it only nudges phones that already know CommOS is their
+/// provisioning server (DHCP option 66, or a prior config) — a never-configured phone still needs
+/// that pointer first.
+pub async fn reboot(
+    State(st): State<AppState>,
+    _admin: AdminContext,
+    Json(body): Json<RebootBody>,
+) -> Result<Json<RebootOutcome>, Problem> {
+    // Resolve the source IP from the chosen interface so the packet leaves the right NIC.
+    let interfaces = onboarding::list_interfaces();
+    let chosen = body
+        .interface
+        .as_deref()
+        .and_then(|name| interfaces.iter().find(|i| i.name == name))
+        .or_else(|| interfaces.iter().find(|i| i.is_primary))
+        .or_else(|| interfaces.first());
+    let src_ip = chosen.and_then(|i| i.ipv4.parse().ok());
+
+    // Targets: the caller's explicit list, else every likely phone discovered on the chosen
+    // interface (fall back to all interfaces when none was resolved).
+    let targets: Vec<RebootTarget> = if !body.targets.is_empty() {
+        body.targets
+    } else {
+        onboarding::discovered_devices()
+            .into_iter()
+            .filter(|d| d.likely_phone)
+            .filter(|d| chosen.map(|c| c.name == d.interface).unwrap_or(true))
+            .map(|d| RebootTarget { ip: d.ip, number: None })
+            .collect()
+    };
+
+    let phone_sip_port = body.phone_sip_port.unwrap_or(5060);
+    let our_sip_port = st.sip_port;
+    // A few small datagrams; do the blocking socket work off the async runtime.
+    let outcome = tokio::task::spawn_blocking(move || {
+        onboarding::reboot_phones(src_ip, &targets, our_sip_port, phone_sip_port)
+    })
+    .await
+    .map_err(|e| Problem::internal(e.to_string()))?;
     Ok(Json(outcome))
 }
 
@@ -212,7 +275,9 @@ let iface=null;
 let useTls=false;
 // Explicit phone↔extension alignment: MAC (as displayed) → extension number. Survives re-render.
 const macNumber={};
-// Manual MAC↔number rows for phones not yet on the wire. Survives re-render.
+// MAC (as displayed) → LCD display name. Survives re-render.
+const macName={};
+// Manual {mac,number,name} rows for phones not yet on the wire. Survives re-render.
 const manualBindings=[];
 async function loadEnvs(){
   const box=document.getElementById('envs');
@@ -286,11 +351,13 @@ async function suggest(){
   // (by MAC) with the number it should own. Likely phones are pre-filled with a sequential
   // extension from the chosen series; every field is editable and blank means "don't bind".
   const dv=el('div','card');dv.appendChild(el('h3',null,'Align phones to extensions'));
-  dv.appendChild(el('p','k','Each phone found on the network, with the extension it will become. Edit any number; clear it to skip. Phones bind by MAC, so they keep their number even if their IP changes.'));
+  dv.appendChild(el('p','k','Each phone found on the network, with the extension it will become and the name to show on its screen. Edit any field; clear the extension to skip. Phones bind by MAC, so they keep their number even if their IP changes.'));
   const base=parseInt(sel.value||s.extension_plan.recommended_series||'100')||100;
   let seq=0; // running offset for pre-filling likely phones
+  // Remember which discovered phones are on the chosen interface, for the reboot sweep.
+  const rebootTargets=[];
   if(s.discovered_devices.length){
-    const t=el('table');const hr=el('tr');['IP','MAC','Vendor','Phone?','Extension #'].forEach(h=>hr.appendChild(el('th',null,h)));t.appendChild(hr);
+    const t=el('table');const hr=el('tr');['IP','MAC','Vendor','Phone?','Extension #','Display name (on LCD)'].forEach(h=>hr.appendChild(el('th',null,h)));t.appendChild(hr);
     s.discovered_devices.forEach(d=>{
       const tr=el('tr');
       tr.appendChild(el('td','mono',d.ip));
@@ -299,11 +366,17 @@ async function suggest(){
       tr.appendChild(el('td',null,d.likely_phone?'yes':''));
       // Pre-fill an extension for likely phones the first time we see them this session.
       if(!(d.mac in macNumber)&&d.likely_phone){macNumber[d.mac]=String(base+(seq++));}
-      const inp=el('input');inp.type='number';inp.min='0';inp.style.width='110px';
+      const inp=el('input');inp.type='number';inp.min='0';inp.style.width='90px';
       inp.value=macNumber[d.mac]||'';inp.placeholder='(skip)';
       inp.oninput=()=>{macNumber[d.mac]=inp.value;};
       const td=el('td');td.appendChild(inp);tr.appendChild(td);
+      // Display name for the LCD.
+      const nin=el('input');nin.type='text';nin.style.width='170px';
+      nin.value=macName[d.mac]||'';nin.placeholder='Ext '+(macNumber[d.mac]||'');
+      nin.oninput=()=>{macName[d.mac]=nin.value;};
+      const ntd=el('td');ntd.appendChild(nin);tr.appendChild(ntd);
       t.appendChild(tr);
+      if(d.likely_phone)rebootTargets.push({ip:d.ip,number:(macNumber[d.mac]||null)});
     });
     dv.appendChild(t);
   }else dv.appendChild(el('p','k','No phones on the wire yet — power them on and re-run, or add them by MAC below. (ARP table.)'));
@@ -313,19 +386,20 @@ async function suggest(){
   const mtbl=el('table');
   const renderManual=()=>{
     mtbl.innerHTML='';
-    const hr=el('tr');['MAC','Extension #',''].forEach(h=>hr.appendChild(el('th',null,h)));mtbl.appendChild(hr);
+    const hr=el('tr');['MAC','Extension #','Display name (on LCD)',''].forEach(h=>hr.appendChild(el('th',null,h)));mtbl.appendChild(hr);
     manualBindings.forEach((b,i)=>{
       const tr=el('tr');
       const mi=el('input');mi.type='text';mi.placeholder='00:15:65:aa:bb:cc';mi.value=b.mac;mi.oninput=()=>{b.mac=mi.value;};
-      const ni=el('input');ni.type='number';ni.min='0';ni.placeholder='101';ni.style.width='110px';ni.value=b.number;ni.oninput=()=>{b.number=ni.value;};
+      const ni=el('input');ni.type='number';ni.min='0';ni.placeholder='101';ni.style.width='90px';ni.value=b.number;ni.oninput=()=>{b.number=ni.value;};
+      const di=el('input');di.type='text';di.placeholder='Room 101';di.style.width='170px';di.value=b.name||'';di.oninput=()=>{b.name=di.value;};
       const rm=el('button',null,'Remove');rm.style.margin='0';rm.style.background='transparent';rm.style.color='var(--warn)';rm.onclick=()=>{manualBindings.splice(i,1);renderManual();};
-      [mi,ni,rm].forEach(x=>{const td=el('td');td.appendChild(x);tr.appendChild(td);});
+      [mi,ni,di,rm].forEach(x=>{const td=el('td');td.appendChild(x);tr.appendChild(td);});
       mtbl.appendChild(tr);
     });
   };
   renderManual();man.appendChild(mtbl);
   const addBtn=el('button',null,'+ Add phone');addBtn.style.background='transparent';addBtn.style.color='var(--acc)';addBtn.style.border='1px solid var(--acc)';
-  addBtn.onclick=()=>{manualBindings.push({mac:'',number:''});renderManual();};
+  addBtn.onclick=()=>{manualBindings.push({mac:'',number:'',name:''});renderManual();};
   man.appendChild(addBtn);dv.appendChild(man);
   out.appendChild(dv);
 
@@ -351,11 +425,15 @@ async function suggest(){
   ap.appendChild(el('p','k','Creates '+document.getElementById('devices').value+' extensions and people, using the selected series. Phones aligned above are bound to their number by MAC so they auto-provision.'));
   const btn=el('button',null,'Create extensions & people →');
   const res=el('p','k');
-  // Collect the operator's phone↔number alignment (discovered + manual), dropping blanks.
+  const saved=el('p','k'); // where the config was persisted (filled in after apply)
+  // Reboot phones — the "make them functional now" nudge (sent after a successful apply).
+  const rb=el('button',null,'Reboot phones now');rb.style.marginLeft='10px';rb.className='hide';
+  const rbRes=el('p','k');
+  // Collect the operator's phone↔number↔name alignment (discovered + manual), dropping blanks.
   const collectBindings=()=>{
     const out=[];
-    Object.keys(macNumber).forEach(mac=>{const n=(macNumber[mac]||'').trim();if(n)out.push({mac,number:n});});
-    manualBindings.forEach(b=>{const m=(b.mac||'').trim(),n=(b.number||'').trim();if(m&&n)out.push({mac:m,number:n});});
+    Object.keys(macNumber).forEach(mac=>{const n=(macNumber[mac]||'').trim();if(n)out.push({mac,number:n,display_name:(macName[mac]||'').trim()||null});});
+    manualBindings.forEach(b=>{const m=(b.mac||'').trim(),n=(b.number||'').trim();if(m&&n)out.push({mac:m,number:n,display_name:(b.name||'').trim()||null});});
     return out;
   };
   const doApply=async()=>{
@@ -375,11 +453,34 @@ async function suggest(){
       }
       const o=await r.json();
       if(!r.ok){res.className='warn';res.textContent='Error: '+(o.detail||r.status);}
-      else{res.className='ok';res.textContent='✓ Created '+o.extensions_created+' extensions ('+o.extensions.slice(0,5).join(', ')+(o.extensions.length>5?'…':'')+'), '+o.users_created+' people, '+o.routes_created+' routes, '+o.devices_created+' phones bound.';}
+      else{
+        res.className='ok';res.textContent='✓ Created '+o.extensions_created+' extensions ('+o.extensions.slice(0,5).join(', ')+(o.extensions.length>5?'…':'')+'), '+o.users_created+' people, '+o.routes_created+' routes, '+o.devices_created+' phones bound.';
+        // Tell the operator exactly where their configuration now lives.
+        if(o.storage_location){saved.className='k';saved.textContent='💾 Saved to '+o.storage_location+'.';}
+        // Offer the reboot nudge once there is something to reboot.
+        rb.className='';
+      }
     }catch(e){res.className='warn';res.textContent='Request failed.';}
     btn.disabled=false;
   };
-  ap.appendChild(btn);ap.appendChild(res);out.appendChild(ap);
+  // Reboot: ask phones on the chosen interface to resync now (best-effort SIP check-sync).
+  rb.onclick=async()=>{
+    rb.disabled=true;rbRes.className='k';rbRes.textContent='Asking phones to reboot…';
+    const body=JSON.stringify({interface:iface||null,targets:rebootTargets.filter(t=>t.ip)});
+    try{
+      let r=await fetch('/v1/onboarding/reboot',{method:'POST',headers:{Authorization:'Bearer '+adminBearer(),'content-type':'application/json'},body});
+      if(r.status===401&&!ADMIN){
+        const pw=prompt('Admin password required to reboot phones:');
+        if(pw&&await adminLogin(pw)){r=await fetch('/v1/onboarding/reboot',{method:'POST',headers:{Authorization:'Bearer '+adminBearer(),'content-type':'application/json'},body});}
+        else{rbRes.className='warn';rbRes.textContent='Admin login required.';rb.disabled=false;return;}
+      }
+      const o=await r.json();
+      if(!r.ok){rbRes.className='warn';rbRes.textContent='Error: '+(o.detail||r.status);}
+      else{rbRes.className=o.sent?'ok':'warn';rbRes.textContent=(o.sent?'✓ ':'')+'Sent reboot to '+o.sent+'/'+o.attempted+' phone(s)'+(o.source_ip?(' from '+o.source_ip):'')+'.'+(o.failed&&o.failed.length?(' Skipped: '+o.failed.join('; ')):'')+(o.attempted===0?' No phones were discovered on this interface — power them on (with DHCP option 66 set) so they can provision.':'');}
+    }catch(e){rbRes.className='warn';rbRes.textContent='Request failed.';}
+    rb.disabled=false;
+  };
+  ap.appendChild(btn);ap.appendChild(rb);ap.appendChild(res);ap.appendChild(saved);ap.appendChild(rbRes);out.appendChild(ap);
 }
 document.getElementById('go').onclick=suggest;
 loadEnvs();
