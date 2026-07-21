@@ -186,6 +186,7 @@ sip_tls_key: { ref_uri: "file:///etc/commos/tls/sip-key.pem" }  # key by referen
 record_calls: true                                # capture call audio as objects
 voicemail_enabled: true                           # record-on-no-answer + MWI
 srtp: true                                        # encrypt RTP (SRTP/SDES) on endpoint + bridge/trunk legs when offered
+trunk_srtp: false                                 # also offer SRTP to a carrier trunk (off: carrier leg stays plaintext)
 object_storage: "s3://my-bucket"                  # local filesystem by default (any S3-compatible service)
 database_url: { ref_uri: "env://DATABASE_URL" }   # embedded SQLite if unset
 ```

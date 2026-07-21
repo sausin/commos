@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 use commos_core::common::{Timestamp, Uuid};
 use commos_core::entities::gateway::{Gateway, GatewayHealth, GatewayKind};
@@ -53,6 +53,14 @@ const IVR_VOICEMAIL_MAX: Duration = Duration::from_secs(120);
 /// How long we wait for a registered callee to answer our outbound INVITE before falling
 /// back to the echo path so the caller's dial still completes.
 const CALLEE_ANSWER_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// RFC 3261 §17.1.1 initial retransmit interval (T1). Requests are re-sent at T1, 2·T1, 4·T1 …
+/// (capped at [`T2`]) until a response arrives, so a lost request on UDP is recovered.
+const T1: Duration = Duration::from_millis(500);
+/// RFC 3261 retransmit interval ceiling (T2).
+const T2: Duration = Duration::from_secs(4);
+/// Overall budget for a reliable non-INVITE transaction (BYE) — a few retransmits, then give up.
+const NON_INVITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The media path backing a dialog: either the single-socket echo (PSTN-style / non-registered
 /// destinations) or a two-leg [`Bridge`](rtp::Bridge) between caller and a registered callee.
@@ -132,6 +140,10 @@ struct Dialog {
     /// For an active IVR dialog, the channel that injects SIP INFO DTMF digits into the running
     /// menu session; `None` for echo/bridge/voicemail dialogs.
     info_tx: Option<tokio::sync::mpsc::UnboundedSender<char>>,
+    /// The SDP body CommOS answered this dialog's INVITE with, so a retransmitted INVITE (our 200
+    /// was lost) or a re-INVITE (media refresh / hold) is re-answered idempotently — replaying the
+    /// same media — instead of creating a duplicate Call.
+    answer_sdp: String,
 }
 
 /// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
@@ -175,6 +187,9 @@ pub struct SipServer {
     /// Encrypt the endpoint media path with SRTP when a caller offers `RTP/SAVP` + SDES
     /// ([`srtp`]/[`sdes`], RFC 3711/4568). Plain-RTP callers are unaffected.
     srtp_enabled: bool,
+    /// Also offer SRTP toward an outbound carrier trunk (default off — carrier SRTP support is
+    /// inconsistent and an `RTP/SAVP` offer a carrier can't answer would fail the call).
+    trunk_srtp: bool,
 }
 
 impl SipServer {
@@ -195,6 +210,7 @@ impl SipServer {
         objects: ObjectService,
         default_cc: impl Into<String>,
         srtp_enabled: bool,
+        trunk_srtp: bool,
     ) -> Self {
         SipServer {
             registrations,
@@ -215,6 +231,7 @@ impl SipServer {
             objects,
             default_cc: default_cc.into(),
             srtp_enabled,
+            trunk_srtp,
         }
     }
 
@@ -421,6 +438,22 @@ impl SipServer {
 
         tracing::info!(method = "INVITE", from = %from_ref, to = %to_ref, %src, "SIP INVITE");
 
+        // In-dialog INVITE: a retransmission (our 200 OK was lost) or a re-INVITE (media refresh /
+        // hold) for a dialog we already answered. Re-answer 200 OK from the stored media — echoing
+        // the incoming INVITE's headers/CSeq — without creating a duplicate Call or re-binding
+        // media. (Full re-negotiation of a hold's media direction is future B2BUA work.)
+        let existing = self
+            .dialogs
+            .lock()
+            .expect("dialogs mutex")
+            .get(&call_id_hdr)
+            .map(|d| (d.call_id, d.answer_sdp.clone()));
+        if let Some((dialog_call_id, answer_sdp)) = existing {
+            tracing::info!(%dialog_call_id, %src, "SIP re-INVITE / retransmit → replaying answer");
+            let ok = self.build_invite_ok(msg, &answer_sdp, dialog_call_id);
+            return resp.send(ok.as_bytes()).await;
+        }
+
         // Digest auth gate: an unauthenticated INVITE is challenged with 401 before any Call is
         // created; the phone re-sends with credentials. (REGISTER auth already limits who is
         // reachable; challenging INVITE too stops direct unauthenticated dialing.)
@@ -532,6 +565,9 @@ impl SipServer {
                 match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
                     Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
+                        // Answer the caller with the codec the callee selected (transparent relay),
+                        // plus our SRTP key when the caller leg is encrypted.
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                         if !call_id_hdr.is_empty() {
                             let callee_call_id = callee_leg.call_id.clone();
                             self.dialogs.lock().expect("dialogs mutex").insert(
@@ -543,6 +579,7 @@ impl SipServer {
                                     capture: capture.clone(),
                                     voicemail: None,
                                     info_tx: None,
+                                    answer_sdp: sdp.clone(),
                                 },
                             );
                             // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
@@ -553,9 +590,6 @@ impl SipServer {
                         } else {
                             bridge.abort();
                         }
-                        // Answer the caller with the codec the callee selected (transparent relay),
-                        // plus our SRTP key when the caller leg is encrypted.
-                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
                             codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE bridged to registered callee");
@@ -592,6 +626,9 @@ impl SipServer {
             if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
                 if let Some((bridge, leg, sel_codec, sel_te, leg_a_crypto)) = self.try_trunk(&gateway, &e164, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
                     let leg_a_port = bridge.leg_a_port;
+                    // Answer the caller with the carrier's selected codec (transparent relay),
+                    // plus our SRTP key when the caller leg is encrypted.
+                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                     if !call_id_hdr.is_empty() {
                         let callee_call_id = leg.call_id.clone();
                         self.dialogs.lock().expect("dialogs mutex").insert(
@@ -603,15 +640,13 @@ impl SipServer {
                                 capture: capture.clone(),
                                 voicemail: None,
                                 info_tx: None,
+                                answer_sdp: sdp.clone(),
                             },
                         );
                         self.bye_aliases.lock().expect("aliases mutex").insert(callee_call_id, call_id_hdr.clone());
                     } else {
                         bridge.abort();
                     }
-                    // Answer the caller with the carrier's selected codec (transparent relay),
-                    // plus our SRTP key when the caller leg is encrypted.
-                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
                     tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE routed outbound via trunk");
                     return resp.send(ok.as_bytes()).await;
@@ -632,32 +667,33 @@ impl SipServer {
                 Some((c, s)) => (Some(c), Some(s)),
                 None => (None, None),
             };
-            let rtp_port = match rtp::bind_echo(Some(vm_capture.clone()), vm_srtp).await {
-                Ok((port, task)) => {
-                    if !call_id_hdr.is_empty() {
-                        self.dialogs.lock().expect("dialogs mutex").insert(
-                            call_id_hdr,
-                            Dialog {
-                                call_id,
-                                media: Media::Echo(task),
-                                callee: None,
-                                capture: Some(vm_capture),
-                                voicemail: Some(vmbox),
-                                info_tx: None,
-                            },
-                        );
-                    } else {
-                        task.abort();
-                    }
-                    port
-                }
+            let (rtp_port, task) = match rtp::bind_echo(Some(vm_capture.clone()), vm_srtp).await {
+                Ok((port, task)) => (port, Some(task)),
                 Err(e) => {
                     tracing::warn!(error = %e, "could not bind RTP for voicemail; answering without media");
-                    0
+                    (0, None)
                 }
             };
             // Answer with G.711 so the captured voicemail is a storable/playable codec.
             let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, vm_crypto.as_ref());
+            if let Some(task) = task {
+                if !call_id_hdr.is_empty() {
+                    self.dialogs.lock().expect("dialogs mutex").insert(
+                        call_id_hdr,
+                        Dialog {
+                            call_id,
+                            media: Media::Echo(task),
+                            callee: None,
+                            capture: Some(vm_capture),
+                            voicemail: Some(vmbox),
+                            info_tx: None,
+                            answer_sdp: sdp.clone(),
+                        },
+                    );
+                } else {
+                    task.abort();
+                }
+            }
             let ok = self.build_invite_ok(msg, &sdp, call_id);
             tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, srtp = vm_crypto.is_some(), "SIP INVITE answered (voicemail)");
             return resp.send(ok.as_bytes()).await;
@@ -670,33 +706,34 @@ impl SipServer {
             Some((c, s)) => (Some(c), Some(s)),
             None => (None, None),
         };
-        let rtp_port = match rtp::bind_echo(capture.clone(), echo_srtp).await {
-            Ok((port, task)) => {
-                if !call_id_hdr.is_empty() {
-                    self.dialogs.lock().expect("dialogs mutex").insert(
-                        call_id_hdr,
-                        Dialog {
-                            call_id,
-                            media: Media::Echo(task),
-                            callee: None,
-                            capture: capture.clone(),
-                            voicemail: None,
-                            info_tx: None,
-                        },
-                    );
-                } else {
-                    task.abort();
-                }
-                port
-            }
+        let (rtp_port, task) = match rtp::bind_echo(capture.clone(), echo_srtp).await {
+            Ok((port, task)) => (port, Some(task)),
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind RTP; answering without media");
-                0
+                (0, None)
             }
         };
 
         // Answer with the caller's preferred codec — the echo path reflects it byte-for-byte.
         let sdp = self.build_sdp(rtp_port, &reflect, te_pt, echo_crypto.as_ref());
+        if let Some(task) = task {
+            if !call_id_hdr.is_empty() {
+                self.dialogs.lock().expect("dialogs mutex").insert(
+                    call_id_hdr,
+                    Dialog {
+                        call_id,
+                        media: Media::Echo(task),
+                        callee: None,
+                        capture: capture.clone(),
+                        voicemail: None,
+                        info_tx: None,
+                        answer_sdp: sdp.clone(),
+                    },
+                );
+            } else {
+                task.abort();
+            }
+        }
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, rtp_port, codec = %reflect.name, srtp = echo_crypto.is_some(), "SIP INVITE answered (RTP echo)");
         resp.send(ok.as_bytes()).await
@@ -852,6 +889,8 @@ impl SipServer {
             stop_rx,
         ));
 
+        let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         if !call_id_hdr.is_empty() {
             self.dialogs.lock().expect("dialogs mutex").insert(
                 call_id_hdr.to_string(),
@@ -862,14 +901,13 @@ impl SipServer {
                     capture: None,
                     voicemail: None,
                     info_tx: Some(info_tx),
+                    answer_sdp: sdp.clone(),
                 },
             );
         } else {
             let _ = stop_tx.send(true); // no dialog key to track it → stop the session
         }
 
-        let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
-        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, %ivr_id, rtp_port, codec = %g711.sdp_name(), "SIP INVITE answered (IVR menu)");
         resp.send(ok.as_bytes()).await
@@ -948,28 +986,11 @@ impl SipServer {
         call_id: Uuid,
         call_id_hdr: &str,
     ) -> std::io::Result<()> {
-        let rtp_port = match rtp::bind_echo(None, None).await {
-            Ok((port, task)) => {
-                if !call_id_hdr.is_empty() {
-                    self.dialogs.lock().expect("dialogs mutex").insert(
-                        call_id_hdr.to_string(),
-                        Dialog {
-                            call_id,
-                            media: Media::Echo(task),
-                            callee: None,
-                            capture: None,
-                            voicemail: None,
-                            info_tx: None,
-                        },
-                    );
-                } else {
-                    task.abort();
-                }
-                port
-            }
+        let (rtp_port, task) = match rtp::bind_echo(None, None).await {
+            Ok((port, task)) => (port, Some(task)),
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind RTP; answering without media");
-                0
+                (0, None)
             }
         };
         // Reflect the caller's preferred codec (the echo path relays bytes verbatim).
@@ -977,6 +998,24 @@ impl SipServer {
         let audio = offer.preferred_audio().unwrap_or_else(default_codec);
         let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
         let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
+        if let Some(task) = task {
+            if !call_id_hdr.is_empty() {
+                self.dialogs.lock().expect("dialogs mutex").insert(
+                    call_id_hdr.to_string(),
+                    Dialog {
+                        call_id,
+                        media: Media::Echo(task),
+                        callee: None,
+                        capture: None,
+                        voicemail: None,
+                        info_tx: None,
+                        answer_sdp: sdp.clone(),
+                    },
+                );
+            } else {
+                task.abort();
+            }
+        }
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         resp.send(ok.as_bytes()).await
     }
@@ -1060,32 +1099,10 @@ impl SipServer {
             Some(("application/sdp", &sdp)),
         );
 
-        if let Err(e) = sock.send_to(invite.as_bytes(), addr).await {
-            tracing::warn!(error = %e, %addr, "sending outbound INVITE failed");
-            return None;
-        }
-
-        // Wait for the callee's answer, ignoring provisional 1xx, until the timeout.
-        let mut buf = vec![0u8; MAX_DATAGRAM];
-        let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
-            loop {
-                let (n, _from) = sock.recv_from(&mut buf).await.ok()?;
-                let resp = match message::parse(&buf[..n]) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                match resp.status() {
-                    Some(s) if (100..200).contains(&s) => continue, // provisional; keep waiting
-                    Some(s) if (200..300).contains(&s) => return Some(resp),
-                    Some(_) => return None, // final non-2xx: callee rejected/failed
-                    None => continue,       // stray request, not our response
-                }
-            }
-        })
-        .await;
-
-        let resp = match answer {
-            Ok(Some(r)) => r,
+        // Send the INVITE and wait for the callee's final answer, retransmitting until it responds
+        // (RFC 3261 client transaction); a non-2xx (or no answer) falls back to voicemail/echo.
+        let resp = match send_invite_await_final(&sock, invite.as_bytes(), addr, CALLEE_ANSWER_TIMEOUT).await {
+            Some(r) if (200..300).contains(&r.status().unwrap_or(0)) => r,
             _ => return None,
         };
 
@@ -1179,8 +1196,9 @@ impl SipServer {
         };
         let pending = rtp::bind_bridge_sockets().await.ok()?;
 
-        // Leg A (caller) SRTP, and — when the caller leg is encrypted — an SRTP offer to the
-        // carrier on leg B, so the trunk leg is encrypted too where the carrier supports it.
+        // Leg A (caller) SRTP. The carrier (leg B) is offered SRTP only when `trunk_srtp` is on:
+        // a carrier that can't answer RTP/SAVP would reject the call, so by default the trunk leg
+        // stays plaintext (the caller's access leg is still encrypted) and the call always connects.
         let (leg_a_crypto, srtp_a) = match caller_crypto {
             Some(c) => {
                 let (attr, session) = srtp_answer(c);
@@ -1188,7 +1206,7 @@ impl SipServer {
             }
             None => (None, None),
         };
-        let legb_offer = leg_a_crypto.as_ref().map(|_| srtp::random_key_salt());
+        let legb_offer = (self.trunk_srtp && leg_a_crypto.is_some()).then(srtp::random_key_salt);
         let legb_crypto = legb_offer.map(|ks| sdes::CryptoAttr { tag: 1, key_salt: ks });
 
         let sock = match UdpSocket::bind("0.0.0.0:0").await {
@@ -1211,8 +1229,8 @@ impl SipServer {
         let sdp = reoffer_sdp(self.media_ip, pending.leg_b_port, offer, legb_crypto.as_ref());
         let creds = self.trunk_credentials(gateway.carrier_id).await;
 
-        // Send the INVITE, retrying once with digest auth if the carrier challenges.
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        // Send the INVITE (retransmitting until the carrier responds), retrying once with digest
+        // auth if it challenges.
         let mut auth: Option<(&str, String)> = None;
         let mut resp = None;
         for cseq in 1u32..=2 {
@@ -1227,28 +1245,11 @@ impl SipServer {
                 headers.push((name, value.clone()));
             }
             let invite = message::request("INVITE", &request_uri, &headers, Some(("application/sdp", &sdp)));
-            if sock.send_to(invite.as_bytes(), addr).await.is_err() {
-                return None;
-            }
-            let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
-                loop {
-                    let (n, _from) = sock.recv_from(&mut buf).await.ok()?;
-                    let m = match message::parse(&buf[..n]) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    match m.status() {
-                        Some(s) if (100..200).contains(&s) => continue,
-                        Some(s) => return Some((s, m)),
-                        None => continue,
-                    }
-                }
-            })
-            .await;
-            let (status, msg) = match answer {
-                Ok(Some(v)) => v,
-                _ => return None,
+            let msg = match send_invite_await_final(&sock, invite.as_bytes(), addr, CALLEE_ANSWER_TIMEOUT).await {
+                Some(m) => m,
+                None => return None,
             };
+            let status = msg.status().unwrap_or(0);
             if (200..300).contains(&status) {
                 resp = Some(msg);
                 break;
@@ -1323,12 +1324,12 @@ impl SipServer {
         Some((bridge, leg, sel_codec, sel_te, leg_a_crypto))
     }
 
-    /// Best-effort mid-dialog BYE toward the callee leg of a bridged call, sent
-    /// fire-and-forget over a throwaway socket.
+    /// Mid-dialog BYE toward the callee leg of a bridged call, sent as a reliable non-INVITE
+    /// transaction: retransmitted until the callee confirms with a final response (or the
+    /// transaction times out), so a lost BYE still tears the callee leg down.
     ///
-    /// TODO(B2BUA): this reconstructs the BYE from captured identifiers only. Full RFC 3261
-    /// mid-dialog correctness — route sets, contact refresh, a real client transaction and
-    /// retransmission, waiting for the 200 — is not implemented; we send once and move on.
+    /// TODO(B2BUA): this reconstructs the BYE from captured identifiers only; full RFC 3261
+    /// mid-dialog correctness (route sets, contact refresh) is still out of scope.
     async fn send_bye_to_callee(&self, callee: &CalleeLeg) {
         let bye = message::request(
             "BYE",
@@ -1341,15 +1342,10 @@ impl SipServer {
             ],
             None,
         );
-        match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(sock) => {
-                if let Err(e) = sock.send_to(bye.as_bytes(), callee.addr).await {
-                    tracing::debug!(error = %e, addr = %callee.addr, "sending BYE to callee failed");
-                } else {
-                    tracing::info!(addr = %callee.addr, "sent BYE to callee leg");
-                }
-            }
-            Err(e) => tracing::debug!(error = %e, "could not bind socket for callee BYE"),
+        if send_request_reliable(bye.as_bytes(), callee.addr).await {
+            tracing::info!(addr = %callee.addr, "callee leg BYE confirmed");
+        } else {
+            tracing::debug!(addr = %callee.addr, "callee leg BYE unconfirmed (no final response)");
         }
     }
 
@@ -1909,6 +1905,79 @@ async fn send_mwi_notify(
     }
 }
 
+/// Send an INVITE on `sock` to `dst` and return its **final** response, retransmitting per RFC
+/// 3261 §17.1.1 (a client INVITE transaction over UDP): re-send at T1, 2·T1 … until the first
+/// response arrives, then stop retransmitting and wait for the final one (skipping provisional
+/// 1xx) up to `overall`. Returns `None` if nothing final arrives in time — so a lost INVITE is
+/// retried rather than silently failing the call setup.
+async fn send_invite_await_final(
+    sock: &UdpSocket,
+    invite: &[u8],
+    dst: SocketAddr,
+    overall: Duration,
+) -> Option<SipMessage> {
+    if sock.send_to(invite, dst).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::sleep(overall);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    let mut retransmit = true; // stops once any response (even 1xx) is seen
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return None,
+            _ = retx, if retransmit => {
+                let _ = sock.send_to(invite, dst).await; // retransmit until first response
+                interval = (interval * 2).min(T2);
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = r else { return None };
+                let Ok(m) = message::parse(&buf[..n]) else { continue };
+                match m.status() {
+                    Some(s) if (100..200).contains(&s) => retransmit = false, // provisional: keep waiting
+                    Some(_) => return Some(m),                                 // final response
+                    None => continue,                                          // stray request
+                }
+            }
+        }
+    }
+}
+
+/// Send a non-INVITE request (a mid-dialog BYE) reliably on a throwaway socket, retransmitting per
+/// RFC 3261 §17.1.2 until a final response arrives or [`NON_INVITE_TIMEOUT`] elapses. Returns
+/// whether the peer confirmed — so a lost BYE is retried and the callee leg is actually torn down.
+async fn send_request_reliable(request: &[u8], dst: SocketAddr) -> bool {
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
+        return false;
+    };
+    if sock.send_to(request, dst).await.is_err() {
+        return false;
+    }
+    let deadline = tokio::time::sleep(NON_INVITE_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return false,
+            _ = retx => {
+                let _ = sock.send_to(request, dst).await;
+                interval = (interval * 2).min(T2);
+            }
+            r = sock.recv_from(&mut buf) => {
+                if let Ok((n, _)) = r {
+                    if message::parse(&buf[..n]).ok().and_then(|m| m.status()).is_some_and(|s| s >= 200) {
+                        return true; // any final response ends the transaction
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a contact URI (`sip:200@192.168.1.5:5060`) to the socket address to send requests
 /// to. Parses `host[:port]` (default port 5060), returning a literal IP directly and falling
 /// back to async DNS for hostnames. Best-effort: returns `None` if nothing resolves.
@@ -2063,5 +2132,47 @@ mod tests {
         let body = String::from_utf8_lossy(msg.body());
         assert!(body.contains("Messages-Waiting: no"), "body: {body}");
         assert!(body.contains("Voice-Message: 0/0 (0/0)"), "body: {body}");
+    }
+
+    /// A reliable non-INVITE transaction retransmits a lost request and completes when the peer
+    /// finally answers — the mechanism that makes a mid-dialog BYE actually tear the callee down.
+    #[tokio::test]
+    async fn reliable_request_retransmits_until_final_response() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        // Peer drops the first datagram, then answers the retransmit with a 200.
+        let peer_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let _ = peer.recv_from(&mut buf).await; // first send — "lost"
+            let (_, from) = peer.recv_from(&mut buf).await.unwrap(); // retransmit
+            peer.send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
+        });
+        let bye = b"BYE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n";
+        assert!(
+            send_request_reliable(bye, peer_addr).await,
+            "should retransmit the lost BYE and observe the 200"
+        );
+        peer_task.await.unwrap();
+    }
+
+    /// The outbound INVITE transaction retransmits until the callee responds, then returns the
+    /// final response (skipping provisional 1xx).
+    #[tokio::test]
+    async fn invite_retransmits_then_returns_final() {
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+        let callee_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let _ = callee.recv_from(&mut buf).await; // first INVITE — "lost"
+            let (_, from) = callee.recv_from(&mut buf).await.unwrap(); // retransmit
+            // Provisional first (stops retransmission), then the final 200.
+            callee.send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
+            callee.send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
+        });
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite = b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let resp = send_invite_await_final(&sock, invite, callee_addr, Duration::from_secs(3)).await;
+        assert_eq!(resp.and_then(|m| m.status()), Some(200), "should return the final 200");
+        callee_task.await.unwrap();
     }
 }

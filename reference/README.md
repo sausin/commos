@@ -175,8 +175,14 @@ An INVITE aimed at a **registered** endpoint is bridged B2BUA-style: CommOS plac
 INVITE to the callee, then relays RTP between the two legs (symmetric-RTP latching) so two
 softphones can talk; an INVITE to an external/unregistered number falls back to the echo test.
 Verified: `INVITE → 100 Trying → 200 OK (SDP)`, RTP echoed back, `BYE → 200 OK`, Call `ENDED` + CDR;
-the two-leg bridge relays A↔B in a unit test. Full mid-dialog B2BUA correctness (transactions,
-re-INVITE/hold, transcoding, conferencing) are the next media steps.
+the two-leg bridge relays A↔B in a unit test.
+
+Mid-dialog handling is transaction-aware: the outbound INVITE and the callee-leg BYE are sent as
+**reliable transactions** — retransmitted on SIP timers (T1 back-off) until the peer responds, so a
+lost request on UDP doesn't drop the call or leak the far leg. A **retransmitted INVITE** (a lost
+200) or a **re-INVITE** (media refresh / hold) is answered idempotently from the dialog's stored
+media, so it never spawns a duplicate `Call` — verified end-to-end (three INVITEs → one Call).
+Full re-negotiation of a hold's media direction, transcoding, and conferencing are the next steps.
 
 Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) whenever a phone offers the
 secure `RTP/SAVP` profile with an SDES key (`a=crypto`, RFC 4568): on the endpoint paths CommOS

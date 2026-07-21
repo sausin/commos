@@ -63,11 +63,20 @@ pub struct Config {
     /// Default `true`: worth doing even on a trusted LAN, since it stops a passive sniffer from
     /// capturing call audio. SRTP is only ever *offered* by the phone, so this default never
     /// breaks a plain-RTP caller — a plain `RTP/AVP` INVITE is still answered in the clear. It
-    /// applies to the endpoint media paths CommOS terminates (echo test and voicemail); SRTP for
-    /// two-leg extension bridges and carrier trunks is forthcoming. Because SDES carries the key
-    /// in the SDP, pair this with SIP-over-TLS below to protect the key in transit.
+    /// applies to the endpoint media paths CommOS terminates (echo test and voicemail) and, per
+    /// leg, across the two-leg bridge/trunk relay. Because SDES carries the key in the SDP, pair
+    /// this with SIP-over-TLS below to protect the key in transit.
     #[serde(default = "default_true")]
     pub srtp: bool,
+
+    /// Attempt SRTP toward an **outbound carrier trunk** as well (default `false`). SDP cannot
+    /// downgrade the profile in an answer, so offering `RTP/SAVP` to a carrier that only speaks
+    /// plain RTP makes it reject the call. Carrier SRTP support is inconsistent, so by default the
+    /// carrier (trunk) leg is left **plaintext** — the caller's access leg is still encrypted when
+    /// they offered SRTP, and the outbound call always connects. Set `true` only when the carrier
+    /// is known to support `AES_CM_128_HMAC_SHA1_80` SDES.
+    #[serde(default)]
+    pub trunk_srtp: bool,
 
     /// TLS address the SIP signalling ingress binds for **SIPS** (SIP over TLS, RFC 3261). `null`
     /// (the default) disables it — TLS is opt-in and requires a build with `--features tls`. The
@@ -229,6 +238,7 @@ impl Default for Config {
             voicemail_enabled: true,
             media_ip: default_media_ip(),
             srtp: true,
+            trunk_srtp: false,
             sips_listen: None,
             sip_tls_cert: None,
             sip_tls_key: None,

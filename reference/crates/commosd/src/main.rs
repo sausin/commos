@@ -239,6 +239,7 @@ async fn run(cfg: Config) -> i32 {
             objects.clone(),
             cfg.default_country_code.clone(),
             cfg.srtp,
+            cfg.trunk_srtp,
         ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
