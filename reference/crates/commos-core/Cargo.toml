@@ -3,7 +3,7 @@ name = "commos-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "CommOS core contract types — Rust projections of the frozen JSON-Schema domain & event model."
 
 [dependencies]

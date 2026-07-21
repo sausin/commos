@@ -169,5 +169,8 @@ conformance harness runs 500+ checks (green). See the freeze-status matrix in
 
 ## Licence
 
-The specification is intended to be openly licensed as a vendor-neutral standard.
-Licence selection is tracked in [ADR-0009](spec/019-adrs/README.md).
+This repository is licensed under the **[O'Saasy License](https://osaasy.dev/)** (see
+[`LICENSE`](LICENSE)) — a source-available licence: you may **self-host, use, modify, and
+redistribute** it freely, but you may **not** repackage it and offer it to third parties as a
+competing hosted / managed / SaaS product where the platform's own functionality is the primary
+value. See [ADR-0009](spec/019-adrs/README.md) for the rationale and the spec-vs-standard note.

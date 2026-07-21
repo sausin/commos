@@ -6,7 +6,9 @@ members = ["crates/commos-core", "crates/commosd"]
 version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
-license = "Apache-2.0"
+# Source-available under the O'Saasy License (see /LICENSE): self-host and modify freely, but
+# don't repackage it as a competing hosted/SaaS product. Not an SPDX id, so referenced by file.
+license-file = "../LICENSE"
 repository = "https://github.com/sausin/commos"
 description = "CommOS reference implementation — the single self-contained binary (CMOS-14-DEP-001)."
 

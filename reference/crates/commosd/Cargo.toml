@@ -3,7 +3,7 @@ name = "commosd"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "CommOS single self-contained binary — control plane + media plane in one process (CMOS-14-DEP-001/010)."
 
 [[bin]]
