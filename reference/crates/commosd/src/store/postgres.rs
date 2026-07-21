@@ -826,6 +826,19 @@ impl Store for PgStore {
         Ok(Page { items, next_cursor })
     }
 
+    async fn delete_extension(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM extensions WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+    async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM routes WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn call_for_idempotency_key(
         &self,
         tenant: Uuid,

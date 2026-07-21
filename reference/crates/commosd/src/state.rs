@@ -11,6 +11,7 @@ use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
 use crate::control::messaging::MessagingService;
+use crate::control::provisioning::Provisioning;
 use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
 use crate::control::registrations::RegistrationRegistry;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
     pub queues: QueueService,
+    /// Directory write path — people, phones, extensions, routes and their lifecycle.
+    pub provisioning: Provisioning,
     /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
     pub agents: AgentRegistry,
     /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
@@ -57,6 +60,7 @@ impl AppState {
         messaging: MessagingService,
         realtime: RealtimeService,
         queues: QueueService,
+        provisioning: Provisioning,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
         auth: AuthConfig,
@@ -72,6 +76,7 @@ impl AppState {
             messaging,
             realtime,
             queues,
+            provisioning,
             agents,
             registrations,
             auth,

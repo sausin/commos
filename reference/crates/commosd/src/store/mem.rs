@@ -575,6 +575,25 @@ impl Store for MemStore {
         Ok(page_from(&g.route_order, |k| g.routes.get(k).cloned(), tenant, limit, cursor))
     }
 
+    async fn delete_extension(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.extensions.remove(&key).is_some();
+        if removed {
+            g.extension_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+    async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.routes.remove(&key).is_some();
+        if removed {
+            g.route_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+
     async fn call_for_idempotency_key(
         &self,
         tenant: Uuid,

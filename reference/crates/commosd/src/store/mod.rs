@@ -207,6 +207,13 @@ pub trait Store: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Page<Route>, StoreError>;
 
+    /// Hard-delete a config entity (Extension/Route carry no lifecycle state or audit
+    /// history, so removing one is a plain delete — unlike Call/CDR, where deletion is a
+    /// state transition, CMOS-00-ENG-012). Returns `true` if a row was removed, `false` if
+    /// the id did not exist for this tenant.
+    async fn delete_extension(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+    async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(
         &self,

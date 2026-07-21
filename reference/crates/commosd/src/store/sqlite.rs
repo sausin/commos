@@ -167,6 +167,18 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Tenant-scoped hard delete of a config row. Returns whether a row was removed.
+    async fn delete_row(&self, table: &str, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let sql = format!("DELETE FROM {table} WHERE tenant_id = ?1 AND id = ?2");
+        let res = sqlx::query(&sql)
+            .bind(tenant.to_string())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn get_one<T: serde::de::DeserializeOwned>(
         &self,
         table: &str,
@@ -442,6 +454,13 @@ impl Store for SqliteStore {
     }
     async fn list_routes(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Route>, StoreError> {
         self.list("routes", tenant, limit, cursor).await
+    }
+
+    async fn delete_extension(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("extensions", tenant, id).await
+    }
+    async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("routes", tenant, id).await
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

@@ -75,15 +75,37 @@ pub fn router(state: AppState) -> Router {
         .route("/onboarding/apply", post(onboarding::apply))
         // Config-as-code (pbx.yaml) export/import — CMOS-14-DEP-080/082.
         .route("/config", get(config::export_config).post(config::import_config))
-        // Provisioning directory — people, extensions, phones (read).
-        .route("/users", get(directory::list_users))
-        .route("/users/:id", get(directory::get_user))
-        .route("/extensions", get(directory::list_extensions))
-        .route("/extensions/:id", get(directory::get_extension))
-        .route("/devices", get(directory::list_devices))
-        .route("/devices/:id", get(directory::get_device))
-        .route("/routes", get(directory::list_routes))
-        .route("/routes/:id", get(directory::get_route));
+        // Provisioning directory — people, phones, extensions, routes. Reads are
+        // tenant-scoped; writes (create/patch/lifecycle/delete) require an admin.
+        .route("/users", get(directory::list_users).post(directory::create_user))
+        .route(
+            "/users/:id",
+            get(directory::get_user).patch(directory::patch_user).delete(directory::delete_user),
+        )
+        .route("/users/:id/activate", post(directory::activate_user))
+        .route("/users/:id/deactivate", post(directory::deactivate_user))
+        .route("/users/:id/suspend", post(directory::suspend_user))
+        .route("/extensions", get(directory::list_extensions).post(directory::create_extension))
+        .route(
+            "/extensions/:id",
+            get(directory::get_extension)
+                .patch(directory::patch_extension)
+                .delete(directory::delete_extension),
+        )
+        .route("/devices", get(directory::list_devices).post(directory::create_device))
+        .route(
+            "/devices/:id",
+            get(directory::get_device).patch(directory::patch_device).delete(directory::delete_device),
+        )
+        .route("/devices/:id/approve", post(directory::approve_device))
+        .route("/devices/:id/reject", post(directory::reject_device))
+        .route("/devices/:id/retire", post(directory::retire_device))
+        .route("/devices/:id/replace", post(directory::replace_device))
+        .route("/routes", get(directory::list_routes).post(directory::create_route))
+        .route(
+            "/routes/:id",
+            get(directory::get_route).patch(directory::patch_route).delete(directory::delete_route),
+        );
 
     Router::new()
         .nest("/v1", v1)

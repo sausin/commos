@@ -8,6 +8,7 @@ pub mod configexport;
 pub mod dialplan;
 pub mod messaging;
 pub mod onboarding;
+pub mod provisioning;
 pub mod queue;
 pub mod rating;
 pub mod realtime;

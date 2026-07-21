@@ -140,6 +140,7 @@ async fn run(cfg: Config) -> i32 {
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
+    let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
 
@@ -220,6 +221,7 @@ async fn run(cfg: Config) -> i32 {
         messaging,
         realtime,
         queues,
+        provisioning,
         agents,
         registrations,
         auth,
