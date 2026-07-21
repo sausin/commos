@@ -93,7 +93,10 @@ One **"Create it"** button then applies the choice: `POST /v1/onboarding/apply` 
 and extensions in a single transaction (and binds any discovered phones so they auto-provision).
 The created directory is browsable at `/v1/{users,extensions,devices}`, exportable as a
 Git-reviewable `pbx.yaml` (`GET /v1/config`), and re-importable (`POST /v1/config`). A phone then
-fetches its own config from **`GET /provision/{mac}.cfg`** (the DHCP-option-66 target) and registers.
+fetches its own config from the **`/provision/`** endpoint (the DHCP-option-66 target) and registers.
+Phones name their own file, so the endpoint accepts every shape they ask for — `<mac>.cfg`, bare
+`<mac>`, and Grandstream's `cfg<mac>` / `cfg<mac>.xml` — replying with the vendor-native format
+(plain-text P-values or `<gs_provision>` XML for Grandstream, `account.1.*` for Yealink).
 
 The philosophy: **good defaults everywhere; the operator confirms rather than fills in forms.**
 
@@ -137,7 +140,7 @@ ephemeral in-process store (tests), set `database_url` to `memory://`.
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
 - `GET /dashboard` — live operations dashboard; `GET /onboarding` — setup wizard (both unauthenticated, self-contained HTML).
 - `GET /v1/onboarding/environments`, `GET /v1/onboarding/suggest`, `POST /v1/onboarding/apply` — the wizard's detect-and-apply API.
-- `GET|POST /v1/config` — export/import the `pbx.yaml`; `GET /provision/{mac}.cfg` — phone auto-provisioning (unauthenticated).
+- `GET|POST /v1/config` — export/import the `pbx.yaml`; `GET /provision/:file` — phone auto-provisioning (unauthenticated; accepts `<mac>.cfg`, `cfg<mac>`, `cfg<mac>.xml`).
 - `GET /v1/{users,extensions,devices}[/{id}]` — the provisioning directory.
 - **Voice workload** — `GET|POST /v1/calls`, `GET|PATCH /v1/calls/{id}` (`PATCH` is an
   RFC 7386 merge-patch with `If-Match` optimistic concurrency), and actions

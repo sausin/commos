@@ -481,9 +481,11 @@ pub struct ProvisioningGuide {
     pub tls: bool,
     /// Plain-language guidance about the TLS choice — the "should I turn SSL on?" answer.
     pub tls_advice: String,
-    /// DHCP option 66 value (provisioning/config server).
+    /// DHCP option 66 value — the config-server path, with a trailing slash so phones append
+    /// their own filename cleanly.
     pub dhcp_option_66: String,
-    /// DHCP option 67 value (per-device bootfile name pattern).
+    /// DHCP option 67 value. Empty by design: phones derive their own config filename and
+    /// dnsmasq cannot template a per-MAC bootfile here, so option 67 is not used.
     pub dhcp_option_67: String,
     /// Ready-to-paste ISC `dhcpd`/`dnsmasq` lines.
     pub dhcp_dnsmasq: Vec<String>,
@@ -532,12 +534,22 @@ pub fn provisioning_guide(
         provisioning_url: provisioning_url.clone(),
         tls,
         tls_advice,
-        dhcp_option_66: provisioning_url.clone(),
-        dhcp_option_67: "{mac}.cfg".to_string(),
+        // Option 66 is the config-server *path*; note the trailing slash — Grandstream (and
+        // others) append their own filename to it, so without it the phone builds a malformed
+        // URL like `…/provisioncfg<mac>.xml` that never resolves.
+        dhcp_option_66: format!("{provisioning_url}/"),
+        // Deliberately empty: phones name their own config file (Grandstream `cfg<mac>.xml`,
+        // Yealink/others `<mac>.cfg`), and dnsmasq cannot expand a `{mac}` macro into option 67 —
+        // it would send the literal text `{mac}.cfg`. So option 67 is not used; CommOS serves
+        // whatever filename the phone asks for.
+        dhcp_option_67: String::new(),
         dhcp_dnsmasq: vec![
-            format!("# dnsmasq: point phones at CommOS for auto-provisioning"),
-            format!("dhcp-option=66,\"{provisioning_url}\""),
-            format!("dhcp-option=67,\"{{mac}}.cfg\""),
+            format!("# dnsmasq: point phones at CommOS for auto-provisioning."),
+            format!("# Option 66 is the config-server path (keep the trailing slash). Each phone"),
+            format!("# appends its OWN filename — Grandstream cfg<mac>.xml, others <mac>.cfg — and"),
+            format!("# CommOS serves every one of those, so no per-MAC bootfile (option 67) is"),
+            format!("# needed; dnsmasq can't expand a {{mac}} macro there anyway."),
+            format!("dhcp-option=66,\"{provisioning_url}/\""),
         ],
         dns_bind_zone: vec![
             format!("; CommOS records for {domain}"),
@@ -545,9 +557,11 @@ pub fn provisioning_guide(
             srv_record,
         ],
         note: format!(
-            "Set DHCP option 66 to the provisioning URL and add the DNS records above. Phones \
-             that support DHCP option 66 will fetch their config from CommOS on next boot; \
-             others can be pointed at {provisioning_url} manually."
+            "Set DHCP option 66 to the provisioning path (with the trailing slash) and add the \
+             DNS records above. Do NOT set option 67 — phones name their own config file \
+             (Grandstream requests cfg<mac>.xml / cfg<mac>, others <mac>.cfg) and CommOS serves \
+             each. Phones fetch their config from CommOS on next boot; others can be pointed at \
+             {provisioning_url}/ manually."
         ),
     }
 }
@@ -927,7 +941,11 @@ mod tests {
     #[test]
     fn provisioning_guide_is_paste_ready() {
         let g = provisioning_guide("commos.local", "192.168.1.10", 8080, 5060, false);
-        assert_eq!(g.dhcp_option_66, "http://192.168.1.10:8080/provision");
+        // Option 66 is the config-server path with a trailing slash (phones append their filename).
+        assert_eq!(g.dhcp_option_66, "http://192.168.1.10:8080/provision/");
+        // Option 67 is deliberately unused — phones name their own config file.
+        assert!(g.dhcp_option_67.is_empty());
+        assert!(!g.dhcp_dnsmasq.iter().any(|l| l.contains("option=67") || l.contains("dhcp-option=67")));
         assert!(g.dns_bind_zone.iter().any(|l| l.contains("_sip._udp.commos.local")));
         assert!(g.dns_bind_zone.iter().any(|l| l.contains("A    192.168.1.10")));
     }
