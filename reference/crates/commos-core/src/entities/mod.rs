@@ -5,10 +5,12 @@
 //! faithful projection, its enums and invariants enforced at the type boundary.
 
 pub mod call;
+pub mod call_flow;
 pub mod cdr;
 pub mod channel;
 pub mod device;
 pub mod extension;
+pub mod ivr;
 pub mod message;
 pub mod object;
 pub mod participant;

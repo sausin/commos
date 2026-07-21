@@ -10,6 +10,8 @@ use crate::api::admin::{AdminAuth, HasAdminAuth};
 use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
+use crate::control::callflow::CallFlowService;
+use crate::control::ivr::IvrService;
 use crate::control::messaging::MessagingService;
 use crate::control::objects::ObjectService;
 use crate::control::provisioning::Provisioning;
@@ -32,6 +34,9 @@ pub struct AppState {
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
     pub queues: QueueService,
+    /// Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
+    pub call_flows: CallFlowService,
+    pub ivrs: IvrService,
     /// Directory write path — people, phones, extensions, routes and their lifecycle.
     pub provisioning: Provisioning,
     /// Outbound webhook subscriptions (register/list/delete).
@@ -75,6 +80,8 @@ impl AppState {
         messaging: MessagingService,
         realtime: RealtimeService,
         queues: QueueService,
+        call_flows: CallFlowService,
+        ivrs: IvrService,
         provisioning: Provisioning,
         webhooks: WebhookService,
         objects: ObjectService,
@@ -96,6 +103,8 @@ impl AppState {
             messaging,
             realtime,
             queues,
+            call_flows,
+            ivrs,
             provisioning,
             webhooks,
             objects,

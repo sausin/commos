@@ -4,8 +4,10 @@
 
 pub mod agents;
 pub mod billing;
+pub mod callflow;
 pub mod configexport;
 pub mod dialplan;
+pub mod ivr;
 pub mod messaging;
 pub mod objects;
 pub mod onboarding;

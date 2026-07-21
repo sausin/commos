@@ -155,6 +155,9 @@ async fn run(cfg: Config) -> i32 {
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
+    // Routing programs (Volume 2/7): versioned CallFlows with publish/rollback, and IVR nodes.
+    let call_flows = control::callflow::CallFlowService::new(store.clone(), signal.clone());
+    let ivrs = control::ivr::IvrService::new(store.clone(), signal.clone());
     let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
     let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
     // Object storage: local filesystem by default; S3-compatible when configured + built with
@@ -287,6 +290,8 @@ async fn run(cfg: Config) -> i32 {
         messaging,
         realtime,
         queues,
+        call_flows,
+        ivrs,
         provisioning,
         webhooks,
         objects,

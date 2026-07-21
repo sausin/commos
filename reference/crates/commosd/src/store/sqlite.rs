@@ -35,6 +35,8 @@ use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
+use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
+use commos_core::entities::ivr::Ivr;
 use commos_core::entities::video_room::VideoRoom;
 use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
@@ -60,6 +62,11 @@ CREATE TABLE IF NOT EXISTS cdrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS cdrs_tenant_id_idx ON cdrs (tenant_id, id);
 CREATE TABLE IF NOT EXISTS queues       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
+CREATE TABLE IF NOT EXISTS call_flows   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS call_flows_tenant_id_idx ON call_flows (tenant_id, id);
+CREATE TABLE IF NOT EXISTS ivrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ivrs_tenant_id_idx ON ivrs (tenant_id, id);
+CREATE TABLE IF NOT EXISTS call_flow_revisions (tenant_id TEXT NOT NULL, call_flow_id TEXT NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant_id, call_flow_id, version));
 CREATE TABLE IF NOT EXISTS users        (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users (tenant_id, id);
 CREATE TABLE IF NOT EXISTS extensions   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
@@ -342,6 +349,36 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(q).map_err(be)?;
             Self::upsert(&mut dbtx, "queues", "Queue", &q.base, &data).await?;
         }
+        for cf in &tx.call_flows {
+            let data = serde_json::to_string(cf).map_err(be)?;
+            Self::upsert(&mut dbtx, "call_flows", "CallFlow", &cf.base, &data).await?;
+        }
+        for iv in &tx.ivrs {
+            let data = serde_json::to_string(iv).map_err(be)?;
+            Self::upsert(&mut dbtx, "ivrs", "IVR", &iv.base, &data).await?;
+        }
+        // Immutable, append-only: a (flow, version) collision must never overwrite history.
+        for r in &tx.call_flow_revisions {
+            let data = serde_json::to_string(r).map_err(be)?;
+            let res = sqlx::query(
+                "INSERT INTO call_flow_revisions (tenant_id, call_flow_id, version, data) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+            )
+            .bind(r.tenant_id.to_string())
+            .bind(r.call_flow_id.to_string())
+            .bind(r.version as i64)
+            .bind(data)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "CallFlowRevision",
+                    id: format!("{}:{}", r.call_flow_id, r.version),
+                    expected: 0,
+                });
+            }
+        }
         for u in &tx.users {
             let data = serde_json::to_string(u).map_err(be)?;
             Self::upsert(&mut dbtx, "users", "User", &u.base, &data).await?;
@@ -458,6 +495,58 @@ impl Store for SqliteStore {
     }
     async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
         self.list("queues", tenant, limit, cursor).await
+    }
+
+    async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError> {
+        self.get_one("call_flows", tenant, id).await
+    }
+    async fn list_call_flows(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<CallFlow>, StoreError> {
+        self.list("call_flows", tenant, limit, cursor).await
+    }
+
+    async fn get_ivr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Ivr>, StoreError> {
+        self.get_one("ivrs", tenant, id).await
+    }
+    async fn list_ivrs(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Ivr>, StoreError> {
+        self.list("ivrs", tenant, limit, cursor).await
+    }
+    async fn delete_ivr(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("ivrs", tenant, id).await
+    }
+
+    async fn get_call_flow_revision(&self, tenant: Uuid, call_flow_id: Uuid, version: u64) -> Result<Option<CallFlowRevision>, StoreError> {
+        let row = sqlx::query(
+            "SELECT data FROM call_flow_revisions WHERE tenant_id = ?1 AND call_flow_id = ?2 AND version = ?3",
+        )
+        .bind(tenant.to_string())
+        .bind(call_flow_id.to_string())
+        .bind(version as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(be)?;
+        match row {
+            Some(r) => {
+                let data: String = r.try_get("data").map_err(be)?;
+                Ok(Some(serde_json::from_str(&data).map_err(be)?))
+            }
+            None => Ok(None),
+        }
+    }
+    async fn list_call_flow_revisions(&self, tenant: Uuid, call_flow_id: Uuid) -> Result<Vec<CallFlowRevision>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT data FROM call_flow_revisions WHERE tenant_id = ?1 AND call_flow_id = ?2 ORDER BY version ASC",
+        )
+        .bind(tenant.to_string())
+        .bind(call_flow_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(be)?;
+        rows.into_iter()
+            .map(|r| {
+                let data: String = r.try_get("data").map_err(be)?;
+                serde_json::from_str(&data).map_err(be)
+            })
+            .collect()
     }
 
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {

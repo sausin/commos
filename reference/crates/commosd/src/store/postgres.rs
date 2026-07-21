@@ -25,6 +25,8 @@ use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
+use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
+use commos_core::entities::ivr::Ivr;
 use commos_core::entities::video_room::VideoRoom;
 use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
@@ -121,6 +123,24 @@ CREATE TABLE IF NOT EXISTS queues (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS call_flows (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS call_flows_tenant_id_idx ON call_flows (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS ivrs (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ivrs_tenant_id_idx ON ivrs (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS call_flow_revisions (
+    tenant_id uuid NOT NULL, call_flow_id uuid NOT NULL, version bigint NOT NULL,
+    data jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, call_flow_id, version)
+);
 
 CREATE TABLE IF NOT EXISTS users (
     id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
@@ -537,6 +557,33 @@ impl Store for PgStore {
         for q in &tx.queues {
             upsert(&mut dbtx, "queues", "Queue", &q.base, &serde_json::to_value(q).map_err(be)?).await?;
         }
+        for cf in &tx.call_flows {
+            upsert(&mut dbtx, "call_flows", "CallFlow", &cf.base, &serde_json::to_value(cf).map_err(be)?).await?;
+        }
+        for iv in &tx.ivrs {
+            upsert(&mut dbtx, "ivrs", "IVR", &iv.base, &serde_json::to_value(iv).map_err(be)?).await?;
+        }
+        // Immutable, append-only: a (flow, version) collision must never overwrite history.
+        for r in &tx.call_flow_revisions {
+            let res = sqlx::query(
+                "INSERT INTO call_flow_revisions (tenant_id, call_flow_id, version, data) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(r.tenant_id.as_uuid())
+            .bind(r.call_flow_id.as_uuid())
+            .bind(r.version as i64)
+            .bind(serde_json::to_value(r).map_err(be)?)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(be)?;
+            if res.rows_affected() == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity: "CallFlowRevision",
+                    id: format!("{}:{}", r.call_flow_id, r.version),
+                    expected: 0,
+                });
+            }
+        }
         for u in &tx.users {
             upsert(&mut dbtx, "users", "User", &u.base, &serde_json::to_value(u).map_err(be)?).await?;
         }
@@ -825,6 +872,53 @@ impl Store for PgStore {
             None
         };
         Ok(Page { items, next_cursor })
+    }
+
+    async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError> {
+        let row = sqlx::query("SELECT data FROM call_flows WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_call_flows(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<CallFlow>, StoreError> {
+        let items = self.list_entities::<CallFlow>("call_flows", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|c| c.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_ivr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Ivr>, StoreError> {
+        let row = sqlx::query("SELECT data FROM ivrs WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_ivrs(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Ivr>, StoreError> {
+        let items = self.list_entities::<Ivr>("ivrs", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|i| i.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_ivr(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM ivrs WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_call_flow_revision(&self, tenant: Uuid, call_flow_id: Uuid, version: u64) -> Result<Option<CallFlowRevision>, StoreError> {
+        let row = sqlx::query(
+            "SELECT data FROM call_flow_revisions WHERE tenant_id = $1 AND call_flow_id = $2 AND version = $3",
+        )
+        .bind(tenant.as_uuid()).bind(call_flow_id.as_uuid()).bind(version as i64)
+        .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_call_flow_revisions(&self, tenant: Uuid, call_flow_id: Uuid) -> Result<Vec<CallFlowRevision>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT data FROM call_flow_revisions WHERE tenant_id = $1 AND call_flow_id = $2 ORDER BY version ASC",
+        )
+        .bind(tenant.as_uuid()).bind(call_flow_id.as_uuid())
+        .fetch_all(&self.pool).await.map_err(be)?;
+        rows.iter().map(entity_from_row).collect()
     }
 
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {

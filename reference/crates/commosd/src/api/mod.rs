@@ -7,10 +7,12 @@
 pub mod admin;
 pub mod agents;
 pub mod auth;
+pub mod call_flows;
 pub mod calls;
 pub mod cdrs;
 pub mod channels;
 pub mod config;
+pub mod ivrs;
 pub mod dashboard;
 pub mod directory;
 pub mod health;
@@ -84,6 +86,18 @@ pub fn router(state: AppState) -> Router {
         .route("/queues", get(queues::list_queues).post(queues::create_queue))
         .route("/queues/:id", get(queues::get_queue))
         .route("/queues/:id/enqueue", post(queues::enqueue_call))
+        // Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
+        // `:action` sub-paths (`/publish`, `/rollback`) mirror the frozen `{id}:publish`.
+        .route("/call-flows", get(call_flows::list_call_flows).post(call_flows::create_call_flow))
+        .route(
+            "/call-flows/:id",
+            get(call_flows::get_call_flow).patch(call_flows::patch_call_flow),
+        )
+        .route("/call-flows/:id/publish", post(call_flows::publish_call_flow))
+        .route("/call-flows/:id/rollback", post(call_flows::rollback_call_flow))
+        .route("/call-flows/:id/revisions", get(call_flows::list_call_flow_revisions))
+        .route("/ivrs", get(ivrs::list_ivrs).post(ivrs::create_ivr))
+        .route("/ivrs/:id", get(ivrs::get_ivr).patch(ivrs::patch_ivr).delete(ivrs::delete_ivr))
         .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
         .route("/agents/:id", get(agents::get_agent))
         // Admin onboarding wizard — auto-detected suggestions + one-click apply.

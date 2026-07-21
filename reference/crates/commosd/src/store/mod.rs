@@ -23,10 +23,12 @@ use axum::async_trait;
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
+use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::ivr::Ivr;
 use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
@@ -57,6 +59,11 @@ pub struct Tx {
     /// Billing (CDR) and contact-centre (Queue) entities.
     pub cdrs: Vec<Cdr>,
     pub queues: Vec<Queue>,
+    /// Routing programs — versioned CallFlows and IVR menu nodes.
+    pub call_flows: Vec<CallFlow>,
+    pub ivrs: Vec<Ivr>,
+    /// Immutable published CallFlow snapshots (append-only history; never updated).
+    pub call_flow_revisions: Vec<CallFlowRevision>,
     /// Provisioning entities — people, extensions, phones, and routes (onboarding).
     pub users: Vec<User>,
     pub extensions: Vec<Extension>,
@@ -185,6 +192,38 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Queue>, StoreError>;
+
+    // Routing programs — CallFlows (versioned) and IVR menu nodes, tenant-scoped.
+    async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError>;
+    async fn list_call_flows(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<CallFlow>, StoreError>;
+
+    async fn get_ivr(&self, tenant: Uuid, id: Uuid) -> Result<Option<Ivr>, StoreError>;
+    async fn list_ivrs(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Ivr>, StoreError>;
+    async fn delete_ivr(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    /// Fetch one immutable published CallFlow revision by `(call_flow_id, version)`.
+    async fn get_call_flow_revision(
+        &self,
+        tenant: Uuid,
+        call_flow_id: Uuid,
+        version: u64,
+    ) -> Result<Option<CallFlowRevision>, StoreError>;
+    /// All revisions of a CallFlow, ascending by version (its append-only publish history).
+    async fn list_call_flow_revisions(
+        &self,
+        tenant: Uuid,
+        call_flow_id: Uuid,
+    ) -> Result<Vec<CallFlowRevision>, StoreError>;
 
     // Provisioning (user/extension/device) reads — tenant-scoped.
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError>;
