@@ -21,7 +21,7 @@ CMOS-00-ENG-012). Status ∈ `{Proposed, Accepted, Superseded, Rejected}`.
 | 0006 | Capability-based authorization, not RBAC | Accepted |
 | 0007 | WebAssembly (Wasmtime-class) for plugins | Accepted |
 | 0008 | Object Storage abstraction, not a filesystem API | Accepted |
-| 0009 | Open, vendor-neutral specification licence | Proposed |
+| 0009 | Repository licence: O'Saasy (source-available) | Accepted |
 | 0010 | Control-plane / media-plane separation behind typed interfaces | Accepted |
 | 0011 | CloudEvents-style envelope with at-least-once + idempotency | Accepted |
 
@@ -136,19 +136,25 @@ is required for the single-binary default.
 **Reopen if.** A backend-specific capability becomes essential and cannot be
 abstracted.
 
-## ADR-0009 — Open, vendor-neutral specification licence
-**Status:** Proposed
-**Problem.** For the spec to become a standard (the stated goal), its licence must
-permit independent, competing implementations and community contribution.
-**Alternatives.** Permissive spec licence (e.g. CC-BY / Apache-2.0 for text +
-schemas); copyleft; proprietary.
-**Decision (proposed).** License the specification and contracts under a permissive,
-vendor-neutral licence so any party may implement it; reference code (if/when added)
-under Apache-2.0. **Final choice pending** — this ADR remains `Proposed` until the
-maintainers ratify the specific licences.
-**Consequences.** Maximises adoption and neutrality; forgoes licence-based control.
-**Reopen if.** Governance requires a different balance (e.g. trademark policy for the
-"CommOS conformant" mark).
+## ADR-0009 — Repository licence: O'Saasy (source-available)
+**Status:** Accepted
+**Problem.** The project is both an open specification (meant to invite independent,
+competing implementations) and a working reference implementation the maintainers may run
+as a service. The licence must let anyone self-host and modify the code, while reserving the
+right to run it as a commercial SaaS for the maintainers.
+**Alternatives.** Permissive (Apache-2.0 / MIT); copyleft (AGPL); other source-available
+licences (BSL, SSPL, Elastic); the [O'Saasy License](https://osaasy.dev/) (MIT grant + a
+clause reserving competing-SaaS rights to the Licensor).
+**Decision.** The repository is licensed under the **O'Saasy License** (see `/LICENSE`),
+Copyright © 2026, Saurabh Singhvi. Self-host / use / modify / redistribute is permitted;
+repackaging it as a competing hosted/SaaS product is not.
+**Consequences.** Preserves self-hosting and community contribution while protecting the
+maintainers' SaaS. Note the trade-off: O'Saasy is *source-available*, not OSI-approved open
+source, so the specification text is not, by this licence alone, a fully vendor-neutral
+standard; a future ADR may dual-licence the **spec + contracts** under a permissive/CC licence
+if standardisation is pursued, keeping the **reference code** under O'Saasy.
+**Reopen if.** Standardisation requires an OSI-open spec licence, or governance adds a
+trademark policy for a "CommOS conformant" mark.
 
 ## ADR-0010 — Control-plane / media-plane separation behind typed interfaces
 **Status:** Accepted
@@ -178,6 +184,33 @@ and tested in Volume 16).
 **Reopen if.** A transport offering practical exactly-once with acceptable cost
 becomes the norm across target bindings.
 
+## ADR-0012 — Embedded SQLite as the default system of record; PostgreSQL for scale
+**Status:** Accepted
+**Problem.** The default single-binary deployment (a small business, an edge box, a
+Raspberry Pi) wants durable storage *without* operating a separate database server, and
+on SD-card hosts must minimise write amplification to survive for years. The v0.4 spine
+named PostgreSQL the sole system of record (CMOS-14-DEP-020), which forces an external
+service even on a one-box install.
+**Alternatives.** In-memory only (not durable); require PostgreSQL always (a service to
+run, patch, and back up — heavy for a single box); embedded SQLite by default with
+PostgreSQL as the scale/HA option.
+**Decision.** The system of record is a SQL store behind one interface (the reference
+`Store` trait). The **default** binding is **embedded SQLite** (WAL journal, `synchronous
+= NORMAL`) — durable with zero external dependency, fulfilling CMOS-14-DEP-021 better
+than an in-memory equivalent. **PostgreSQL** remains the binding for any **multi-node /
+HA** topology (CMOS-14-DEP-011/030), where stateless control-plane nodes share one
+database — which SQLite's single-file model cannot serve. Ephemeral high-churn state
+(registrations, presence) stays in memory, never the durable store, to keep writes low.
+**Consequences.** The single binary is durable *and* dependency-free out of the box;
+SD-card hosts see minimal writes. A single node cannot share its SQLite file across
+processes/nodes (by design — use PostgreSQL there). Amends CMOS-14-DEP-020: PostgreSQL is
+the *scale* system of record, not the only one; the hard-dependency floor for the default
+deployment becomes *none*, strengthening N-3.
+**Reopen if.** A single embedded engine gains safe multi-writer / multi-node semantics,
+or an operational reason makes PostgreSQL-by-default worthwhile again.
+
 ## Change log
+- **0.4.x** — Added ADR-0012 (embedded SQLite default, PostgreSQL for scale), recording
+  the reference implementation's storage tiering.
 - **0.3.0** — Eleven ADRs recording the decisions embodied in the v0.3 spine and
   contracts; ADR-0009 (licence) left `Proposed` pending maintainer ratification.

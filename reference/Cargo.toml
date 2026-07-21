@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/commos-core", "crates/commosd"]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.82"
+# Source-available under the O'Saasy License (see /LICENSE): self-host and modify freely, but
+# don't repackage it as a competing hosted/SaaS product. Not an SPDX id, so referenced by file.
+license-file = "../LICENSE"
+repository = "https://github.com/sausin/commos"
+description = "CommOS reference implementation — the single self-contained binary (CMOS-14-DEP-001)."
+
+# Shared dependency versions so every crate in the workspace pins the same tree.
+# Deliberately pure-Rust (no OpenSSL / native-tls / C codec libs) so the primary
+# artifact cross-compiles cleanly for every published architecture
+# (CMOS-14-DEP-004/060: arm64 + amd64 parity), Raspberry Pi 4 (arm64) first.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+thiserror = "2"
+anyhow = "1"
+# Pure-Rust Postgres driver, runtime queries (no compile-time DB needed). No TLS feature:
+# the reference posture connects to a local/trusted PostgreSQL; TLS is a documented add.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "uuid", "time", "json"] }
+
+[profile.release]
+# Small, self-contained artifact suited to a Raspberry Pi 4 (CMOS-14-DEP / Vol 17 footprint).
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,52 @@
+[package]
+name = "commosd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "CommOS single self-contained binary — control plane + media plane in one process (CMOS-14-DEP-001/010)."
+
+[[bin]]
+name = "commosd"
+path = "src/main.rs"
+
+[dependencies]
+commos-core = { path = "../commos-core" }
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+sqlx.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+# Pure-Rust crypto for HS256 JWT bearer verification (keeps the arm64 cross-build clean —
+# deliberately NOT jsonwebtoken/ring/openssl).
+hmac = "0.12"
+sha2 = "0.10"
+# SIP digest authentication (RFC 3261 §22) mandates MD5 for interop with phones. Pure-Rust
+# RustCrypto, cross-compiles cleanly — used ONLY for the SIP challenge/response, never elsewhere.
+md-5 = "0.10"
+base64 = "0.22"
+
+# Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,
+# Ceph). Gated behind the `s3` feature so the DEFAULT binary stays pure-Rust and
+# cross-compiles cleanly to every arch (this pulls in a reqwest/rustls HTTP+TLS stack). Uses
+# rustls, never OpenSSL, so an `s3`-enabled build still avoids native-tls.
+object_store = { version = "0.11", default-features = false, features = ["aws"], optional = true }
+
+[features]
+# S3-compatible object storage is ON by default. Opt OUT for the leanest, purest-Rust binary
+# with `cargo build --no-default-features` (local-filesystem object storage only).
+default = ["s3"]
+s3 = ["dep:object_store"]
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

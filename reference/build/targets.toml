@@ -1,0 +1,27 @@
+# Architecture registry for the CommOS reference build.
+#
+# "Voice is one workload" on one substrate; likewise every architecture is one target of
+# one build. Rust cross-compiles cleanly across these once the code is right, so adding an
+# architecture is a row here plus a linker line in `.cargo/config.toml` — never a code
+# change (CMOS-14-DEP-042/060: arm64 + amd64 parity, additive scaling).
+#
+# `apt` names are the Debian/Ubuntu cross toolchain + libc dev packages a build host needs.
+
+[[target]]
+id = "rpi4"
+triple = "aarch64-unknown-linux-gnu"
+description = "Raspberry Pi 4 (Cortex-A72, arm64) — 64-bit Raspberry Pi OS / Ubuntu"
+apt = ["gcc-aarch64-linux-gnu", "libc6-dev-arm64-cross"]
+primary = true
+
+[[target]]
+id = "amd64"
+triple = "x86_64-unknown-linux-gnu"
+description = "Generic x86-64 server / desktop (native on most CI)"
+apt = []
+
+[[target]]
+id = "rpi-armv7"
+triple = "armv7-unknown-linux-gnueabihf"
+description = "32-bit Raspberry Pi OS (armv7) — future target"
+apt = ["gcc-arm-linux-gnueabihf", "libc6-dev-armhf-cross"]

@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+# Embedded SQLite database + WAL/SHM sidecars (created at runtime)
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,9 @@
+# Pin the toolchain so every architecture in the build matrix compiles identically
+# (CMOS-18 reproducibility; CMOS-14-DEP-004 artifacts must be reproducible & signed).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-unknown-linux-gnu", # Raspberry Pi 4 (arm64) — first realised target
+    "x86_64-unknown-linux-gnu",  # amd64 parity (CMOS-14-DEP-060)
+]
