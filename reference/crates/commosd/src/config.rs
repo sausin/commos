@@ -33,6 +33,17 @@ pub struct Config {
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
 
+    /// HS256 JWT signing secret — a **reference**, never inline (CMOS-14-DEP-083). When set,
+    /// `/v1` bearer tokens are verified as JWTs (Volume 9). When unset (default), only the
+    /// `tenant:<uuid>` dev token is accepted (see `dev_tokens`).
+    #[serde(default)]
+    pub jwt_secret: Option<SecretRef>,
+
+    /// Accept the `tenant:<uuidv7>` development bearer token. Default `true` so local dev and
+    /// the dashboard work with zero setup; set `false` in production once `jwt_secret` is set.
+    #[serde(default = "default_true")]
+    pub dev_tokens: bool,
+
     /// Database DSN — the system of record. A **reference**, never an inline credential
     /// (CMOS-14-DEP-083). `None` (the default) means use the embedded SQLite store at
     /// `{data_dir}/commos.db` — durable with zero external dependency (CMOS-14-DEP-021,
@@ -120,11 +131,17 @@ impl Default for Config {
             listen: default_listen(),
             sip_listen: default_sip_listen(),
             media_ip: default_media_ip(),
+            jwt_secret: None,
+            dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
             log: LogConfig::default(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_media_ip() -> IpAddr {

@@ -352,6 +352,98 @@ pub fn response_with(
     build_response(request, status, reason, extra)
 }
 
+/// Build a syntactically valid outbound SIP **request** (the UAC side — e.g. the outbound
+/// INVITE a B2BUA sends to a registered callee).
+///
+/// Emits the request line (`METHOD request-uri SIP/2.0`) followed by the caller-supplied
+/// `headers` verbatim, then fills in any of the mandatory framing headers the caller did NOT
+/// provide so the result is always well-formed: a `Via` (with a generated `branch`), `From`
+/// (with a generated `tag`), `To`, `Call-ID`, `CSeq`, `Max-Forwards: 70`, and a
+/// `Content-Length` matching `body`. When `body` is `Some((content_type, text))` a
+/// `Content-Type` header and the body are appended.
+///
+/// This is deliberately minimal but RFC 3261-shaped: it round-trips through [`parse`]. The
+/// caller owns dialog correctness (matching `From`/`To` tags, `Call-ID`, `CSeq` numbering);
+/// this function only guarantees a parseable message with the required headers present.
+pub fn request(
+    method: &str,
+    request_uri: &str,
+    headers: &[(&str, String)],
+    body: Option<(&str, &str)>,
+) -> String {
+    let method = method.trim().to_ascii_uppercase();
+    let mut out = String::with_capacity(256);
+    out.push_str(&format!("{method} {request_uri} SIP/2.0\r\n"));
+
+    // Track which mandatory headers the caller already supplied (case-insensitive).
+    let has = |name: &str| {
+        let want = canonical_header(name);
+        headers.iter().any(|(n, _)| canonical_header(n) == want)
+    };
+    let has_via = has("Via");
+    let has_from = has("From");
+    let has_to = has("To");
+    let has_call_id = has("Call-ID");
+    let has_cseq = has("CSeq");
+    let has_max_forwards = has("Max-Forwards");
+    let has_content_type = has("Content-Type");
+    let has_content_length = has("Content-Length");
+
+    // Caller-supplied headers first, verbatim.
+    for (name, value) in headers {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+
+    // A deterministic-but-unique seed for generated branch/tag/Call-ID values.
+    let seed = format!("{method}{request_uri}{}", headers.len());
+
+    if !has_via {
+        // A magic-cookie branch (RFC 3261 §8.1.1.7) so the response routes back.
+        out.push_str(&format!(
+            "Via: SIP/2.0/UDP commos.invalid;branch=z9hG4bK{}\r\n",
+            dialog_tag(&format!("via{seed}"))
+        ));
+    }
+    if !has_from {
+        out.push_str(&format!(
+            "From: <sip:commos@commos.invalid>;tag={}\r\n",
+            dialog_tag(&format!("from{seed}"))
+        ));
+    }
+    if !has_to {
+        out.push_str(&format!("To: <{request_uri}>\r\n"));
+    }
+    if !has_call_id {
+        out.push_str(&format!("Call-ID: {}@commos.invalid\r\n", dialog_tag(&format!("cid{seed}"))));
+    }
+    if !has_cseq {
+        out.push_str(&format!("CSeq: 1 {method}\r\n"));
+    }
+    if !has_max_forwards {
+        out.push_str("Max-Forwards: 70\r\n");
+    }
+
+    match body {
+        Some((content_type, text)) => {
+            if !has_content_type {
+                out.push_str(&format!("Content-Type: {content_type}\r\n"));
+            }
+            if !has_content_length {
+                out.push_str(&format!("Content-Length: {}\r\n", text.len()));
+            }
+            out.push_str("\r\n");
+            out.push_str(text);
+        }
+        None => {
+            if !has_content_length {
+                out.push_str("Content-Length: 0\r\n");
+            }
+            out.push_str("\r\n");
+        }
+    }
+    out
+}
+
 fn build_response(
     request: &SipMessage,
     status: u16,
@@ -665,6 +757,53 @@ CSeq: 1 OPTIONS\r\n\
         assert_eq!(via_lines.len(), 2, "both Via headers echoed in order");
         assert!(via_lines[0].contains("branch=z9hG4bK1"));
         assert!(via_lines[1].contains("branch=z9hG4bK2"));
+    }
+
+    #[test]
+    fn request_builds_and_round_trips() {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let out = request(
+            "invite", // lowercased on purpose — should be normalised to INVITE
+            "sip:200@192.168.1.9:5060",
+            &[
+                ("From", "<sip:100@commos>;tag=abc".to_string()),
+                ("To", "<sip:200@192.168.1.9:5060>".to_string()),
+                ("Call-ID", "call-xyz".to_string()),
+                ("CSeq", "1 INVITE".to_string()),
+                ("Contact", "<sip:commos@10.0.0.1>".to_string()),
+            ],
+            Some(("application/sdp", sdp)),
+        );
+
+        // Request line is well-formed and the method is uppercased.
+        assert!(out.starts_with("INVITE sip:200@192.168.1.9:5060 SIP/2.0\r\n"));
+
+        let msg = parse(out.as_bytes()).unwrap();
+        assert_eq!(msg.method(), Some("INVITE"));
+        assert_eq!(msg.request_uri(), Some("sip:200@192.168.1.9:5060"));
+        assert_eq!(msg.call_id(), Some("call-xyz"));
+        assert_eq!(msg.cseq_parts(), Some((1, "INVITE")));
+        assert_eq!(msg.from_tag().as_deref(), Some("abc"));
+        assert_eq!(msg.to_aor().as_deref(), Some("sip:200@192.168.1.9:5060"));
+        // Framing the caller omitted was filled in.
+        assert!(msg.via_branch().is_some());
+        assert_eq!(msg.max_forwards(), Some(70));
+        assert_eq!(msg.content_length(), Some(sdp.len()));
+        assert_eq!(msg.body(), sdp.as_bytes());
+    }
+
+    #[test]
+    fn request_bodyless_fills_mandatory_headers() {
+        // Nothing but method + URI supplied → every mandatory header is generated.
+        let out = request("ACK", "sip:200@host", &[], None);
+        let msg = parse(out.as_bytes()).unwrap();
+        assert_eq!(msg.method(), Some("ACK"));
+        assert!(msg.via_branch().is_some());
+        assert!(msg.from_tag().is_some());
+        assert!(msg.call_id().is_some());
+        assert_eq!(msg.cseq_parts(), Some((1, "ACK")));
+        assert_eq!(msg.max_forwards(), Some(70));
+        assert_eq!(msg.content_length(), Some(0));
     }
 
     #[test]

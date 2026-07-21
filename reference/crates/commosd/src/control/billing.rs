@@ -31,17 +31,29 @@ fn billed_ms(call: &Call) -> u64 {
 ///
 /// The CDR gets a fresh [`EntityBase`] scoped to the Call's tenant. Attribution
 /// (`device_id`, `identity_id`) and the negotiated `codec` (first media line) are copied
-/// from the Call when present; `did` is the destination when it is an E.164. `cost` is
-/// rated by the destination-aware [`Rater`] from the billable duration. `duration_ms` and
-/// `billable_ms` are both measured from the Call's own timestamps (this reference bills
-/// the full answered span — a real rater would subtract non-billable segments).
+/// from the Call when present.
+///
+/// The destination is first normalised through [`crate::control::dialplan::normalize_e164`]:
+/// a SIP/`tel` URI or name-addr naming a real number (e.g. `sip:+14155550100@gw`) resolves
+/// to its canonical E.164 (`+14155550100`), while an on-net extension resolves to `None`.
+/// `did` is that canonical E.164 when the destination normalises; `cost` is rated by the
+/// destination-aware [`Rater`] on the *normalised* number, so a URI-wrapped PSTN number now
+/// rates on its real tariff (`+1`) instead of falling through to the internal (0-cost) rate.
+/// Internal destinations keep the raw `to_ref` for rating (the rater tariffs them as
+/// on-net). `duration_ms` and `billable_ms` are both measured from the Call's own timestamps
+/// (this reference bills the full answered span — a real rater would subtract non-billable
+/// segments).
 pub fn assemble_cdr(call: &Call, organisation_id: Uuid) -> Cdr {
     let ms = billed_ms(call);
     let codec = call.media.first().and_then(|m| m.codec.clone());
-    // Record the dialled number only when it is E.164 (`+…`); internal `sip:` targets
-    // and bare extensions have no DID.
-    let did = call.to_ref.starts_with('+').then(|| call.to_ref.clone());
-    let cost = Rater::default_table().rate(&call.to_ref, ms);
+    // Normalise the destination once: canonical E.164 for a real number, else None (on-net).
+    let dest = crate::control::dialplan::normalize_e164(&call.to_ref, "+1");
+    // Record the dialled number only when it normalises to E.164; internal targets (bare
+    // extensions, alphanumeric `sip:` users) have no DID.
+    let did = dest.clone();
+    // Rate the normalised number when present (so `sip:+1…@gw` bills like `+1…`); fall back
+    // to the raw ref for internal destinations, which the rater tariffs as on-net (0).
+    let cost = Rater::default_table().rate(dest.as_deref().unwrap_or(&call.to_ref), ms);
     Cdr {
         base: EntityBase::new(call.base.tenant_id),
         call_id: call.base.id,
@@ -116,6 +128,30 @@ mod tests {
         let cdr = assemble_cdr(&answered_ended_call(), Uuid::now_v7());
         assert_eq!(cdr.did.as_deref(), Some("+14155550100"));
         assert_eq!(cdr.cost.currency, Currency::parse("USD").unwrap());
+    }
+
+    #[test]
+    fn uri_wrapped_number_rates_like_e164_and_records_did() {
+        // A SIP-URI destination naming a +1 number now normalises before rating: it rates on
+        // the +1 tariff (not the internal 0), and the canonical E.164 lands in `did`.
+        let mut call =
+            Call::originate(Uuid::now_v7(), Direction::Outbound, "sip:100", "sip:+14155550100@gw");
+        call.transition(CallState::Ringing).unwrap();
+        call.transition(CallState::Answered).unwrap();
+        call.transition(CallState::Ended).unwrap();
+        // Give it a real 2-minute billable span — instantaneous transitions bill 0 ms (free).
+        call.answered_at =
+            Some(commos_core::common::Timestamp::parse("2026-01-01T00:00:00.000Z").unwrap());
+        call.ended_at =
+            Some(commos_core::common::Timestamp::parse("2026-01-01T00:02:00.000Z").unwrap());
+        let cdr = assemble_cdr(&call, Uuid::now_v7());
+        assert_eq!(cdr.did.as_deref(), Some("+14155550100"));
+        // Same cost as the bare E.164 for the same duration (non-zero on the +1 tariff).
+        assert_eq!(
+            cdr.cost,
+            Rater::default_table().rate("+14155550100", cdr.billable_ms)
+        );
+        assert!(cdr.cost.minor_units > 0, "off-net number is not free");
     }
 
     #[test]

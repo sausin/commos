@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
 use crate::control::messaging::MessagingService;
@@ -29,6 +30,8 @@ pub struct AppState {
     /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
     /// keeps write volume near zero for SD-card longevity; CMOS-14-DEP-021).
     pub registrations: RegistrationRegistry,
+    /// Bearer-auth verifier config (JWT secret + dev-token flag).
+    pub auth: AuthConfig,
     pub bus: EventBus,
     pub recent: RecentEvents,
     /// Readiness flag — a node reports not-ready before it can serve and again while
@@ -46,6 +49,7 @@ impl AppState {
         queues: QueueService,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
+        auth: AuthConfig,
         bus: EventBus,
         recent: RecentEvents,
     ) -> Self {
@@ -57,6 +61,7 @@ impl AppState {
             queues,
             agents,
             registrations,
+            auth,
             bus,
             recent,
             ready: Arc::new(AtomicBool::new(false)),
@@ -70,5 +75,13 @@ impl AppState {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
+    }
+}
+
+/// Lets the `TenantContext` extractor reach the auth verifier config without `api::auth`
+/// depending on the concrete state type.
+impl HasAuthConfig for AppState {
+    fn auth_config(&self) -> &AuthConfig {
+        &self.auth
     }
 }

@@ -143,6 +143,22 @@ async fn run(cfg: Config) -> i32 {
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
 
+    // Bearer-auth config: resolve the JWT secret (if any); dev tokens on by default.
+    let jwt_secret = match &cfg.jwt_secret {
+        Some(secret) => match secret.resolve() {
+            Ok(s) => Some(s.into_bytes()),
+            Err(e) => {
+                tracing::error!("{e}");
+                return exit::CONFIG;
+            }
+        },
+        None => None,
+    };
+    let auth = api::auth::AuthConfig { jwt_secret, dev_tokens: cfg.dev_tokens };
+    if auth.jwt_secret.is_some() {
+        tracing::info!(dev_tokens = cfg.dev_tokens, "bearer auth: HS256 JWT verification enabled");
+    }
+
     // SIP signalling ingress (Volume 7): a real softphone can REGISTER, and an INVITE creates
     // an inbound Call, reports ring/answer as media facts, sets up an RTP echo path, and is
     // answered with SDP. The ingress maps to a single tenant for now (Volume 9).
@@ -186,6 +202,7 @@ async fn run(cfg: Config) -> i32 {
         queues,
         agents,
         registrations,
+        auth,
         bus.clone(),
         recent,
     );

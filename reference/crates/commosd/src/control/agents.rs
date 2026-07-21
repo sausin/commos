@@ -14,12 +14,24 @@
 //! *cache of current state*; the event stream is the *record of transitions*.
 //!
 //! ## ACD ([`AgentRegistry::enqueue`])
-//! MVP distribution: load the target [`Queue`] from the durable store, pick an `AVAILABLE`
-//! agent for the tenant, mark them `BUSY` (emitting `AgentStateChanged`), and return the
-//! [`Assignment`]. The Queue's `strategy` (ROUND_ROBIN / RINGALL / …) is respected only
-//! *loosely* for this MVP — we always pick the first available agent regardless of strategy.
-//! Wiring each strategy to its true dispatch discipline is follow-on work; the seam
-//! (`queue.strategy`) is already here.
+//! Load the target [`Queue`] from the durable store, compute the *eligible* AVAILABLE agents
+//! (a queue's `members` restrict the pool when non-empty; an empty `members` means "all
+//! AVAILABLE agents for the tenant"), pick one according to `queue.strategy`, mark that agent
+//! `BUSY` (emitting `AgentStateChanged`), and return the [`Assignment`].
+//!
+//! Strategy dispatch (over the eligible pool, always sorted deterministically by agent id):
+//! * `RINGALL` (and the default) — the first eligible agent (lowest id). Deterministic.
+//! * `ROUND_ROBIN` — rotate through the eligible pool across successive enqueues, via a
+//!   per-queue cursor held in the registry.
+//! * `FEWEST_CALLS` — the eligible agent with the fewest prior assignments (ties → lowest
+//!   id), via a per-agent assignment counter held in the registry.
+//! * `LEAST_RECENT` / `SKILLS` — **MVP simplification**: fall back to `RINGALL`. True
+//!   least-recently-used dispatch needs per-agent idle timestamps and skills-based routing
+//!   needs a member skill model; both are follow-on work. The seam (`queue.strategy`) is
+//!   honoured, only these two disciplines degrade to the deterministic first-eligible pick.
+//!
+//! The cursor and counter maps are ephemeral runtime state (like the live-state map) and are
+//! never persisted.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 
 use commos_core::common::{Timestamp, Uuid};
+use commos_core::entities::queue::QueueStrategy;
 use commos_core::event::{Correlation, Envelope};
 use commos_core::events::agent_state_changed::AgentStateChanged;
 
@@ -82,6 +95,11 @@ pub struct AgentRegistry {
     store: Arc<dyn Store>,
     signal: RelaySignal,
     agents: Arc<Mutex<HashMap<(Uuid, Uuid), Agent>>>,
+    /// ROUND_ROBIN dispatch cursor per queue (index into the eligible pool). Ephemeral.
+    rr_cursor: Arc<Mutex<HashMap<Uuid, usize>>>,
+    /// FEWEST_CALLS load counter per agent, keyed `(tenant, agent_user_id)`. Incremented on
+    /// every successful assignment. Ephemeral.
+    assignments: Arc<Mutex<HashMap<(Uuid, Uuid), u64>>>,
 }
 
 impl AgentRegistry {
@@ -90,6 +108,8 @@ impl AgentRegistry {
             store,
             signal,
             agents: Arc::new(Mutex::new(HashMap::new())),
+            rr_cursor: Arc::new(Mutex::new(HashMap::new())),
+            assignments: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -135,12 +155,15 @@ impl AgentRegistry {
         map.get(&(tenant, agent_user_id)).cloned()
     }
 
-    /// Enqueue `call_id` onto `queue_id` and distribute it to an available agent (MVP ACD).
+    /// Enqueue `call_id` onto `queue_id` and distribute it to an eligible agent per the
+    /// Queue's `strategy`.
     ///
-    /// Steps: load the Queue (durable), pick an `AVAILABLE` agent for the tenant, mark that
-    /// agent `BUSY` (which emits `AgentStateChanged`), and return the [`Assignment`]. The
-    /// Queue's `strategy` is respected only loosely here — we always take the first available
-    /// agent regardless of ROUND_ROBIN / RINGALL / etc. (documented MVP simplification).
+    /// Steps: load the Queue (durable); compute the eligible AVAILABLE agents for the tenant
+    /// (restricted to `queue.members` when that list is non-empty, else the whole tenant
+    /// pool); pick one according to `queue.strategy` (see the module docs — ROUND_ROBIN /
+    /// FEWEST_CALLS / RINGALL, with LEAST_RECENT & SKILLS degrading to RINGALL); record the
+    /// assignment for load tracking; mark that agent `BUSY` (which emits `AgentStateChanged`);
+    /// and return the [`Assignment`].
     pub async fn enqueue(
         &self,
         tenant: Uuid,
@@ -148,22 +171,39 @@ impl AgentRegistry {
         call_id: Uuid,
     ) -> Result<Assignment, EnqueueError> {
         // The Queue is durable configuration — load it from the system of record.
-        let _queue = self
+        let queue = self
             .store
             .get_queue(tenant, queue_id)
             .await?
             .ok_or(EnqueueError::QueueNotFound)?;
 
-        // MVP distributor: first AVAILABLE agent for the tenant, ignoring `_queue.strategy`.
-        // Deterministic pick (lowest agent id) so the choice is stable across runs.
-        let chosen = {
+        // Eligible pool: AVAILABLE agents for the tenant, restricted to `members` when set.
+        // Always sorted by id (as string) so every strategy has a deterministic base order.
+        let eligible: Vec<Uuid> = {
             let map = self.agents.lock().expect("agent mutex not poisoned");
-            map.values()
+            let mut ids: Vec<Uuid> = map
+                .values()
                 .filter(|a| a.tenant_id == tenant && a.state == STATE_AVAILABLE)
-                .min_by_key(|a| a.agent_user_id.to_string())
+                .filter(|a| {
+                    queue.members.is_empty()
+                        || queue.members.contains(&a.agent_user_id.to_string())
+                })
                 .map(|a| a.agent_user_id)
+                .collect();
+            ids.sort_by_key(|id| id.to_string());
+            ids
         };
-        let agent_user_id = chosen.ok_or(EnqueueError::NoAgentAvailable)?;
+        if eligible.is_empty() {
+            return Err(EnqueueError::NoAgentAvailable);
+        }
+
+        let agent_user_id = self.pick(tenant, queue_id, queue.strategy, &eligible);
+
+        // Record the assignment for FEWEST_CALLS load tracking (all strategies count).
+        {
+            let mut counts = self.assignments.lock().expect("assignments mutex not poisoned");
+            *counts.entry((tenant, agent_user_id)).or_insert(0) += 1;
+        }
 
         // Reserve the agent: flip to BUSY, which emits AgentStateChanged.
         self.set_state(tenant, agent_user_id, STATE_BUSY.to_string())
@@ -174,6 +214,40 @@ impl AgentRegistry {
             call_id,
             agent_user_id,
         })
+    }
+
+    /// Pick one agent from the (non-empty, id-sorted) `eligible` pool per `strategy`.
+    fn pick(
+        &self,
+        tenant: Uuid,
+        queue_id: Uuid,
+        strategy: QueueStrategy,
+        eligible: &[Uuid],
+    ) -> Uuid {
+        match strategy {
+            QueueStrategy::RoundRobin => {
+                // Rotate a per-queue cursor across successive enqueues.
+                let mut cursors = self.rr_cursor.lock().expect("rr cursor mutex not poisoned");
+                let slot = cursors.entry(queue_id).or_insert(0);
+                let idx = *slot % eligible.len();
+                *slot = slot.wrapping_add(1);
+                eligible[idx]
+            }
+            QueueStrategy::FewestCalls => {
+                // Fewest prior assignments wins; ties break on lowest id (eligible is sorted,
+                // and `min_by_key` keeps the first minimum, so the tie-break is stable).
+                let counts = self.assignments.lock().expect("assignments mutex not poisoned");
+                *eligible
+                    .iter()
+                    .min_by_key(|id| counts.get(&(tenant, **id)).copied().unwrap_or(0))
+                    .expect("eligible is non-empty")
+            }
+            // RINGALL and — as a documented MVP simplification — LEAST_RECENT / SKILLS:
+            // deterministic first eligible (lowest id).
+            QueueStrategy::Ringall | QueueStrategy::LeastRecent | QueueStrategy::Skills => {
+                eligible[0]
+            }
+        }
     }
 
     /// Emit an `AgentStateChanged` event through the transactional outbox and wake the relay.
@@ -301,6 +375,105 @@ mod tests {
             .enqueue(t, queue.base.id, Uuid::now_v7())
             .await
             .unwrap_err();
+        assert!(matches!(err, EnqueueError::NoAgentAvailable));
+    }
+
+    /// Store a queue with the given strategy and members, returning it.
+    async fn store_queue(
+        store: &Arc<dyn Store>,
+        tenant: Uuid,
+        strategy: QueueStrategy,
+        members: Vec<String>,
+    ) -> Queue {
+        let mut queue = Queue::create(tenant, strategy);
+        queue.members = members;
+        store
+            .commit(Tx {
+                queues: vec![queue.clone()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        queue
+    }
+
+    #[tokio::test]
+    async fn round_robin_rotates_across_two_agents() {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let reg = AgentRegistry::new(store.clone(), RelaySignal::new());
+        let t = tenant();
+        let queue = store_queue(&store, t, QueueStrategy::RoundRobin, vec![]).await;
+
+        let a1 = Uuid::now_v7();
+        let a2 = Uuid::now_v7();
+        reg.set_state(t, a1, "AVAILABLE".into()).await.unwrap();
+        reg.set_state(t, a2, "AVAILABLE".into()).await.unwrap();
+
+        // enqueue reserves (BUSY) the pick; reset to AVAILABLE between calls so both stay
+        // eligible and we observe the cursor rotating rather than the pool shrinking.
+        let first = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+        reg.set_state(t, first, "AVAILABLE".into()).await.unwrap();
+        let second = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+        reg.set_state(t, second, "AVAILABLE".into()).await.unwrap();
+        let third = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+
+        assert_ne!(first, second, "round robin advances to the other agent");
+        assert_eq!(third, first, "round robin wraps back around");
+    }
+
+    #[tokio::test]
+    async fn fewest_calls_prefers_less_loaded_agent() {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let reg = AgentRegistry::new(store.clone(), RelaySignal::new());
+        let t = tenant();
+        let queue = store_queue(&store, t, QueueStrategy::FewestCalls, vec![]).await;
+
+        let a1 = Uuid::now_v7();
+        let a2 = Uuid::now_v7();
+        reg.set_state(t, a1, "AVAILABLE".into()).await.unwrap();
+        reg.set_state(t, a2, "AVAILABLE".into()).await.unwrap();
+
+        // First enqueue: both have 0 assignments → tie → lowest id. That agent now has 1.
+        let first = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+        reg.set_state(t, first, "AVAILABLE".into()).await.unwrap();
+
+        // Second enqueue: the other agent (still 0) is strictly less loaded → it is chosen.
+        let second = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+        assert_ne!(second, first, "the less-loaded agent is preferred");
+    }
+
+    #[tokio::test]
+    async fn members_filter_restricts_the_pool() {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let reg = AgentRegistry::new(store.clone(), RelaySignal::new());
+        let t = tenant();
+
+        let a1 = Uuid::now_v7();
+        let a2 = Uuid::now_v7();
+        let a3 = Uuid::now_v7();
+        for a in [a1, a2, a3] {
+            reg.set_state(t, a, "AVAILABLE".into()).await.unwrap();
+        }
+
+        // Only a2 is a member — even RINGALL (first eligible) must pick a2, not the lowest id.
+        let queue = store_queue(&store, t, QueueStrategy::Ringall, vec![a2.to_string()]).await;
+        let chosen = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap().agent_user_id;
+        assert_eq!(chosen, a2, "only the queue member is eligible");
+    }
+
+    #[tokio::test]
+    async fn members_filter_with_no_eligible_agent_errors() {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let reg = AgentRegistry::new(store.clone(), RelaySignal::new());
+        let t = tenant();
+
+        let a1 = Uuid::now_v7();
+        reg.set_state(t, a1, "AVAILABLE".into()).await.unwrap();
+
+        // The only member is an agent that is not available (never logged in).
+        let member = Uuid::now_v7();
+        let queue = store_queue(&store, t, QueueStrategy::Ringall, vec![member.to_string()]).await;
+        let err = reg.enqueue(t, queue.base.id, Uuid::now_v7()).await.unwrap_err();
         assert!(matches!(err, EnqueueError::NoAgentAvailable));
     }
 

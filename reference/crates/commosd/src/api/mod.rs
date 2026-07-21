@@ -13,6 +13,7 @@ pub mod dashboard;
 pub mod health;
 pub mod introspect;
 pub mod messages;
+pub mod onboarding;
 pub mod presence;
 pub mod problem;
 pub mod queues;
@@ -63,7 +64,10 @@ pub fn router(state: AppState) -> Router {
         .route("/queues/:id", get(queues::get_queue))
         .route("/queues/:id/enqueue", post(queues::enqueue_call))
         .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
-        .route("/agents/:id", get(agents::get_agent));
+        .route("/agents/:id", get(agents::get_agent))
+        // Admin onboarding wizard — auto-detected suggestions for rapid setup.
+        .route("/onboarding/environments", get(onboarding::list_environments))
+        .route("/onboarding/suggest", get(onboarding::suggest));
 
     Router::new()
         .nest("/v1", v1)
@@ -71,8 +75,9 @@ pub fn router(state: AppState) -> Router {
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
         .route("/info", get(health::info))
-        // Live operations dashboard (self-contained HTML, unauthenticated).
+        // Live operations dashboard + setup wizard (self-contained HTML, unauthenticated).
         .route("/dashboard", get(dashboard::dashboard))
+        .route("/onboarding", get(onboarding::wizard))
         // Non-normative introspection for bring-up/testing.
         .route("/_introspect/events", get(introspect::recent_events))
         .route("/_introspect/events/stream", get(introspect::stream_events))

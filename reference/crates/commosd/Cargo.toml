@@ -27,6 +27,11 @@ uuid.workspace = true
 time.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+# Pure-Rust crypto for HS256 JWT bearer verification (keeps the arm64 cross-build clean —
+# deliberately NOT jsonwebtoken/ring/openssl).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -75,6 +75,23 @@ change — the architecture is not baked into the implementation.
 
 ## Run
 
+### Set-up wizard (rapid onboarding)
+
+Open **`http://localhost:8080/onboarding`**. Answer two questions — *what kind of place* (office /
+hotel / hospital / home) and *how many phones* — and CommOS auto-detects and proposes the rest:
+
+- **Extension plan** — a suggested starting series (100 / 200 / … with a dropdown) whose digit
+  length scales to the fleet, environment-aware service numbers (reception **9** in an office,
+  **0** at a hotel front desk), and default feature codes.
+- **Network** — detects the host's IP, proposes the LAN subnet and a phone DHCP pool, and warns
+  when the fleet won't fit (e.g. 300 phones → "use a /23 or a voice VLAN").
+- **Discovered phones** — reads the ARP table and flags likely IP phones by MAC vendor.
+- **Auto-provisioning** — generates the exact **DNS (BIND A + SRV)** and **DHCP (option 66/67)**
+  lines to paste, so phones provision themselves.
+
+It's all served by the same binary (`GET /v1/onboarding/suggest` is the JSON behind it). The
+philosophy: **good defaults everywhere; the operator confirms rather than fills in forms.**
+
 ### Default — embedded SQLite (durable, zero external dependency)
 
 Just run it. With no `database_url` configured, the binary opens/creates a local SQLite
@@ -113,7 +130,8 @@ ephemeral in-process store (tests), set `database_url` to `memory://`.
 ### Endpoints
 
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
-- `GET /dashboard` — self-contained live operations dashboard (unauthenticated).
+- `GET /dashboard` — live operations dashboard; `GET /onboarding` — setup wizard (both unauthenticated, self-contained HTML).
+- `GET /v1/onboarding/environments`, `GET /v1/onboarding/suggest` — the wizard's auto-detection API.
 - **Voice workload** — `GET|POST /v1/calls`, `GET|PATCH /v1/calls/{id}` (`PATCH` is an
   RFC 7386 merge-patch with `If-Match` optimistic concurrency), and actions
   `POST /v1/calls/{id}/{hold,resume,hangup,transfer}`. A Call starts `INITIATED`; ring and
@@ -146,11 +164,16 @@ call** end-to-end:
   and answers `200 OK` with an SDP body — the caller hears themselves (classic echo test).
 - **BYE/CANCEL** hangs the Call up (producing its **CDR**) and tears down the RTP.
 
-Verified end-to-end: `INVITE → 100 Trying → 200 OK (SDP)`, an RTP packet to the advertised
-port is echoed back, then `BYE → 200 OK` and the Call reaches `ENDED` with a CDR. RTP is an
-echo relay today; leg-to-leg bridging, transcoding, and conferencing are the next media steps.
+An INVITE aimed at a **registered** endpoint is bridged B2BUA-style: CommOS places an outbound
+INVITE to the callee, then relays RTP between the two legs (symmetric-RTP latching) so two
+softphones can talk; an INVITE to an external/unregistered number falls back to the echo test.
+Verified: `INVITE → 100 Trying → 200 OK (SDP)`, RTP echoed back, `BYE → 200 OK`, Call `ENDED` + CDR;
+the two-leg bridge relays A↔B in a unit test. Full mid-dialog B2BUA correctness (transactions,
+re-INVITE/hold, transcoding, conferencing) are the next media steps.
 
-All `/v1` routes are bearer-authenticated and tenant-scoped.
+All `/v1` routes are bearer-authenticated and tenant-scoped. Auth verifies **HS256 JWTs** when a
+`jwt_secret` is configured (tenant from the `tenant_id` claim); with none configured it accepts the
+`tenant:<uuidv7>` dev token, so local dev and the dashboards work with zero setup.
 
 ## Conformance evidence
 
@@ -170,11 +193,12 @@ All `/v1` routes are bearer-authenticated and tenant-scoped.
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. **RTP media depth** — leg-to-leg bridging (softphone↔softphone), transcoding, and
-   conferencing; and outbound INVITE (the `MediaPlane` command path is already in place).
-2. Contact-centre depth: strategy-aware distribution (skills/round-robin state), wrap-up, and
-   number normalisation so SIP-URI destinations rate like E.164.
-3. Richer queries / update / soft-delete across the workloads.
-4. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
+1. **Onboarding "apply"** — persist the wizard's suggestion (create the Extensions/Devices/Users
+   and the `pbx.yaml`) so setup is one click, not copy-paste.
+2. **RTP/B2BUA depth** — full mid-dialog correctness (client transactions, re-INVITE/hold),
+   transcoding, and conferencing.
+3. **Contact-centre depth** — skills-based and least-recent distribution, wrap-up, and a real
+   rating profile (versioned tariffs) behind the CDR.
+4. **Multi-node relay** — switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
-5. Real JWT verification against Identity (Volume 9), and SIP-domain→tenant mapping.
+5. **Identity** — JWKS/OIDC verification and SIP-domain→tenant mapping (multi-tenant SIP).
