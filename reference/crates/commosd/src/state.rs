@@ -65,6 +65,9 @@ pub struct AppState {
     /// SIP registrar address advertised to phones (for auto-provisioning configs).
     pub media_ip: std::net::IpAddr,
     pub sip_port: u16,
+    /// Human-readable description of the system of record (e.g. the SQLite file path), surfaced
+    /// to the operator at the end of onboarding so they know where their configuration lives.
+    pub storage_location: String,
     pub bus: EventBus,
     pub recent: RecentEvents,
     /// Readiness flag — a node reports not-ready before it can serve and again while
@@ -98,6 +101,7 @@ impl AppState {
         admin: AdminAuth,
         media_ip: std::net::IpAddr,
         sip_port: u16,
+        storage_location: String,
         bus: EventBus,
         recent: RecentEvents,
     ) -> Self {
@@ -122,6 +126,7 @@ impl AppState {
             admin,
             media_ip,
             sip_port,
+            storage_location,
             bus,
             recent,
             ready: Arc::new(AtomicBool::new(false)),

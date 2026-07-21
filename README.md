@@ -38,7 +38,15 @@ Then:
 
 1. Open **`http://<box-ip>:8080/onboarding`** — answer two questions (what kind of place, how
    many phones) and CommOS proposes an extension plan, a network layout, discovered phones, and
-   the exact DNS/DHCP lines so phones provision themselves. One click applies it.
+   the exact DNS/DHCP lines so phones provision themselves. If the box has several network
+   interfaces it asks which one carries the phones so the right subnet is picked; you line up
+   each handset (by MAC — discovered ones are pre-filled, or type in a MAC for a phone not yet
+   powered on) with the extension it should own **and the name to show on its LCD**; and SSL
+   stays **off by default** — LAN phones reject a self-signed cert, so provisioning runs over
+   plain HTTP unless you have a CA-signed certificate (media is SRTP-encrypted either way). One
+   click applies it, tells you exactly **where the config was saved**, and offers a **Reboot
+   phones now** button that resyncs the handsets (SIP `check-sync`) so they come up registered
+   without a manual power-cycle.
 2. Point each phone's SIP account at **`<box-ip>:5060`** (username = its extension) and place a
    call. Dial another extension for a two-way call; dial your own number for an echo test.
 3. Watch it live at **`/dashboard`**, scrape **`/metrics`**, or drive everything over the API:

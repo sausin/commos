@@ -346,6 +346,7 @@ async fn run(cfg: Config) -> i32 {
         admin,
         cfg.media_ip,
         cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
+        describe_storage(&cfg),
         bus.clone(),
         recent,
     );
@@ -460,6 +461,36 @@ fn load_sip_tls(cfg: &Config) -> Result<Arc<tokio_rustls::rustls::ServerConfig>,
 /// Default (no `database_url`): the **embedded SQLite** store — durable with zero external
 /// dependency (ADR-0012), the right fit for a single box / Raspberry Pi. `postgres://…`
 /// selects PostgreSQL (multi-node / HA); `memory://` selects the ephemeral in-process store.
+/// A human-readable, secret-free description of where the system of record lives — shown to the
+/// operator at the end of onboarding so they know exactly where their configuration was saved.
+/// Mirrors [`select_store`]'s branching. Never echoes a resolved DSN (it may carry credentials):
+/// PostgreSQL is named without its connection string; SQLite paths are safe and are made absolute.
+fn describe_storage(cfg: &Config) -> String {
+    let abs = |p: &str| {
+        std::fs::canonicalize(p)
+            .ok()
+            .map(|x| x.display().to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    match &cfg.database_url {
+        None => format!("embedded SQLite database at {}", abs(&cfg.default_sqlite_path())),
+        Some(secret) => match secret.resolve() {
+            Ok(d) if d.starts_with("postgres://") || d.starts_with("postgresql://") => {
+                "an external PostgreSQL database (configured via database_url)".to_string()
+            }
+            Ok(d) if d == "memory://" || d == ":memory:" => {
+                "an in-process memory store — NOT durable, lost on restart".to_string()
+            }
+            Ok(d) => {
+                let path = d.strip_prefix("sqlite:").unwrap_or(&d);
+                format!("SQLite database at {}", abs(path))
+            }
+            // Can't resolve the reference here; don't guess or leak it.
+            Err(_) => "the database referenced by database_url".to_string(),
+        },
+    }
+}
+
 async fn select_store(cfg: &Config) -> Result<Arc<dyn store::Store>, i32> {
     let dsn = match &cfg.database_url {
         Some(secret) => match secret.resolve() {
