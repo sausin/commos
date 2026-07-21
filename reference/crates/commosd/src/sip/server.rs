@@ -1330,29 +1330,53 @@ async fn ivr_transfer(
         return false;
     }
 
-    // Await a 2xx (ignoring provisional 1xx) up to the answer timeout.
+    // Await a 2xx (ignoring provisional 1xx) up to the answer timeout, **playing ring-back to
+    // the caller** on leg A meanwhile so they hear audible ring instead of silence while the
+    // callee's phone rings. Ring-back loops the standard 440+480 Hz / 2 s-on-4 s-off cadence.
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
-        loop {
-            let (n, _from) = sig.recv_from(&mut buf).await.ok()?;
-            let resp = match message::parse(&buf[..n]) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            match resp.status() {
-                Some(s) if (100..200).contains(&s) => continue,
-                Some(s) if (200..300).contains(&s) => return Some(resp),
-                Some(_) => return None,
-                None => continue,
+    let ringback = g711::ringback();
+    let mut rb_pos = 0usize;
+    let mut rb_seq: u16 = 0;
+    let mut rb_ts: u32 = 0;
+    let mut rb_first = true;
+    let mut ticker = tokio::time::interval(Duration::from_millis(20));
+    let ring_deadline = tokio::time::sleep(CALLEE_ANSWER_TIMEOUT);
+    tokio::pin!(ring_deadline);
+    let resp = loop {
+        tokio::select! {
+            _ = &mut ring_deadline => {
+                tracing::info!(callee = %callee.aor, "IVR transfer: callee did not answer");
+                return false;
             }
-        }
-    })
-    .await;
-    let resp = match answer {
-        Ok(Some(r)) => r,
-        _ => {
-            tracing::info!(callee = %callee.aor, "IVR transfer: callee did not answer");
-            return false;
+            r = sig.recv_from(&mut buf) => {
+                let Ok((n, _from)) = r else { continue };
+                let msg = match message::parse(&buf[..n]) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                match msg.status() {
+                    Some(s) if (100..200).contains(&s) => continue,     // provisional ring
+                    Some(s) if (200..300).contains(&s) => break msg,    // answered
+                    Some(_) => {                                        // callee rejected/failed
+                        tracing::info!(callee = %callee.aor, "IVR transfer: callee rejected");
+                        return false;
+                    }
+                    None => continue,
+                }
+            }
+            _ = ticker.tick() => {
+                // Send the next 20 ms ring-back frame to the caller, wrapping the cadence buffer.
+                let mut frame = [0u8; 160];
+                for b in frame.iter_mut() {
+                    *b = ringback[rb_pos % ringback.len()];
+                    rb_pos += 1;
+                }
+                let pkt = ivr::pcmu_frame(rb_seq, rb_ts, &frame, rb_first);
+                let _ = sock_a.send_to(&pkt, peer_a).await;
+                rb_seq = rb_seq.wrapping_add(1);
+                rb_ts = rb_ts.wrapping_add(160);
+                rb_first = false;
+            }
         }
     };
     let callee_to = resp.header("To").map(str::to_string).unwrap_or_else(|| format!("<{}>", callee.aor));

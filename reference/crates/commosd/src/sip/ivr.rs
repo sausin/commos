@@ -183,7 +183,7 @@ async fn play_and_collect(
             _ = ticker.tick() => {
                 if let (Some(dst), true) = (*peer, frame_idx < frames.len()) {
                     let payload = frames[frame_idx];
-                    let pkt = rtp_frame(seq, ts, payload, first_frame);
+                    let pkt = pcmu_frame(seq, ts, payload, first_frame);
                     let _ = sock.send_to(&pkt, dst).await;
                     seq = seq.wrapping_add(1);
                     ts = ts.wrapping_add(payload.len() as u32);
@@ -204,7 +204,7 @@ pub async fn play(sock: &UdpSocket, peer: SocketAddr, audio: &[u8]) {
     let mut ticker = tokio::time::interval(FRAME_INTERVAL);
     for chunk in audio.chunks(FRAME_BYTES) {
         ticker.tick().await;
-        let _ = sock.send_to(&rtp_frame(seq, ts, chunk, first), peer).await;
+        let _ = sock.send_to(&pcmu_frame(seq, ts, chunk, first), peer).await;
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(chunk.len() as u32);
         first = false;
@@ -245,8 +245,9 @@ pub async fn record_until_stop(
 }
 
 /// Build a PCMU (payload type 0) RTP packet with a 12-byte header. `marker` is set on the
-/// first packet of the talkspurt (RFC 3550 §5.1).
-fn rtp_frame(seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec<u8> {
+/// first packet of the talkspurt (RFC 3550 §5.1). Shared with the ring-back playout in
+/// [`crate::sip::server`].
+pub fn pcmu_frame(seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec<u8> {
     let mut p = Vec::with_capacity(12 + payload.len());
     p.push(0x80); // version 2, no padding/extension/CSRC
     p.push(if marker { 0x80 } else { 0x00 }); // marker + payload type 0 (PCMU)

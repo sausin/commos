@@ -13,6 +13,8 @@ use std::f64::consts::PI;
 
 /// Sample rate of the negotiated codec (PCMU/8000).
 pub const SAMPLE_RATE: usize = 8000;
+/// μ-law byte value for digital silence (the encoding of a zero sample).
+pub const ULAW_SILENCE: u8 = 0xFF;
 
 /// Encode one 16-bit linear PCM sample to a G.711 μ-law byte (ITU-T G.711).
 pub fn linear_to_ulaw(sample: i16) -> u8 {
@@ -53,6 +55,28 @@ pub fn tone(freq_hz: f64, ms: usize, amplitude: i16) -> Vec<u8> {
 /// The classic dual-tone "beep" used to cue the caller to begin (a 425 Hz tone, `ms` long).
 pub fn beep(ms: usize) -> Vec<u8> {
     tone(425.0, ms, 8000)
+}
+
+/// Synthesise a **dual-tone** of `ms` milliseconds as μ-law: the sum of two sines at `f1`/`f2`,
+/// each at `amplitude` (kept at ≤ ~12000 so the summed peak stays well within range).
+pub fn dual_tone(f1: f64, f2: f64, ms: usize, amplitude: i16) -> Vec<u8> {
+    let n = SAMPLE_RATE * ms / 1000;
+    (0..n)
+        .map(|i| {
+            let t = i as f64 / SAMPLE_RATE as f64;
+            let s = amplitude as f64 * ((2.0 * PI * f1 * t).sin() + (2.0 * PI * f2 * t).sin());
+            linear_to_ulaw(s as i16)
+        })
+        .collect()
+}
+
+/// One period of standard **ring-back** as μ-law: a 440 + 480 Hz dual tone with the North
+/// American cadence (2 s on, 4 s off). Loop it while a callee's phone is ringing so the caller
+/// hears audible ring-back instead of silence during transfer setup.
+pub fn ringback() -> Vec<u8> {
+    let mut buf = dual_tone(440.0, 480.0, 2000, 11000);
+    buf.resize(buf.len() + SAMPLE_RATE * 4000 / 1000, ULAW_SILENCE);
+    buf
 }
 
 #[cfg(test)]
@@ -99,5 +123,16 @@ mod tests {
         let b = beep(200);
         assert_eq!(b.len(), 1600); // 200 ms
         assert!(b.iter().any(|&x| x != SILENCE));
+    }
+
+    #[test]
+    fn ringback_has_a_tone_then_silence_cadence() {
+        let rb = ringback();
+        // 2 s tone + 4 s silence == 6 s == 48000 bytes.
+        assert_eq!(rb.len(), 48000);
+        assert_eq!(ULAW_SILENCE, SILENCE);
+        // The first 2 s carries the dual tone; the tail 4 s is silence.
+        assert!(rb[..16000].iter().any(|&b| b != SILENCE), "leading segment should be audible");
+        assert!(rb[16000..].iter().all(|&b| b == SILENCE), "trailing segment should be silent");
     }
 }
