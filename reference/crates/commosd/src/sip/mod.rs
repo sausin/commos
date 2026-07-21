@@ -13,11 +13,14 @@
 //!
 //! Media is encrypted with **SRTP** ([`srtp`], RFC 3711 `AES_CM_128_HMAC_SHA1_80`) on the
 //! endpoint paths CommOS terminates (echo/voicemail) when a caller offers the secure `RTP/SAVP`
-//! profile with an SDES key ([`sdes`], RFC 4568); plain-RTP callers are unaffected.
+//! profile with an SDES key ([`sdes`], RFC 4568); plain-RTP callers are unaffected. The signalling
+//! channel can itself be encrypted with **SIP-over-TLS** ([`tls`], a `--features tls` build) — a
+//! stream transport, so [`transport`] re-frames messages by `Content-Length` and answers back on
+//! the same connection through a transport-agnostic [`transport::Responder`].
 //!
 //! **What comes next:** the B2BUA bridge is best-effort (see the `TODO(B2BUA)` in [`server`]);
-//! full mid-dialog correctness, SRTP for the two-leg bridge/trunk relay, and SIP-over-TLS
-//! (to protect the SDES key in transit) are the remaining media-plane work.
+//! full mid-dialog correctness, SRTP for the two-leg bridge/trunk relay, and *outbound* TLS on
+//! UAC/trunk legs are the remaining media-plane work.
 
 pub mod codec;
 pub mod digest;
@@ -29,5 +32,8 @@ pub mod rtp;
 pub mod sdes;
 pub mod server;
 pub mod srtp;
+#[cfg(feature = "tls")]
+pub mod tls;
+pub mod transport;
 
 pub use server::SipServer;

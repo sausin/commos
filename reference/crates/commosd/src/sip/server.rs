@@ -40,6 +40,7 @@ fn now_unix() -> i64 {
 }
 
 use super::message::{self, SipMessage};
+use super::transport::Responder;
 use super::{codec, dtmf, g711, ivr, rtp, sdes, srtp};
 
 /// Largest UDP SIP datagram we accept (the UDP ceiling; ample for INVITE+SDP).
@@ -261,25 +262,21 @@ impl SipServer {
 
     /// Send a `401 Unauthorized` with a fresh digest challenge, prompting the phone to
     /// re-send the request with an `Authorization` header.
-    async fn send_challenge(
-        &self,
-        socket: &UdpSocket,
-        msg: &SipMessage,
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    async fn send_challenge(&self, resp: &Responder, msg: &SipMessage) -> std::io::Result<()> {
         let challenge = super::digest::Challenge::new(self.realm.clone(), self.issue_nonce());
-        let resp = message::response_with(
+        let reply = message::response_with(
             msg,
             401,
             "Unauthorized",
             &[("WWW-Authenticate", challenge.header_value())],
         );
-        self.send(socket, resp.as_bytes(), src).await
+        resp.send(reply.as_bytes()).await
     }
 
-    /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error.
-    pub async fn run(self, bind: SocketAddr) -> std::io::Result<()> {
-        let socket = UdpSocket::bind(bind).await?;
+    /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error. Shared
+    /// behind an [`Arc`] so the same server also drives the TLS ingress ([`super::tls`]).
+    pub async fn run(self: Arc<Self>, bind: SocketAddr) -> std::io::Result<()> {
+        let socket = Arc::new(UdpSocket::bind(bind).await?);
         let local = socket.local_addr().unwrap_or(bind);
         tracing::info!(addr = %local, "SIP signalling ingress listening (UDP)");
 
@@ -292,22 +289,21 @@ impl SipServer {
                     continue;
                 }
             };
-            if let Err(e) = self.handle(&socket, &buf[..len], src).await {
+            let responder = Responder::Udp { socket: socket.clone(), dst: src };
+            if let Err(e) = self.handle(&responder, &buf[..len]).await {
                 tracing::debug!(error = %e, %src, "dropping SIP datagram");
             }
         }
     }
 
-    async fn handle(
-        &self,
-        socket: &UdpSocket,
-        datagram: &[u8],
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    /// Parse and dispatch one received SIP message, replying via `resp`. Transport-agnostic: the
+    /// same path serves a UDP datagram and a message framed off a TLS stream ([`super::tls`]).
+    pub(crate) async fn handle(&self, resp: &Responder, datagram: &[u8]) -> std::io::Result<()> {
+        let src = resp.peer();
         let msg = match message::parse(datagram) {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!(error = %e, %src, "unparseable SIP datagram");
+                tracing::debug!(error = %e, %src, "unparseable SIP message");
                 return Ok(());
             }
         };
@@ -321,33 +317,28 @@ impl SipServer {
         };
 
         match method.as_str() {
-            "REGISTER" => self.on_register(socket, &msg, src).await,
+            "REGISTER" => self.on_register(resp, &msg).await,
             "OPTIONS" => {
                 tracing::info!(method = %method, %src, "SIP OPTIONS");
-                self.reply(socket, &msg, 200, "OK", src).await
+                self.reply(resp, &msg, 200, "OK").await
             }
-            "INVITE" => self.on_invite(socket, &msg, src).await,
+            "INVITE" => self.on_invite(resp, &msg).await,
             "ACK" => {
                 tracing::info!(method = %method, %src, "SIP ACK");
                 Ok(())
             }
-            "BYE" | "CANCEL" => self.on_bye(socket, &msg, src).await,
-            "INFO" => self.on_info(socket, &msg, src).await,
+            "BYE" | "CANCEL" => self.on_bye(resp, &msg).await,
+            "INFO" => self.on_info(resp, &msg).await,
             other => {
                 tracing::info!(method = %other, %src, "SIP method not implemented");
-                self.reply(socket, &msg, 501, "Not Implemented", src).await
+                self.reply(resp, &msg, 501, "Not Implemented").await
             }
         }
     }
 
     /// INFO: out-of-band DTMF (`application/dtmf-relay` / `application/dtmf`). If the datagram's
     /// dialog is a live IVR session, inject the pressed digit into it; always `200 OK`.
-    async fn on_info(
-        &self,
-        socket: &UdpSocket,
-        msg: &SipMessage,
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    async fn on_info(&self, resp: &Responder, msg: &SipMessage) -> std::io::Result<()> {
         let body = String::from_utf8_lossy(msg.body());
         if let (Some(call_id), Some(digit)) = (msg.call_id(), dtmf::parse_info_dtmf(&body)) {
             let injected = self
@@ -361,29 +352,25 @@ impl SipServer {
                 tracing::info!(%call_id, %digit, "SIP INFO DTMF injected into IVR");
             }
         }
-        self.reply(socket, msg, 200, "OK", src).await
+        self.reply(resp, msg, 200, "OK").await
     }
 
     /// REGISTER: bind the AoR to its contact and confirm with a `200 OK`.
-    async fn on_register(
-        &self,
-        socket: &UdpSocket,
-        msg: &SipMessage,
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    async fn on_register(&self, resp: &Responder, msg: &SipMessage) -> std::io::Result<()> {
+        let src = resp.peer();
         // Digest auth gate (Volume 9): an unauthenticated REGISTER is challenged with 401 +
         // WWW-Authenticate; the phone re-sends with credentials we verify against its stored
         // per-device secret.
         if self.require_auth && !self.digest_ok(msg, "REGISTER").await {
             tracing::info!(%src, "SIP REGISTER challenged (digest auth required)");
-            return self.send_challenge(socket, msg, src).await;
+            return self.send_challenge(resp, msg).await;
         }
 
         let aor = match msg.register_aor() {
             Some(a) if !a.is_empty() => a,
             _ => {
                 tracing::debug!(%src, "REGISTER without a usable To/From AoR");
-                return self.reply(socket, msg, 400, "Bad Request", src).await;
+                return self.reply(resp, msg, 400, "Bad Request").await;
             }
         };
         let expires = msg.expires();
@@ -406,8 +393,8 @@ impl SipServer {
 
         let contact_header = format!("<{contact}>;expires={expires}");
         let extra = [("Contact", contact_header), ("Expires", expires.to_string())];
-        let resp = message::response_with(msg, 200, "OK", &extra);
-        let sent = self.send(socket, resp.as_bytes(), src).await;
+        let reply = message::response_with(msg, 200, "OK", &extra);
+        let sent = resp.send(reply.as_bytes()).await;
 
         // A returning phone should light its message-waiting lamp: push MWI after the 200 OK
         // if the mailbox has unheard voicemails. Skipped on de-register (expires=0) and when
@@ -420,12 +407,8 @@ impl SipServer {
 
     /// INVITE: create an inbound Call, report ring+answer facts, set up RTP echo, answer
     /// `200 OK` with an SDP answer.
-    async fn on_invite(
-        &self,
-        socket: &UdpSocket,
-        msg: &SipMessage,
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    async fn on_invite(&self, resp: &Responder, msg: &SipMessage) -> std::io::Result<()> {
+        let src = resp.peer();
         let call_id_hdr = msg.call_id().unwrap_or("").to_string();
         let to_ref = msg
             .request_uri()
@@ -443,12 +426,12 @@ impl SipServer {
         // reachable; challenging INVITE too stops direct unauthenticated dialing.)
         if self.require_auth && !self.digest_ok(msg, "INVITE").await {
             tracing::info!(%src, "SIP INVITE challenged (digest auth required)");
-            return self.send_challenge(socket, msg, src).await;
+            return self.send_challenge(resp, msg).await;
         }
 
         // Provisional response.
         let trying = message::response(msg, 100, "Trying");
-        self.send(socket, trying.as_bytes(), src).await?;
+        resp.send(trying.as_bytes()).await?;
 
         // Create the inbound Call in the control plane.
         let call = match self
@@ -459,7 +442,7 @@ impl SipServer {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "INVITE could not create Call");
-                return self.reply(socket, msg, 500, "Server Internal Error", src).await;
+                return self.reply(resp, msg, 500, "Server Internal Error").await;
             }
         };
         let call_id = call.base.id;
@@ -527,7 +510,7 @@ impl SipServer {
             Some(id) => Some(id),
             None => self.resolve_ivr_target(request_uri).await,
         } {
-            return self.answer_with_ivr(socket, msg, src, call_id, &call_id_hdr, ivr_id, g711, te_pt).await;
+            return self.answer_with_ivr(resp, msg, call_id, &call_id_hdr, ivr_id, g711, te_pt).await;
         }
 
         let mut voicemail_target: Option<VoicemailBox> = None;
@@ -571,7 +554,7 @@ impl SipServer {
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
                             codec = %sel_codec.name, "SIP INVITE bridged to registered callee");
-                        return self.send(socket, ok.as_bytes(), src).await;
+                        return resp.send(ok.as_bytes()).await;
                     }
                     None if self.voicemail_enabled => {
                         // Rang but never answered → take a voicemail. MWI is pushed to the
@@ -625,7 +608,7 @@ impl SipServer {
                     let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, None);
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
                     tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, "SIP INVITE routed outbound via trunk");
-                    return self.send(socket, ok.as_bytes(), src).await;
+                    return resp.send(ok.as_bytes()).await;
                 }
                 tracing::warn!(%call_id, %e164, "outbound trunk failed; falling back to echo");
             }
@@ -671,7 +654,7 @@ impl SipServer {
             let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, vm_crypto.as_ref());
             let ok = self.build_invite_ok(msg, &sdp, call_id);
             tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, srtp = vm_crypto.is_some(), "SIP INVITE answered (voicemail)");
-            return self.send(socket, ok.as_bytes(), src).await;
+            return resp.send(ok.as_bytes()).await;
         }
 
         // Echo path: non-mailbox destination (PSTN-style / +E.164), or a no-answer with
@@ -710,7 +693,7 @@ impl SipServer {
         let sdp = self.build_sdp(rtp_port, &reflect, te_pt, echo_crypto.as_ref());
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, rtp_port, codec = %reflect.name, srtp = echo_crypto.is_some(), "SIP INVITE answered (RTP echo)");
-        self.send(socket, ok.as_bytes(), src).await
+        resp.send(ok.as_bytes()).await
     }
 
     /// Resolve the request-URI through the Extension→Route table. When the dialled number
@@ -813,9 +796,8 @@ impl SipServer {
     #[allow(clippy::too_many_arguments)]
     async fn answer_with_ivr(
         &self,
-        socket: &UdpSocket,
+        resp: &Responder,
         msg: &SipMessage,
-        src: SocketAddr,
         call_id: Uuid,
         call_id_hdr: &str,
         ivr_id: Uuid,
@@ -827,7 +809,7 @@ impl SipServer {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, %ivr_id, "IVR not found; falling back to echo");
-                return self.answer_with_echo(socket, msg, src, call_id, call_id_hdr).await;
+                return self.answer_with_echo(resp, msg, call_id, call_id_hdr).await;
             }
         };
         // The prompt is synthesised/served in the negotiated G.711 codec.
@@ -845,7 +827,7 @@ impl SipServer {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind IVR RTP socket; falling back to echo");
-                return self.answer_with_echo(socket, msg, src, call_id, call_id_hdr).await;
+                return self.answer_with_echo(resp, msg, call_id, call_id_hdr).await;
             }
         };
         let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -884,7 +866,7 @@ impl SipServer {
         let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, %ivr_id, rtp_port, codec = %g711.sdp_name(), "SIP INVITE answered (IVR menu)");
-        self.send(socket, ok.as_bytes(), src).await
+        resp.send(ok.as_bytes()).await
     }
 
     /// Drive an IVR session to completion, then enact its outcome. A `voicemail*` selection
@@ -955,9 +937,8 @@ impl SipServer {
     /// reflecting RTP back to the caller.
     async fn answer_with_echo(
         &self,
-        socket: &UdpSocket,
+        resp: &Responder,
         msg: &SipMessage,
-        src: SocketAddr,
         call_id: Uuid,
         call_id_hdr: &str,
     ) -> std::io::Result<()> {
@@ -991,7 +972,7 @@ impl SipServer {
         let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
         let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
-        self.send(socket, ok.as_bytes(), src).await
+        resp.send(ok.as_bytes()).await
     }
 
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.
@@ -1397,12 +1378,7 @@ impl SipServer {
     }
 
     /// BYE/CANCEL: hang the Call up (produces the CDR), abort its RTP, and `200 OK`.
-    async fn on_bye(
-        &self,
-        socket: &UdpSocket,
-        msg: &SipMessage,
-        src: SocketAddr,
-    ) -> std::io::Result<()> {
+    async fn on_bye(&self, resp: &Responder, msg: &SipMessage) -> std::io::Result<()> {
         let method = msg.method().unwrap_or("BYE").to_string();
         if let Some(incoming_call_id) = msg.call_id() {
             // The incoming Call-ID is either a primary (caller-leg) dialog key, or — for a
@@ -1463,7 +1439,7 @@ impl SipServer {
                 }
             }
         }
-        self.reply(socket, msg, 200, "OK", src).await
+        self.reply(resp, msg, 200, "OK").await
     }
 
     /// Build the SDP answer advertising `rtp_port` for the negotiated `audio` codec + DTMF
@@ -1531,19 +1507,12 @@ impl SipServer {
 
     async fn reply(
         &self,
-        socket: &UdpSocket,
+        resp: &Responder,
         msg: &SipMessage,
         status: u16,
         reason: &str,
-        src: SocketAddr,
     ) -> std::io::Result<()> {
-        let resp = message::response(msg, status, reason);
-        self.send(socket, resp.as_bytes(), src).await
-    }
-
-    async fn send(&self, socket: &UdpSocket, bytes: &[u8], dst: SocketAddr) -> std::io::Result<()> {
-        socket.send_to(bytes, dst).await?;
-        Ok(())
+        resp.send(message::response(msg, status, reason).as_bytes()).await
     }
 }
 

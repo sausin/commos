@@ -65,9 +65,27 @@ pub struct Config {
     /// breaks a plain-RTP caller — a plain `RTP/AVP` INVITE is still answered in the clear. It
     /// applies to the endpoint media paths CommOS terminates (echo test and voicemail); SRTP for
     /// two-leg extension bridges and carrier trunks is forthcoming. Because SDES carries the key
-    /// in the SDP, pair this with SIP-over-TLS once available to protect the key in transit.
+    /// in the SDP, pair this with SIP-over-TLS below to protect the key in transit.
     #[serde(default = "default_true")]
     pub srtp: bool,
+
+    /// TLS address the SIP signalling ingress binds for **SIPS** (SIP over TLS, RFC 3261). `null`
+    /// (the default) disables it — TLS is opt-in and requires a build with `--features tls`. The
+    /// IANA SIPS port is `5061`. Encrypting the signalling channel protects the SDES SRTP keys
+    /// (and every header — who calls whom) from a passive network observer.
+    #[serde(default)]
+    pub sips_listen: Option<SocketAddr>,
+
+    /// PEM certificate chain served on the SIPS listener. A public certificate, so a plain path
+    /// (not a secret reference). Required when `sips_listen` is set.
+    #[serde(default)]
+    pub sip_tls_cert: Option<String>,
+
+    /// PEM private key for the SIPS certificate — a **reference**, never inline
+    /// (CMOS-14-DEP-083); e.g. `{ ref_uri: "file:///etc/commos/tls/sip-key.pem" }`. Required when
+    /// `sips_listen` is set.
+    #[serde(default)]
+    pub sip_tls_key: Option<SecretRef>,
 
     /// HS256 JWT signing secret — a **reference**, never inline (CMOS-14-DEP-083). When set,
     /// `/v1` bearer tokens are verified as JWTs (Volume 9). When unset (default), only the
@@ -211,6 +229,9 @@ impl Default for Config {
             voicemail_enabled: true,
             media_ip: default_media_ip(),
             srtp: true,
+            sips_listen: None,
+            sip_tls_cert: None,
+            sip_tls_key: None,
             jwt_secret: None,
             dev_tokens: default_true(),
             database_url: None,

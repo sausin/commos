@@ -220,24 +220,10 @@ async fn run(cfg: Config) -> i32 {
     // SIP signalling ingress (Volume 7): a real softphone can REGISTER, and an INVITE creates
     // an inbound Call, reports ring/answer as media facts, sets up an RTP echo path, and is
     // answered with SDP. The ingress maps to a single tenant for now (Volume 9).
-    if let Some(sip_addr) = cfg.sip_listen {
-        // The #1 misconfiguration that silently breaks audio: SIP is reachable on the LAN but
-        // the SDP advertises a loopback RTP address, so calls connect and no one can hear
-        // anything. Warn loudly with the address to use (detected LAN IP if we can find one).
-        if cfg.media_ip.is_loopback() && !sip_addr.ip().is_loopback() {
-            let suggestion = control::onboarding::primary_host_ip()
-                .filter(|ip| !ip.is_loopback())
-                .map(|ip| format!(" — set `media_ip: \"{ip}\"` in pbx.yaml"))
-                .unwrap_or_else(|| " — set `media_ip` to this host's LAN IP in pbx.yaml".to_string());
-            tracing::warn!(
-                media_ip = %cfg.media_ip, sip = %sip_addr,
-                "media_ip is loopback but SIP listens on {sip_addr}: real phones will register \
-                 and connect, but NO AUDIO will flow{suggestion} (or run scripts/install.sh)."
-            );
-        }
+    if cfg.sip_listen.is_some() || cfg.sips_listen.is_some() {
         let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
             .expect("valid default SIP tenant");
-        let server = sip::SipServer::new(
+        let server = std::sync::Arc::new(sip::SipServer::new(
             registrations.clone(),
             routing.clone(),
             cfg.media_ip,
@@ -253,7 +239,7 @@ async fn run(cfg: Config) -> i32 {
             objects.clone(),
             cfg.default_country_code.clone(),
             cfg.srtp,
-        );
+        ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
         } else {
@@ -272,12 +258,55 @@ async fn run(cfg: Config) -> i32 {
         } else {
             tracing::info!("SRTP: DISABLED (media answered in the clear even when offered)");
         }
-        tokio::spawn(async move {
-            if let Err(e) = server.run(sip_addr).await {
-                tracing::error!("SIP ingress stopped: {e}");
+
+        // UDP ingress.
+        if let Some(sip_addr) = cfg.sip_listen {
+            // The #1 misconfiguration that silently breaks audio: SIP is reachable on the LAN but
+            // the SDP advertises a loopback RTP address, so calls connect and no one can hear
+            // anything. Warn loudly with the address to use (detected LAN IP if we can find one).
+            if cfg.media_ip.is_loopback() && !sip_addr.ip().is_loopback() {
+                let suggestion = control::onboarding::primary_host_ip()
+                    .filter(|ip| !ip.is_loopback())
+                    .map(|ip| format!(" — set `media_ip: \"{ip}\"` in pbx.yaml"))
+                    .unwrap_or_else(|| " — set `media_ip` to this host's LAN IP in pbx.yaml".to_string());
+                tracing::warn!(
+                    media_ip = %cfg.media_ip, sip = %sip_addr,
+                    "media_ip is loopback but SIP listens on {sip_addr}: real phones will register \
+                     and connect, but NO AUDIO will flow{suggestion} (or run scripts/install.sh)."
+                );
             }
-        });
-        tracing::info!(addr = %sip_addr, "SIP signalling ingress listening (UDP)");
+            let udp = server.clone();
+            tokio::spawn(async move {
+                if let Err(e) = udp.run(sip_addr).await {
+                    tracing::error!("SIP ingress stopped: {e}");
+                }
+            });
+            tracing::info!(addr = %sip_addr, "SIP signalling ingress listening (UDP)");
+        }
+
+        // TLS ingress (SIPS) — opt-in, and only in a `--features tls` build. Encrypting the
+        // signalling channel protects the SDES SRTP keys and call metadata in transit.
+        #[cfg(feature = "tls")]
+        if let Some(sips_addr) = cfg.sips_listen {
+            match load_sip_tls(&cfg) {
+                Ok(tls_config) => {
+                    let tls_server = server.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sip::tls::run_tls(tls_server, sips_addr, tls_config).await {
+                            tracing::error!("SIP/TLS ingress stopped: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("SIP/TLS ingress could not start: {e}");
+                    return exit::CONFIG;
+                }
+            }
+        }
+        #[cfg(not(feature = "tls"))]
+        if cfg.sips_listen.is_some() {
+            tracing::warn!("sips_listen is set but this binary was built without `--features tls`; the SIPS ingress is DISABLED");
+        }
     }
 
     // Media-fact loop: apply media→control facts (ring/answer/…) to Call state and emit their
@@ -403,6 +432,26 @@ async fn run(cfg: Config) -> i32 {
     let _ = relay_handle.await;
     tracing::info!("commosd stopped cleanly");
     exit::OK
+}
+
+/// Build the rustls config for the SIPS listener from the configured certificate path and key
+/// reference, so a missing or unreadable/invalid cert/key surfaces as a boot-time error rather
+/// than a silent failure inside the accept loop.
+#[cfg(feature = "tls")]
+fn load_sip_tls(cfg: &Config) -> Result<Arc<tokio_rustls::rustls::ServerConfig>, String> {
+    let cert_path = cfg
+        .sip_tls_cert
+        .as_ref()
+        .ok_or("sips_listen is set but sip_tls_cert is not configured")?;
+    let key_ref = cfg
+        .sip_tls_key
+        .as_ref()
+        .ok_or("sips_listen is set but sip_tls_key is not configured")?;
+    let cert_pem =
+        std::fs::read(cert_path).map_err(|e| format!("reading sip_tls_cert '{cert_path}': {e}"))?;
+    let key_pem = key_ref.resolve().map_err(|e| e.to_string())?.into_bytes();
+    let config = sip::tls::load_server_config(&cert_pem, &key_pem).map_err(|e| e.to_string())?;
+    Ok(Arc::new(config))
 }
 
 /// Choose the system-of-record binding from config, connecting/opening it.

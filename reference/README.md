@@ -182,8 +182,14 @@ Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) on the en
 CommOS terminates — the echo test and voicemail — whenever a phone offers the secure `RTP/SAVP`
 profile with an SDES key (`a=crypto`, RFC 4568); a plain-RTP caller is answered in the clear
 exactly as before. The crypto is pure-Rust (RustCrypto), validated against the RFC 3711 key-
-derivation vectors and cross-checked end-to-end by an independent SRTP implementation. SRTP for
-the two-leg bridge/trunk relay, and SIP-over-TLS to protect the SDES key in transit, come next.
+derivation vectors and cross-checked end-to-end by an independent SRTP implementation.
+
+The signalling channel itself can run over **SIP-over-TLS** (SIPS) — build with `--features tls`,
+set `sips_listen` plus `sip_tls_cert`/`sip_tls_key`, and CommOS serves the same request handlers
+over a TLS stream (rustls, ring provider), re-framing messages by `Content-Length` and replying on
+the same connection. This encrypts every header and the SDES SRTP keys against a passive observer.
+TLS stays behind a feature so the default binary is pure-Rust and cross-compiles clean, exactly
+like `s3`. Two-leg bridge/trunk SRTP, and *outbound* TLS on trunk legs, come next.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped. Auth verifies **HS256 JWTs** when a
 `jwt_secret` is configured (tenant from the `tenant_id` claim); with none configured it accepts the

@@ -180,6 +180,9 @@ inlined** (an inline secret is rejected at boot):
 # pbx.yaml
 media_ip: "192.168.1.10"                          # the address advertised to phones for RTP
 sip_listen: "0.0.0.0:5060"                        # SIP/UDP ingress (null disables it)
+sips_listen: "0.0.0.0:5061"                       # SIP-over-TLS ingress (needs a --features tls build)
+sip_tls_cert: "/etc/commos/tls/sip-fullchain.pem" # PEM cert chain for SIPS
+sip_tls_key: { ref_uri: "file:///etc/commos/tls/sip-key.pem" }  # key by reference, never inline
 record_calls: true                                # capture call audio as objects
 voicemail_enabled: true                           # record-on-no-answer + MWI
 srtp: true                                        # encrypt RTP (SRTP/SDES) when a phone offers RTP/SAVP
