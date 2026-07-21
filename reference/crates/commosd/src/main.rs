@@ -87,8 +87,40 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Resolve the config path to use when `--config` is not given.
+///
+/// Historically the binary looked only at `./pbx.yaml`, but the installer writes the config to
+/// the data dir (`/var/lib/commos/pbx.yaml` as root). So a bare `commosd` on an installed box
+/// missed its own config and silently booted on defaults. Search the conventional locations, in
+/// order, and use the first that exists:
+///
+/// 1. `$COMMOS_CONFIG` — explicit override (wins if set, even when the file is missing, so a
+///    typo surfaces as a clear "cannot read config" error rather than a silent defaults boot),
+/// 2. `./pbx.yaml` — the working-directory config (dev / `--data-dir ./data`),
+/// 3. `/etc/commos/pbx.yaml` — the FHS config location,
+/// 4. `/var/lib/commos/pbx.yaml` — where the installer writes it by default.
+///
+/// Falls back to `./pbx.yaml` (which `Config::load` reports as "booting with defaults") when none
+/// exists, preserving the zero-config boot.
+fn default_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("COMMOS_CONFIG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    const CANDIDATES: [&str; 3] =
+        ["pbx.yaml", "/etc/commos/pbx.yaml", "/var/lib/commos/pbx.yaml"];
+    for candidate in CANDIDATES {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("pbx.yaml")
+}
+
 fn parse_args() -> Result<PathBuf, i32> {
-    let mut path = PathBuf::from("pbx.yaml");
+    let mut path = default_config_path();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {

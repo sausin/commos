@@ -428,7 +428,7 @@ pub struct DiscoveredDevice {
 fn vendor_for_oui(oui: &str) -> Option<&'static str> {
     match oui {
         "00:15:65" | "80:5e:c0" | "24:9a:d8" | "00:1f:c1" => Some("Yealink"),
-        "00:0b:82" | "c0:74:ad" | "00:0b:83" => Some("Grandstream"),
+        "00:0b:82" | "c0:74:ad" | "00:0b:83" | "ec:74:d7" => Some("Grandstream"),
         "00:04:f2" | "64:16:7f" | "48:25:67" => Some("Polycom"),
         "00:04:13" | "00:1a:4b" => Some("Snom"),
         "0c:38:3e" | "70:2a:d5" => Some("Fanvil"),
@@ -586,9 +586,14 @@ pub struct MacBinding {
 /// Build the people, extensions, routes, and phones for a confirmed onboarding choice. Each
 /// extension gets a person and a **real Route** (`sip:<number>@<domain>`) that the control
 /// plane resolves on an inbound call; the extension's `route_id` points at it. Discovered
-/// phones (from ARP) are bound to the first extensions by writing the device MAC into the
-/// extension `label` — exactly what the provisioning endpoint keys on, so a phone that fetches
-/// its config gets that account.
+/// phones (from ARP) are bound to extensions by writing the device MAC into the extension
+/// `label` — exactly what the provisioning endpoint keys on, so a phone that fetches its config
+/// gets that account.
+///
+/// Extensions are created for the union of the sequential series (`start .. start+device_count`)
+/// and every number the operator explicitly bound a phone to, so an aligned handset always gets
+/// an extension even if its number falls outside the series. Bindings whose MAC is not a valid
+/// 12-hex address are logged and skipped rather than silently ignored.
 pub fn build_entities(
     tenant: Uuid,
     device_count: u32,
@@ -616,10 +621,23 @@ pub fn build_entities(
                     .as_ref()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
-                (b.number.clone(), (m, name))
+                (b.number.trim().to_string(), (m, name))
             })
         })
         .collect();
+
+    // Surface bindings we cannot honour rather than dropping them silently: a MAC that is not
+    // 12 hex chars can never match the provisioning lookup, so warn (with the offending value)
+    // instead of quietly skipping it.
+    for b in bindings {
+        if mac_hex(&b.mac).is_none() && !b.number.trim().is_empty() {
+            tracing::warn!(
+                mac = %b.mac,
+                number = %b.number,
+                "onboarding binding ignored: not a valid MAC (need 12 hex digits) — this phone will NOT auto-provision"
+            );
+        }
+    }
 
     // Fallback only when the operator gave no explicit alignment: bind discovered likely-phones
     // to the first extensions in ARP order (the previous behaviour).
@@ -629,13 +647,36 @@ pub fn build_entities(
         Vec::new()
     };
 
+    // The extension numbers to create: the sequential plan (`start .. start+device_count`) UNION
+    // every explicitly bound number. Previously only the sequence was built, so a phone the
+    // operator aligned to a number *outside* the series was silently dropped — its extension was
+    // never created, its MAC never became a `label`, and provisioning answered "no account
+    // provisioned". Taking the union guarantees an operator-aligned phone always gets its
+    // extension. Sequential numbers come first (matching the plan the operator saw); any extra
+    // bound numbers follow in ascending order for a stable, deterministic result.
+    let mut numbers: Vec<String> = (0..device_count).map(|i| (start + i).to_string()).collect();
+    let in_seq: std::collections::HashSet<String> = numbers.iter().cloned().collect();
+    let mut extra: Vec<String> =
+        bound_by_number.keys().filter(|n| !in_seq.contains(*n)).cloned().collect();
+    extra.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    });
+    if !extra.is_empty() {
+        tracing::info!(
+            extra = ?extra,
+            "onboarding: creating extensions for operator-aligned phones outside the {start}+{device_count} series"
+        );
+    }
+    numbers.extend(extra);
+
     let mut users = Vec::new();
     let mut extensions = Vec::new();
     let mut devices = Vec::new();
     let mut routes = Vec::new();
 
-    for i in 0..device_count {
-        let number = (start + i).to_string();
+    for (i, number) in numbers.iter().enumerate() {
+        let number = number.clone();
 
         // The person behind this extension. When the operator gave a display name it becomes the
         // User's name (and, via provisioning, the text on the phone's LCD); otherwise a default.
@@ -654,8 +695,10 @@ pub fn build_entities(
         let bound: Option<(String, Option<DiscoveredDevice>)> =
             if let Some((mac, _)) = bound_by_number.get(&number) {
                 Some((mac.clone(), by_mac.get(mac).cloned()))
-            } else if let Some(phone) = auto_phones.get(i as usize) {
-                mac_hex(&phone.mac).map(|m| (m, Some((*phone).clone())))
+            } else if bound_by_number.is_empty() {
+                auto_phones
+                    .get(i)
+                    .and_then(|phone| mac_hex(&phone.mac).map(|m| (m, Some((*phone).clone()))))
             } else {
                 None
             };
@@ -938,6 +981,26 @@ mod tests {
             .find(|u| Some(u.base.id) == ext101_dev.assigned_user_id)
             .unwrap();
         assert_eq!(user.display_name, "Front Desk");
+    }
+
+    #[test]
+    fn binding_outside_the_series_is_still_created_and_bound() {
+        // Regression: a phone aligned to a number *outside* the `start .. start+device_count`
+        // series used to be dropped — no extension, no label — so provisioning answered
+        // "no account provisioned". It must now get its own extension, bound to its MAC.
+        let tenant = Uuid::now_v7();
+        let bindings = vec![MacBinding {
+            mac: "ec:74:d7:5a:9b:3c".into(),
+            number: "250".into(), // well outside 100..102
+            display_name: Some("Lobby".into()),
+        }];
+        let built = build_entities(tenant, 2, "100", "commos.local", &bindings);
+        // The two sequential extensions plus the one for the out-of-series binding.
+        assert_eq!(built.extensions.len(), 3);
+        let ext250 = built.extensions.iter().find(|e| e.number == "250").unwrap();
+        assert_eq!(ext250.label.as_deref(), Some("ec74d75a9b3c"));
+        // A device is bound so the provisioning endpoint resolves the MAC → this account.
+        assert!(built.devices.iter().any(|d| d.mac.as_deref() == Some("ec74d75a9b3c")));
     }
 
     #[test]

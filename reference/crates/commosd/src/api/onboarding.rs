@@ -145,6 +145,14 @@ pub async fn apply(
             .await
             .map_err(|e| Problem::internal(e.to_string()))?;
     }
+    tracing::info!(
+        extensions = outcome.extensions_created,
+        phones_bound = outcome.devices_created,
+        bindings_requested = body.bindings.len(),
+        "onboarding apply: created {} extensions, {} phone(s) bound to a MAC for auto-provisioning",
+        outcome.extensions_created,
+        outcome.devices_created
+    );
     Ok(Json(outcome))
 }
 

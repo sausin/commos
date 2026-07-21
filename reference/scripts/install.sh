@@ -161,24 +161,40 @@ if [ "$DO_SYSTEMD" = "1" ]; then
   cat > "$UNIT" <<UNITEOF
 [Unit]
 Description=CommOS communications platform (commosd)
+Documentation=https://github.com/sausin/commos
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=$BIN --config $CONFIG
+# Run from the data dir so any relative paths resolve against the state it owns.
+WorkingDirectory=$DATA_DIR
 Restart=on-failure
 RestartSec=2
 # Systemd sends SIGTERM; commosd drains gracefully (readiness off, then finishes in-flight).
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# --- logging: commosd logs to stdout/stderr, which systemd captures into the journal. Tag it
+# so \`journalctl -t commosd\` / \`-u commosd\` reads cleanly.
+SyslogIdentifier=commosd
+# --- sandboxing: the daemon only needs to write its own data dir. Lock down the rest so a bug
+# can't touch the wider filesystem. ReadWritePaths keeps the SQLite DB, objects, and any config
+# rewrite working under a read-only system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target
 UNITEOF
   systemctl daemon-reload
   systemctl enable --now commosd.service
-  ok "systemd service installed and started (systemctl status commosd)"
+  ok "systemd service installed and started"
+  log "Logs (journald):   journalctl -u commosd -f"
+  log "Service status:    systemctl status commosd"
 fi
 
 # ---- next steps -------------------------------------------------------------------------
