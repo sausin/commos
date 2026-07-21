@@ -72,6 +72,27 @@ python3 conformance/run.py               # validates contracts + spec consistenc
 
 The harness is the arbiter of "does this conform." See [`conformance/README.md`](conformance/README.md).
 
+## Stand up a test PBX (real phones, ~5 minutes)
+
+The installer gets a box to a working state and avoids the usual setup traps (chiefly a
+loopback `media_ip`, which makes calls connect with no audio):
+
+```bash
+cd reference
+sudo scripts/install.sh --build --systemd            # detects LAN IP, writes pbx.yaml, installs a service
+# or, no root / no systemd:
+scripts/install.sh --build --data-dir ./commos-data  # prints the exact command to start it
+```
+
+Then, from any machine on the LAN: open `http://<box-ip>:8080/onboarding` to add extensions,
+point each phone's SIP account at `<box-ip>:5060` (username = its extension), and place a call.
+Dialling your own number is an **echo test** (you hear yourself); dialling another phone's
+extension is a **two-way call**. Live state is at `/dashboard`, metrics at `/metrics`.
+
+This is a LAN test bed — SIP/RTP are unencrypted and REGISTER is not yet authenticated, so keep
+UDP 5060 off the public internet. PSTN/carrier trunking, recording, and voicemail are not built
+yet; internal calling and the echo test are.
+
 ## Building & releases
 
 The reference binary is deliberately pure-Rust in its cross-compilation-hostile

@@ -208,6 +208,20 @@ async fn run(cfg: Config) -> i32 {
     // an inbound Call, reports ring/answer as media facts, sets up an RTP echo path, and is
     // answered with SDP. The ingress maps to a single tenant for now (Volume 9).
     if let Some(sip_addr) = cfg.sip_listen {
+        // The #1 misconfiguration that silently breaks audio: SIP is reachable on the LAN but
+        // the SDP advertises a loopback RTP address, so calls connect and no one can hear
+        // anything. Warn loudly with the address to use (detected LAN IP if we can find one).
+        if cfg.media_ip.is_loopback() && !sip_addr.ip().is_loopback() {
+            let suggestion = control::onboarding::primary_host_ip()
+                .filter(|ip| !ip.is_loopback())
+                .map(|ip| format!(" — set `media_ip: \"{ip}\"` in pbx.yaml"))
+                .unwrap_or_else(|| " — set `media_ip` to this host's LAN IP in pbx.yaml".to_string());
+            tracing::warn!(
+                media_ip = %cfg.media_ip, sip = %sip_addr,
+                "media_ip is loopback but SIP listens on {sip_addr}: real phones will register \
+                 and connect, but NO AUDIO will flow{suggestion} (or run scripts/install.sh)."
+            );
+        }
         let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
             .expect("valid default SIP tenant");
         let server = sip::SipServer::new(
