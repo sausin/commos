@@ -12,25 +12,28 @@ pub struct Problem {
     /// A URI reference identifying the problem type.
     #[serde(rename = "type")]
     pub type_uri: String,
-    pub title: String,
+    /// The HTTP status' canonical reason — always a static string.
+    pub title: &'static str,
     pub status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// Machine-readable CommOS error code.
+    /// Machine-readable CommOS error code — a fixed catalogue of static slugs. Keeping it
+    /// (and `title`) `&'static str` rather than `String` also holds `Problem` under clippy's
+    /// `result_large_err` threshold, so the API's `Result<_, Problem>` stays cheap to return.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    pub code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
 }
 
 impl Problem {
-    pub fn new(status: StatusCode, code: &str, detail: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, code: &'static str, detail: impl Into<String>) -> Self {
         Problem {
             type_uri: format!("https://commos.dev/problems/{code}"),
-            title: status.canonical_reason().unwrap_or("Error").to_string(),
+            title: status.canonical_reason().unwrap_or("Error"),
             status: status.as_u16(),
             detail: Some(detail.into()),
-            code: Some(code.to_string()),
+            code: Some(code),
             correlation_id: None,
         }
     }

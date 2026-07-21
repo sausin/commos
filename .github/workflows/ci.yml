@@ -1,0 +1,102 @@
+name: ci
+
+# Health gate for the reference implementation on every push and PR. The tag-triggered
+# multi-architecture publish lives in release.yml; this keeps `main` releasable by proving
+# the workspace builds, tests, and lints on amd64 — and cross-compiles for every published
+# architecture — before a tag is ever cut.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build · test · clippy (amd64)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference
+      # The project's quality bar: clippy is clean under -D warnings (rustfmt is intentionally
+      # not enforced — the code uses deliberately wide lines).
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build (release, native)
+        run: cargo build --release --locked --bin commosd
+
+  cross:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every published architecture is compile-checked on every push, so a tag never
+        # surprises us (amd64-gnu is covered natively by the `check` job above).
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Set up cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference
+          key: ${{ matrix.target }}
+      - name: Compile-check
+        run: cargo build --locked --target ${{ matrix.target }} --bin commosd
+
+  parity-arm64:
+    name: behaviour parity (arm64 under qemu)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + arm64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Set up cross toolchain + qemu
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference
+          key: parity-aarch64
+      # CMOS-14-DEP-060: conformance evidence must cover both arm64 and amd64, since
+      # media/codec paths are architecture-sensitive. The `check` job is the amd64 half;
+      # this runs the same suite for arm64 under qemu.
+      - name: Test suite under qemu (arm64)
+        run: cargo test --locked --target aarch64-unknown-linux-gnu

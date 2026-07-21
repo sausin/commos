@@ -64,9 +64,7 @@ pub fn normalize_e164(input: &str, default_country_code: &str) -> Option<String>
     }
 
     // 4c. Otherwise it must be an all-digit string to be a candidate number.
-    let Some(digits) = leading_digits(&cleaned) else {
-        return None;
-    };
+    let digits = leading_digits(&cleaned)?;
     if digits.len() != cleaned.len() {
         // Contained a non-digit that was not a separator/scheme — not a plain number.
         return None;

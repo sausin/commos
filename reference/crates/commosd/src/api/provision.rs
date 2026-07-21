@@ -25,6 +25,7 @@
 //!   * `grandstream` → a readable Grandstream `P`-value / parameter block,
 //!   * anything else (polycom, unknown, no device) → the original generic vendor-neutral
 //!     INI block as the fallback.
+//!
 //! All three are served as `text/plain; charset=utf-8` for the reference implementation.
 //!
 //! Vendor detection here is purely by `Device.vendor_key`. A real fleet also negotiates the

@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(back.members, vec!["sip:100".to_string()]);
 
         // Every variant renders SCREAMING_SNAKE.
-        let render = |s| serde_json::to_value(&Queue::create(Uuid::now_v7(), s)).unwrap()["strategy"].clone();
+        let render = |s| serde_json::to_value(Queue::create(Uuid::now_v7(), s)).unwrap()["strategy"].clone();
         assert_eq!(render(QueueStrategy::Ringall), "RINGALL");
         assert_eq!(render(QueueStrategy::FewestCalls), "FEWEST_CALLS");
         assert_eq!(render(QueueStrategy::RoundRobin), "ROUND_ROBIN");

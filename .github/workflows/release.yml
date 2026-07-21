@@ -1,0 +1,155 @@
+name: release
+
+# Multi-architecture publish. Push a `v*` tag (e.g. `v0.4.0`) and every supported
+# architecture is built, packaged, checksummed, signed, and attached to a GitHub Release —
+# satisfying the deployment contract's parity + signed-artifact mandate
+# (CMOS-14-DEP-004 / CMOS-14-DEP-060: amd64 + arm64 with behaviour parity; L1 published
+# artifacts exist with verifiable, signed checksums).
+#
+# The binary is deliberately pure-Rust (no OpenSSL / native codec libs), so it also ships
+# as fully static `musl` builds — the truest form of the single-self-contained-binary
+# mandate (CMOS-14-DEP-001): drop it on any Linux of that architecture and run it.
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual runs build + attest the matrix (a dry run of the pipeline) but do NOT publish a
+  # Release — publishing is gated on a tag ref below.
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the Release and upload assets
+  id-token: write # OIDC for keyless (Sigstore) signing
+  attestations: write # write the build-provenance attestation
+
+env:
+  BIN: commosd
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, arch: amd64, libc: gnu }
+          - { target: x86_64-unknown-linux-musl, arch: amd64, libc: musl }
+          - { target: aarch64-unknown-linux-gnu, arch: arm64, libc: gnu }
+          - { target: aarch64-unknown-linux-musl, arch: arm64, libc: musl }
+          - { target: armv7-unknown-linux-gnueabihf, arch: armv7, libc: gnu }
+    defaults:
+      run:
+        working-directory: reference
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up cross toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: reference
+          key: release-${{ matrix.target }}
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin "$BIN"
+
+      - name: Package + checksum
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="${BIN}-${version}-${{ matrix.target }}"
+          out="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "$out"
+          bindir="target/${{ matrix.target }}/release"
+          # Prove the artifact is the architecture we claim before we ship it.
+          file "$bindir/${BIN}"
+          tar -C "$bindir" -czf "${out}/${name}.tar.gz" "$BIN"
+          ( cd "$out" && sha256sum "${name}.tar.gz" | tee "${name}.tar.gz.sha256" )
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: sign + publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect artifacts + combined checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -type f -name '*.tar.gz' -exec cp -v {} dist/ \;
+          cd dist
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+          echo "== published artifacts =="
+          cat SHA256SUMS
+
+      # Signed, verifiable provenance for each artifact via Sigstore keyless signing (no
+      # secrets to manage). Verify a download with:
+      #   gh attestation verify <file>.tar.gz --repo <owner>/<repo>
+      # Best-effort so a repo without the attestation entitlement still ships checksummed
+      # artifacts (the SHA256SUMS file is the always-present verifiable-checksum guarantee).
+      - name: Sign — build-provenance attestation (keyless)
+        uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            ## CommOS `commosd` — multi-architecture release
+
+            The single self-contained binary (CMOS-14-DEP-001), published for every
+            supported architecture with feature and behaviour parity
+            (CMOS-14-DEP-004 / CMOS-14-DEP-060).
+
+            | Architecture | libc | Target triple | Typical hardware |
+            |---|---|---|---|
+            | amd64 | glibc  | `x86_64-unknown-linux-gnu`      | servers, desktops |
+            | amd64 | static | `x86_64-unknown-linux-musl`     | containers, portable |
+            | arm64 | glibc  | `aarch64-unknown-linux-gnu`     | Raspberry Pi 4/5, ARM servers |
+            | arm64 | static | `aarch64-unknown-linux-musl`    | containers, portable |
+            | armv7 | glibc  | `armv7-unknown-linux-gnueabihf` | Raspberry Pi 2/3, Zero 2 W |
+
+            The **`musl`** builds are fully static — no glibc dependency, so they run on
+            any Linux of that architecture out of the box.
+
+            ### Verify a download
+            ```sh
+            # verifiable checksums
+            sha256sum -c SHA256SUMS --ignore-missing
+
+            # signed build provenance (Sigstore, keyless)
+            gh attestation verify commosd-*-<target>.tar.gz --repo ${{ github.repository }}
+            ```

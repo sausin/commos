@@ -72,6 +72,46 @@ python3 conformance/run.py               # validates contracts + spec consistenc
 
 The harness is the arbiter of "does this conform." See [`conformance/README.md`](conformance/README.md).
 
+## Building & releases
+
+The reference binary is deliberately pure-Rust in its cross-compilation-hostile
+dependencies (no OpenSSL, native-tls, or C codec libraries), so it builds for every
+target with a stock cross toolchain:
+
+```bash
+cd reference
+cargo build --release --bin commosd                                  # host
+cargo build --release --target aarch64-unknown-linux-gnu --bin commosd   # Raspberry Pi 4/5
+```
+
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR:
+build + test + `clippy -D warnings` on amd64, a compile-check for every published
+architecture, and the full test suite for arm64 under QEMU — the two-architecture
+conformance evidence the deployment contract requires (CMOS-14-DEP-060). Contract
+conformance runs separately in [`conformance.yml`](.github/workflows/conformance.yml).
+
+**Releases** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) are cut by
+pushing a `v*` tag. Every supported architecture is built, packaged, checksummed, signed
+with a keyless [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations),
+and attached to a GitHub Release (CMOS-14-DEP-004: amd64 + arm64 parity, signed verifiable
+checksums):
+
+```bash
+git tag v0.4.0 && git push origin v0.4.0
+```
+
+| Architecture | libc | Target triple | Typical hardware |
+|---|---|---|---|
+| amd64 | glibc  | `x86_64-unknown-linux-gnu`      | servers, desktops |
+| amd64 | static | `x86_64-unknown-linux-musl`     | containers, portable |
+| arm64 | glibc  | `aarch64-unknown-linux-gnu`     | Raspberry Pi 4/5, ARM servers |
+| arm64 | static | `aarch64-unknown-linux-musl`    | containers, portable |
+| armv7 | glibc  | `armv7-unknown-linux-gnueabihf` | Raspberry Pi 2/3, Zero 2 W |
+
+The `musl` builds are fully static — no glibc dependency, run on any Linux of that
+architecture out of the box, which is the single-self-contained-binary mandate
+(CMOS-14-DEP-001) at its strongest.
+
 ## Status
 
 This is **v0.4** — **contract-complete**. The foundational spine (Philosophy, Domain,

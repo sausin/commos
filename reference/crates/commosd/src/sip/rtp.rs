@@ -98,14 +98,9 @@ pub async fn bind_echo() -> std::io::Result<(u16, JoinHandle<()>)> {
     let port = sock.local_addr()?.port();
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
-        loop {
-            match sock.recv_from(&mut buf).await {
-                Ok((n, peer)) => {
-                    // Reflect the RTP packet straight back to the caller (echo).
-                    let _ = sock.send_to(&buf[..n], peer).await;
-                }
-                Err(_) => break,
-            }
+        // Reflect each RTP packet straight back to the caller (echo) until the socket errors.
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let _ = sock.send_to(&buf[..n], peer).await;
         }
     });
     Ok((port, handle))

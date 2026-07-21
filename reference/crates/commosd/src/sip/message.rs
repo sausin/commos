@@ -279,6 +279,8 @@ impl SipMessage {
     }
 
     /// The `tag` parameter of the From header (the originating dialog half-id).
+    // `from_` here names the SIP *From* header (peer of `to_tag`), not a type conversion.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_tag(&self) -> Option<String> {
         find_param(self.header("From")?, "tag")
     }
@@ -294,6 +296,8 @@ impl SipMessage {
     }
 
     /// Address-of-record from the From header.
+    // `from_` here names the SIP *From* header (peer of `to_aor`), not a type conversion.
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_aor(&self) -> Option<String> {
         self.header("From").map(uri_aor)
     }

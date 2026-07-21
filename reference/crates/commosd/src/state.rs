@@ -48,6 +48,9 @@ pub struct AppState {
 }
 
 impl AppState {
+    // A wiring constructor called exactly once from `main`; each argument is a distinct
+    // shared handle, so bundling them into a struct would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn Store>,
         routing: Routing,
