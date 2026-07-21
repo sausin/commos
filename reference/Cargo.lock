@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "commos-core"
-version = "0.4.0"
+version = "0.1.0"
 dependencies = [
  "regex-lite",
  "serde",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "commosd"
-version = "0.4.0"
+version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
