@@ -204,5 +204,6 @@ log "Test the call path:"
 echo "    • Dial your own number  → echo test (you hear yourself = signalling + audio OK)"
 echo "    • Dial another phone's extension → two-way call"
 echo
-warn "This is a LAN test bed: SIP/RTP are unencrypted and REGISTER is not yet authenticated —"
-warn "do NOT expose UDP $SIP_PORT to the internet. Open $SIP_PORT/udp and the RTP range to phones only."
+warn "LAN posture: SIP/RTP are unencrypted (no TLS/SRTP yet), so keep UDP $SIP_PORT off the public"
+warn "internet — open it and the RTP range to phones only. SIP digest auth is available: set"
+warn "\`require_sip_auth: true\` in $CONFIG once phones are onboarded (each gets a generated secret)."

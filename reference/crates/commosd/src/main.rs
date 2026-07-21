@@ -229,7 +229,15 @@ async fn run(cfg: Config) -> i32 {
             routing.clone(),
             cfg.media_ip,
             default_tenant,
+            store.clone(),
+            cfg.require_sip_auth,
+            cfg.sip_realm.clone(),
         );
+        if cfg.require_sip_auth {
+            tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
+        } else {
+            tracing::warn!("SIP digest auth: DISABLED (REGISTER accepted unauthenticated) — enable require_sip_auth before exposing SIP");
+        }
         tokio::spawn(async move {
             if let Err(e) = server.run(sip_addr).await {
                 tracing::error!("SIP ingress stopped: {e}");

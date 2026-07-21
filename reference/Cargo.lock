@@ -231,6 +231,7 @@ dependencies = [
  "base64",
  "commos-core",
  "hmac",
+ "md-5",
  "object_store",
  "serde",
  "serde_json",

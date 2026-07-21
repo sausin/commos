@@ -156,6 +156,14 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
 
+CREATE TABLE IF NOT EXISTS sip_credentials (
+    tenant_id  uuid NOT NULL,
+    username   text NOT NULL,
+    secret     text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, username)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
     key         text NOT NULL,
@@ -893,6 +901,25 @@ impl Store for PgStore {
             .bind(tenant.as_uuid()).bind(id.as_uuid())
             .execute(&self.pool).await.map_err(be)?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO sip_credentials (tenant_id, username, secret) VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, username) DO UPDATE SET secret = EXCLUDED.secret",
+        )
+        .bind(tenant.as_uuid()).bind(username).bind(secret)
+        .execute(&self.pool).await.map_err(be)?;
+        Ok(())
+    }
+    async fn get_sip_credential(&self, tenant: Uuid, username: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT secret FROM sip_credentials WHERE tenant_id = $1 AND username = $2")
+            .bind(tenant.as_uuid()).bind(username)
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        match row {
+            Some(r) => Ok(Some(r.try_get("secret").map_err(be)?)),
+            None => Ok(None),
+        }
     }
 
     async fn call_for_idempotency_key(

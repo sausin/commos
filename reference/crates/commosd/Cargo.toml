@@ -31,6 +31,9 @@ anyhow.workspace = true
 # deliberately NOT jsonwebtoken/ring/openssl).
 hmac = "0.12"
 sha2 = "0.10"
+# SIP digest authentication (RFC 3261 §22) mandates MD5 for interop with phones. Pure-Rust
+# RustCrypto, cross-compiles cleanly — used ONLY for the SIP challenge/response, never elsewhere.
+md-5 = "0.10"
 base64 = "0.22"
 
 # Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,

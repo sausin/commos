@@ -98,6 +98,7 @@ pub async fn apply(
         routes_created: built.routes.len(),
         extensions: built.extensions.iter().map(|e| e.number.clone()).collect(),
     };
+    let extension_numbers: Vec<String> = built.extensions.iter().map(|e| e.number.clone()).collect();
     st.store
         .commit(Tx {
             users: built.users,
@@ -108,6 +109,13 @@ pub async fn apply(
         })
         .await
         .map_err(|e| Problem::internal(e.to_string()))?;
+    // Mint each phone's SIP secret so they can authenticate and auto-provision.
+    for number in &extension_numbers {
+        st.provisioning
+            .ensure_credential(admin.tenant_id, number)
+            .await
+            .map_err(|e| Problem::internal(e.to_string()))?;
+    }
     Ok(Json(outcome))
 }
 

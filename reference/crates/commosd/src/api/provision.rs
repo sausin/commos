@@ -123,8 +123,18 @@ pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> 
     let registrar_host = st.media_ip.to_string();
     let registrar_port = st.sip_port;
 
-    // 5. Render the vendor-specific config (format + Content-Type depend on the vendor).
-    let (content_type, body) = render(&vendor, &account.number, &registrar_host, registrar_port);
+    // 5. The phone's SIP secret — the real per-device credential minted during provisioning.
+    //    Falls back to the placeholder only if none was generated (e.g. a hand-made extension).
+    let secret = st
+        .store
+        .get_sip_credential(tenant, &account.number)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| PLACEHOLDER_SECRET.to_string());
+
+    // 6. Render the vendor-specific config (format + Content-Type depend on the vendor).
+    let (content_type, body) = render(&vendor, &account.number, &secret, &registrar_host, registrar_port);
     text_with(StatusCode::OK, content_type, body)
 }
 
@@ -193,24 +203,23 @@ async fn find_account(
 ///
 /// The SIP password is the `CHANGEME` placeholder — per-device secrets are not stored yet and
 /// arrive in Volume 9.
-fn render(vendor: &str, ext_number: &str, registrar: &str, port: u16) -> (String, String) {
+fn render(vendor: &str, ext_number: &str, secret: &str, registrar: &str, port: u16) -> (String, String) {
     let content_type = "text/plain; charset=utf-8".to_string();
     let body = match vendor {
-        "yealink" => render_yealink(ext_number, registrar, port),
-        "grandstream" => render_grandstream(ext_number, registrar, port),
+        "yealink" => render_yealink(ext_number, secret, registrar, port),
+        "grandstream" => render_grandstream(ext_number, secret, registrar, port),
         // polycom / unknown / no device / anything else → generic fallback.
-        _ => render_generic(ext_number, registrar, port),
+        _ => render_generic(ext_number, secret, registrar, port),
     };
     (content_type, body)
 }
 
 /// Yealink-style `.cfg` (`account.1.*` dotted keys). Yealink phones consume this format
 /// directly. Signature line: `account.1.sip_server.1.address`.
-fn render_yealink(ext_number: &str, registrar: &str, port: u16) -> String {
+fn render_yealink(ext_number: &str, secret: &str, registrar: &str, port: u16) -> String {
     format!(
         "#!version:1.0.0.1\n\
          # CommOS auto-provisioning config (Yealink)\n\
-         # Password is a placeholder; real per-device secrets come from Volume 9.\n\
          account.1.enable = 1\n\
          account.1.label = Ext {number}\n\
          account.1.display_name = Ext {number}\n\
@@ -222,7 +231,7 @@ fn render_yealink(ext_number: &str, registrar: &str, port: u16) -> String {
          account.1.sip_server.1.transport_type = 0\n\
          account.1.sip_server.1.expires = 3600\n",
         number = ext_number,
-        secret = PLACEHOLDER_SECRET,
+        secret = secret,
         registrar = registrar,
         port = port,
     )
@@ -232,12 +241,11 @@ fn render_yealink(ext_number: &str, registrar: &str, port: u16) -> String {
 /// (`P271`, `P35`, …) whose numbers vary by model; here we emit a readable, clearly-labelled
 /// `key = value` block using the common GS parameter names with their `P`-codes in comments,
 /// which a GS config tool / template can map. Signature line: `account.1.sip_server.address`.
-fn render_grandstream(ext_number: &str, registrar: &str, port: u16) -> String {
+fn render_grandstream(ext_number: &str, secret: &str, registrar: &str, port: u16) -> String {
     format!(
         "# CommOS auto-provisioning config (Grandstream)\n\
          # Grandstream devices provision from opaque Pxx value pairs (model-specific); this\n\
          # readable block names the common parameters with their P-codes for a GS template.\n\
-         # Password is a placeholder; real per-device secrets come from Volume 9.\n\
          account.1.active = 1                  # P271\n\
          account.1.name = Ext {number}         # P270 (account display name)\n\
          account.1.sip_userid = {number}       # P35  (SIP User ID)\n\
@@ -248,7 +256,7 @@ fn render_grandstream(ext_number: &str, registrar: &str, port: u16) -> String {
          account.1.sip_transport = 0           # P130 (0 = UDP)\n\
          account.1.register_expiration = 60    # P32  (minutes)\n",
         number = ext_number,
-        secret = PLACEHOLDER_SECRET,
+        secret = secret,
         registrar = registrar,
         port = port,
     )
@@ -257,7 +265,7 @@ fn render_grandstream(ext_number: &str, registrar: &str, port: u16) -> String {
 /// The original generic, vendor-neutral INI block — the fallback for polycom / unknown / no
 /// device. INI-style `key=value` with `#` comments, a shape most phones and config converters
 /// accept. Signature line: `[account]`.
-fn render_generic(ext_number: &str, registrar_host: &str, registrar_port: u16) -> String {
+fn render_generic(ext_number: &str, secret: &str, registrar_host: &str, registrar_port: u16) -> String {
     // Display name: the extension's own label is the MAC (the binding key), so it is a poor
     // human name; fall back to "Ext <number>".
     let display_name = format!("Ext {}", ext_number);
@@ -265,7 +273,6 @@ fn render_generic(ext_number: &str, registrar_host: &str, registrar_port: u16) -
         "# CommOS auto-provisioning config\n\
          # Generic, vendor-neutral form. Vendor-specific formats (Yealink/Grandstream) are\n\
          # served when the bound Device's vendor_key is known; a converter can map these keys.\n\
-         # Password is a placeholder; real per-device secrets come from Volume 9.\n\
          \n\
          [account]\n\
          # SIP username / auth identity — the Extension number bound to this device.\n\
@@ -283,7 +290,7 @@ fn render_generic(ext_number: &str, registrar_host: &str, registrar_port: u16) -
          register_expiry=3600\n\
          enabled=1\n",
         number = ext_number,
-        secret = PLACEHOLDER_SECRET,
+        secret = secret,
         display_name = display_name,
         registrar_host = registrar_host,
         registrar_port = registrar_port,
@@ -383,40 +390,42 @@ mod tests {
 
     #[test]
     fn render_yealink_has_signature_and_account() {
-        let (ct, body) = render("yealink", "1001", "10.0.0.5", 5060);
+        let (ct, body) = render("yealink", "1001", "s3cr3t", "10.0.0.5", 5060);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Yealink signature line.
         assert!(body.contains("account.1.sip_server.1.address = 10.0.0.5"));
         assert!(body.contains("account.1.user_name = 1001"));
         assert!(body.contains("account.1.sip_server.1.port = 5060"));
-        // Password is the placeholder, not a stored secret.
-        assert!(body.contains("account.1.password = CHANGEME"));
+        // The real per-device secret is served, not a placeholder.
+        assert!(body.contains("account.1.password = s3cr3t"));
     }
 
     #[test]
     fn render_grandstream_has_signature_and_pcodes() {
-        let (ct, body) = render("grandstream", "1002", "10.0.0.6", 5060);
+        let (ct, body) = render("grandstream", "1002", "s3cr3t", "10.0.0.6", 5060);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Grandstream signature line.
         assert!(body.contains("account.1.sip_server.address = 10.0.0.6"));
         assert!(body.contains("account.1.sip_userid = 1002"));
+        assert!(body.contains("account.1.password = s3cr3t"));
         // P-codes documented in comments.
         assert!(body.contains("P47"));
     }
 
     #[test]
     fn render_polycom_falls_back_to_generic() {
-        let (ct, body) = render("polycom", "1003", "10.0.0.7", 5060);
+        let (ct, body) = render("polycom", "1003", "s3cr3t", "10.0.0.7", 5060);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Generic signature: INI [account] section, not vendor-specific keys.
         assert!(body.contains("[account]"));
         assert!(body.contains("username=1003"));
+        assert!(body.contains("password=s3cr3t"));
         assert!(!body.contains("account.1."));
     }
 
     #[test]
     fn render_unknown_vendor_falls_back_to_generic() {
-        let (_ct, body) = render("unknown", "1004", "10.0.0.8", 5060);
+        let (_ct, body) = render("unknown", "1004", "s3cr3t", "10.0.0.8", 5060);
         assert!(body.contains("[account]"));
         assert!(body.contains("registrar=10.0.0.8"));
     }

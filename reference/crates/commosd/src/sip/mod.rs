@@ -4,15 +4,17 @@
 //! a PBX trunk) talk to CommOS. [`SipServer`] terminates SIP over UDP; [`message`] is the
 //! pure, unit-tested codec it uses.
 //!
-//! **What works today:** REGISTER is fully handled — a phone's REGISTER drives the
-//! [`crate::control::registrations::RegistrationRegistry`], so real endpoints register and
-//! become visible through the control plane and API. OPTIONS/BYE/CANCEL are answered;
-//! INVITE is acknowledged at the signalling layer only.
+//! **What works today:** REGISTER is fully handled — optionally gated by SIP digest auth
+//! ([`digest`]) — and drives the [`crate::control::registrations::RegistrationRegistry`], so
+//! real endpoints register and become visible through the control plane and API. INVITE
+//! creates an inbound Call, reports ring/answer, sets up an RTP path (echo, or a two-leg
+//! bridge to a registered callee), and answers `200 OK` with SDP. OPTIONS/BYE/CANCEL are
+//! answered; BYE produces the CDR.
 //!
-//! **What comes next:** INVITE→Call creation and RTP media negotiation sit behind the
-//! existing `MediaPlane` boundary and are the next step — the ingress deliberately does not
-//! reach across that boundary yet (see the TODO in [`server`]).
+//! **What comes next:** the B2BUA bridge is best-effort (see the `TODO(B2BUA)` in [`server`]);
+//! full mid-dialog correctness, PSTN trunking, and SRTP are the remaining media-plane work.
 
+pub mod digest;
 pub mod message;
 pub mod rtp;
 pub mod server;

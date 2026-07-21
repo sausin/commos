@@ -238,6 +238,22 @@ pub trait Store: Send + Sync {
     ) -> Result<Page<Object>, StoreError>;
     async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
+    /// SIP shared-secret credentials (Volume 9), keyed by `(tenant, sip username)`. Not a
+    /// frozen contract entity — a per-device secret used to authenticate SIP digest and served
+    /// (once) to the phone during provisioning. Stored as plaintext because the phone needs it;
+    /// a production deployment keeps it in the secrets manager and persists only the HA1.
+    async fn put_sip_credential(
+        &self,
+        tenant: Uuid,
+        username: &str,
+        secret: &str,
+    ) -> Result<(), StoreError>;
+    async fn get_sip_credential(
+        &self,
+        tenant: Uuid,
+        username: &str,
+    ) -> Result<Option<String>, StoreError>;
+
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(
         &self,

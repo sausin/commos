@@ -118,6 +118,22 @@ impl Provisioning {
         Ok(())
     }
 
+    /// Ensure a SIP shared secret exists for `username` (the extension number), generating and
+    /// storing one on first call. Returns the secret so the caller / provisioning can hand it
+    /// to the phone. Idempotent: an existing credential is returned unchanged.
+    pub async fn ensure_credential(
+        &self,
+        tenant: Uuid,
+        username: &str,
+    ) -> Result<String, ProvisioningError> {
+        if let Some(existing) = self.store.get_sip_credential(tenant, username).await? {
+            return Ok(existing);
+        }
+        let secret = gen_secret();
+        self.store.put_sip_credential(tenant, username, &secret).await?;
+        Ok(secret)
+    }
+
     fn event<P: EventPayload>(tenant: Uuid, payload: P, idem: String) -> serde_json::Value {
         let ctx = Correlation::root(tenant);
         Envelope::new(payload, &ctx, idem).to_json()
@@ -447,6 +463,8 @@ impl Provisioning {
             ..Default::default()
         })
         .await?;
+        // Mint the phone's SIP secret so it's ready to authenticate + be provisioned.
+        self.ensure_credential(tenant, &ext.number).await?;
         Ok(ext)
     }
 
@@ -555,6 +573,14 @@ impl Provisioning {
             Err(ProvisioningError::NotFound)
         }
     }
+}
+
+/// Generate a SIP shared secret. Derived from two UUIDv7s' random material — ample entropy
+/// for a device secret, hex so it survives any phone's password field. (A production system
+/// would use a dedicated CSPRNG and store only the HA1; documented in the store trait.)
+fn gen_secret() -> String {
+    let raw = format!("{}{}", Uuid::now_v7(), Uuid::now_v7());
+    raw.chars().filter(|c| c.is_ascii_hexdigit()).take(24).collect()
 }
 
 #[cfg(test)]

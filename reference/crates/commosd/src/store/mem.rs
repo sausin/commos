@@ -113,6 +113,8 @@ struct Inner {
     webhook_order: Vec<(Uuid, Uuid)>,
     objects: HashMap<(Uuid, Uuid), Object>,
     object_order: Vec<(Uuid, Uuid)>,
+    /// SIP shared secrets, keyed by (tenant, username).
+    sip_credentials: HashMap<(Uuid, String), String>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -668,6 +670,16 @@ impl Store for MemStore {
             g.object_order.retain(|k| k != &key);
         }
         Ok(removed)
+    }
+
+    async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        g.sip_credentials.insert((tenant, username.to_string()), secret.to_string());
+        Ok(())
+    }
+    async fn get_sip_credential(&self, tenant: Uuid, username: &str) -> Result<Option<String>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.sip_credentials.get(&(tenant, username.to_string())).cloned())
     }
 
     async fn call_for_idempotency_key(

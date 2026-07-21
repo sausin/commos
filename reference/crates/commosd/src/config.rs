@@ -28,6 +28,16 @@ pub struct Config {
     #[serde(default = "default_sip_listen")]
     pub sip_listen: Option<SocketAddr>,
 
+    /// Require SIP digest authentication on REGISTER (Volume 9). Default `false` so a LAN test
+    /// bed works with zero setup; set `true` to demand per-device credentials (generated during
+    /// provisioning) — do this before exposing SIP beyond a trusted network.
+    #[serde(default)]
+    pub require_sip_auth: bool,
+
+    /// SIP digest realm presented in the auth challenge. Default `commos`.
+    #[serde(default = "default_sip_realm")]
+    pub sip_realm: String,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
@@ -169,6 +179,8 @@ impl Default for Config {
             api_version: default_api_version(),
             listen: default_listen(),
             sip_listen: default_sip_listen(),
+            require_sip_auth: false,
+            sip_realm: default_sip_realm(),
             media_ip: default_media_ip(),
             jwt_secret: None,
             dev_tokens: default_true(),
@@ -209,6 +221,10 @@ fn default_s3_region() -> String {
 
 fn default_sip_listen() -> Option<SocketAddr> {
     Some("0.0.0.0:5060".parse().expect("valid default SIP addr"))
+}
+
+fn default_sip_realm() -> String {
+    "commos".to_string()
 }
 
 fn default_api_version() -> String {

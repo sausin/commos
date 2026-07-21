@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS webhooks     (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS webhooks_tenant_id_idx ON webhooks (tenant_id, id);
 CREATE TABLE IF NOT EXISTS objects      (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
+CREATE TABLE IF NOT EXISTS sip_credentials (tenant_id TEXT NOT NULL, username TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant_id, username));
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 "#;
@@ -495,6 +496,32 @@ impl Store for SqliteStore {
     }
     async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         self.delete_row("objects", tenant, id).await
+    }
+
+    async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO sip_credentials (tenant_id, username, secret) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(tenant_id, username) DO UPDATE SET secret = excluded.secret",
+        )
+        .bind(tenant.to_string())
+        .bind(username)
+        .bind(secret)
+        .execute(&self.pool)
+        .await
+        .map_err(be)?;
+        Ok(())
+    }
+    async fn get_sip_credential(&self, tenant: Uuid, username: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query("SELECT secret FROM sip_credentials WHERE tenant_id = ?1 AND username = ?2")
+            .bind(tenant.to_string())
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(be)?;
+        match row {
+            Some(r) => Ok(Some(r.try_get("secret").map_err(be)?)),
+            None => Ok(None),
+        }
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

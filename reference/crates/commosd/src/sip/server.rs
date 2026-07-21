@@ -25,6 +25,12 @@ use commos_core::common::{Timestamp, Uuid};
 use crate::control::registrations::{Registration, RegistrationRegistry};
 use crate::control::routing::Routing;
 use crate::media::MediaFact;
+use crate::store::Store;
+
+/// Current unix time in seconds (for nonce expiry).
+fn now_unix() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
 
 use super::message::{self, SipMessage};
 use super::rtp;
@@ -100,14 +106,26 @@ pub struct SipServer {
     /// Maps a bridged call's **callee-leg** Call-ID → its **caller-leg** (primary) Call-ID,
     /// so a BYE arriving on the callee leg can find and tear down the same dialog.
     bye_aliases: Arc<Mutex<HashMap<String, String>>>,
+    /// The durable store, for SIP digest credential lookup.
+    store: Arc<dyn Store>,
+    /// Require SIP digest auth on REGISTER/INVITE (Volume 9).
+    require_auth: bool,
+    /// Digest realm advertised in the auth challenge.
+    realm: String,
+    /// Nonces we have issued → their expiry (unix seconds). In-memory; a restart re-challenges.
+    nonces: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl SipServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registrations: RegistrationRegistry,
         routing: Routing,
         media_ip: IpAddr,
         default_tenant: Uuid,
+        store: Arc<dyn Store>,
+        require_auth: bool,
+        realm: impl Into<String>,
     ) -> Self {
         SipServer {
             registrations,
@@ -116,7 +134,71 @@ impl SipServer {
             default_tenant,
             dialogs: Arc::new(Mutex::new(HashMap::new())),
             bye_aliases: Arc::new(Mutex::new(HashMap::new())),
+            store,
+            require_auth,
+            realm: realm.into(),
+            nonces: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// How long a challenge nonce stays valid (seconds).
+    const NONCE_TTL: i64 = 300;
+
+    /// Issue a fresh nonce, remember it, and return it.
+    fn issue_nonce(&self) -> String {
+        let nonce: String = format!("{}{}", Uuid::now_v7(), Uuid::now_v7())
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(32)
+            .collect();
+        let exp = now_unix() + Self::NONCE_TTL;
+        let mut g = self.nonces.lock().expect("nonces mutex");
+        g.retain(|_, &mut e| e > now_unix());
+        g.insert(nonce.clone(), exp);
+        nonce
+    }
+
+    /// Whether `nonce` is one we issued and it hasn't expired.
+    fn nonce_known(&self, nonce: &str) -> bool {
+        let now = now_unix();
+        let mut g = self.nonces.lock().expect("nonces mutex");
+        g.retain(|_, &mut e| e > now);
+        g.get(nonce).is_some_and(|&e| e > now)
+    }
+
+    /// Verify the request's `Authorization` digest for `method` against the stored per-device
+    /// secret. Returns true only when the nonce is ours, the username has a credential, and the
+    /// response hash matches.
+    async fn digest_ok(&self, msg: &SipMessage, method: &str) -> bool {
+        let creds = match msg.header("Authorization").and_then(super::digest::Credentials::parse) {
+            Some(c) => c,
+            None => return false,
+        };
+        if !self.nonce_known(&creds.nonce) {
+            return false;
+        }
+        match self.store.get_sip_credential(self.default_tenant, &creds.username).await {
+            Ok(Some(secret)) => super::digest::verify(&creds, method, &secret),
+            _ => false,
+        }
+    }
+
+    /// Send a `401 Unauthorized` with a fresh digest challenge, prompting the phone to
+    /// re-send the request with an `Authorization` header.
+    async fn send_challenge(
+        &self,
+        socket: &UdpSocket,
+        msg: &SipMessage,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
+        let challenge = super::digest::Challenge::new(self.realm.clone(), self.issue_nonce());
+        let resp = message::response_with(
+            msg,
+            401,
+            "Unauthorized",
+            &[("WWW-Authenticate", challenge.header_value())],
+        );
+        self.send(socket, resp.as_bytes(), src).await
     }
 
     /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error.
@@ -188,6 +270,14 @@ impl SipServer {
         msg: &SipMessage,
         src: SocketAddr,
     ) -> std::io::Result<()> {
+        // Digest auth gate (Volume 9): an unauthenticated REGISTER is challenged with 401 +
+        // WWW-Authenticate; the phone re-sends with credentials we verify against its stored
+        // per-device secret.
+        if self.require_auth && !self.digest_ok(msg, "REGISTER").await {
+            tracing::info!(%src, "SIP REGISTER challenged (digest auth required)");
+            return self.send_challenge(socket, msg, src).await;
+        }
+
         let aor = match msg.register_aor() {
             Some(a) if !a.is_empty() => a,
             _ => {
@@ -238,6 +328,14 @@ impl SipServer {
             .unwrap_or_else(|| format!("sip:{}", src));
 
         tracing::info!(method = "INVITE", from = %from_ref, to = %to_ref, %src, "SIP INVITE");
+
+        // Digest auth gate: an unauthenticated INVITE is challenged with 401 before any Call is
+        // created; the phone re-sends with credentials. (REGISTER auth already limits who is
+        // reachable; challenging INVITE too stops direct unauthenticated dialing.)
+        if self.require_auth && !self.digest_ok(msg, "INVITE").await {
+            tracing::info!(%src, "SIP INVITE challenged (digest auth required)");
+            return self.send_challenge(socket, msg, src).await;
+        }
 
         // Provisional response.
         let trying = message::response(msg, 100, "Trying");
