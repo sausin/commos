@@ -87,7 +87,10 @@ list:
 
 - **Telephony** — SIP/UDP registration; inbound and API-originated calls; the full Call
   lifecycle (`INITIATED → RINGING → ANSWERED → …`); hold / resume / transfer / hangup; a two-leg
-  RTP bridge between registered phones (symmetric-RTP latching).
+  RTP bridge between registered phones (symmetric-RTP latching); SDP **codec negotiation**
+  (transparent pass-through of any codec for bridged/trunked calls; PCMU/PCMA for prompts).
+- **PSTN / SIP trunking** — outbound calls to a carrier gateway (with digest auth) and inbound
+  DID routing to any internal destination.
 - **Voicemail** — record-on-no-answer for internal extensions, message-waiting indication (MWI)
   pushed over SIP `NOTIFY`, and a retrieval API with audio playback.
 - **IVR & Call Flows** — a versioned `CallFlow` entity with **publish / rollback** over
@@ -129,7 +132,7 @@ Shipped ✓ · Partial ◐ · Planned ○
 | OIDC / SSO ○            | Messaging · Presence ◐    | Metrics / observability ✓    |
 | WebAuthn / MFA ○        | Video / WebRTC ○          | Event streaming ◐            |
 | Device identity ○       | Conferences ○             | Automation ○                 |
-| PIN / RFID / Bluetooth ○| PSTN / SIP trunking ○     | WASM plugins ○               |
+| PIN / RFID / Bluetooth ○| PSTN / SIP trunking ✓     | WASM plugins ○               |
 
 ## Architecture
 
@@ -175,11 +178,11 @@ inlined** (an inline secret is rejected at boot):
 
 ```yaml
 # pbx.yaml
-media_ip: "192.168.1.10"          # the address advertised to phones for RTP
-sip_listen: "0.0.0.0:5060"        # SIP/UDP ingress (null disables it)
-record_calls: true                # capture call audio as objects
-voicemail_enabled: true           # record-on-no-answer + MWI
-object_storage: "s3://my-bucket"  # local filesystem by default; any S3-compatible service
+media_ip: "192.168.1.10"                          # the address advertised to phones for RTP
+sip_listen: "0.0.0.0:5060"                        # SIP/UDP ingress (null disables it)
+record_calls: true                                # capture call audio as objects
+voicemail_enabled: true                           # record-on-no-answer + MWI
+object_storage: "s3://my-bucket"                  # local filesystem by default (any S3-compatible service)
 database_url: { ref_uri: "env://DATABASE_URL" }   # embedded SQLite if unset
 ```
 
