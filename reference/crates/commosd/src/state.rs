@@ -15,6 +15,7 @@ use crate::control::objects::ObjectService;
 use crate::control::provisioning::Provisioning;
 use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
+use crate::control::recordings::RecordingService;
 use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
 use crate::control::webhooks::WebhookService;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub webhooks: WebhookService,
     /// Object storage — recordings, voicemail, exports, diagnostics (blob + metadata).
     pub objects: ObjectService,
+    /// Call recordings — list/fetch captured audio and its metadata (Volume 7).
+    pub recordings: RecordingService,
     /// Prometheus metrics registry (scraped at `/metrics`).
     pub metrics: Metrics,
     /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
@@ -72,6 +75,7 @@ impl AppState {
         provisioning: Provisioning,
         webhooks: WebhookService,
         objects: ObjectService,
+        recordings: RecordingService,
         metrics: Metrics,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
@@ -91,6 +95,7 @@ impl AppState {
             provisioning,
             webhooks,
             objects,
+            recordings,
             metrics,
             agents,
             registrations,

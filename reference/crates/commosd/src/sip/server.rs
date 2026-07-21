@@ -22,6 +22,7 @@ use tokio::time::{timeout, Duration};
 
 use commos_core::common::{Timestamp, Uuid};
 
+use crate::control::recordings::RecordingService;
 use crate::control::registrations::{Registration, RegistrationRegistry};
 use crate::control::routing::Routing;
 use crate::media::MediaFact;
@@ -89,6 +90,9 @@ struct Dialog {
     media: Media,
     /// Present only for bridged (internal) calls; `None` for the echo path.
     callee: Option<CalleeLeg>,
+    /// Shared RTP capture buffer when recording is on; `None` when the call is not recorded.
+    /// On hangup the buffer's bytes are persisted as a [`Recording`].
+    capture: Option<rtp::Capture>,
 }
 
 /// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
@@ -114,6 +118,10 @@ pub struct SipServer {
     realm: String,
     /// Nonces we have issued → their expiry (unix seconds). In-memory; a restart re-challenges.
     nonces: Arc<Mutex<HashMap<String, i64>>>,
+    /// Record calls (Volume 7): capture the caller's RTP audio and persist it on hangup.
+    record_calls: bool,
+    /// Recording service used to store captured audio when `record_calls` is on.
+    recordings: RecordingService,
 }
 
 impl SipServer {
@@ -126,6 +134,8 @@ impl SipServer {
         store: Arc<dyn Store>,
         require_auth: bool,
         realm: impl Into<String>,
+        record_calls: bool,
+        recordings: RecordingService,
     ) -> Self {
         SipServer {
             registrations,
@@ -138,6 +148,8 @@ impl SipServer {
             require_auth,
             realm: realm.into(),
             nonces: Arc::new(Mutex::new(HashMap::new())),
+            record_calls,
+            recordings,
         }
     }
 
@@ -355,6 +367,15 @@ impl SipServer {
         };
         let call_id = call.base.id;
 
+        // When recording is on, all RTP payload for this call accumulates in this shared buffer
+        // (caller leg, header-stripped, as-is). It is threaded into whichever media path is set
+        // up below and drained into a Recording on hangup.
+        let capture: Option<rtp::Capture> = if self.record_calls {
+            Some(Arc::new(Mutex::new(Vec::new())))
+        } else {
+            None
+        };
+
         // SIP is the media plane here: report ring then answer as facts. Applied
         // synchronously (we hold the Routing handle) so the Call is ANSWERED before we send
         // 200 OK — a fast BYE then always finds an answered Call to hang up.
@@ -384,7 +405,7 @@ impl SipServer {
         // answer the caller (offering leg A). Any failure (no registered match, callee did not
         // answer) falls through to the echo path so the dial still completes.
         if let Some(callee_reg) = self.find_registered_callee(effective_uri) {
-            match self.try_bridge(&callee_reg, call_id).await {
+            match self.try_bridge(&callee_reg, call_id, capture.clone()).await {
                 Some((bridge, callee_leg)) => {
                     let leg_a_port = bridge.leg_a_port;
                     if !call_id_hdr.is_empty() {
@@ -395,6 +416,7 @@ impl SipServer {
                                 call_id,
                                 media: Media::Bridge(bridge),
                                 callee: Some(callee_leg),
+                                capture: capture.clone(),
                             },
                         );
                         // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
@@ -420,7 +442,7 @@ impl SipServer {
 
         // Echo path: non-registered destination (PSTN-style / +E.164), or the callee did not
         // answer. One UDP socket reflecting RTP back to the caller.
-        let rtp_port = match rtp::bind_echo().await {
+        let rtp_port = match rtp::bind_echo(capture.clone()).await {
             Ok((port, task)) => {
                 if !call_id_hdr.is_empty() {
                     self.dialogs.lock().expect("dialogs mutex").insert(
@@ -429,6 +451,7 @@ impl SipServer {
                             call_id,
                             media: Media::Echo(task),
                             callee: None,
+                            capture: capture.clone(),
                         },
                     );
                 } else {
@@ -492,8 +515,9 @@ impl SipServer {
         &self,
         callee: &Registration,
         call_id: Uuid,
+        capture: Option<rtp::Capture>,
     ) -> Option<(rtp::Bridge, CalleeLeg)> {
-        let bridge = match rtp::bind_bridge().await {
+        let bridge = match rtp::bind_bridge(capture).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind RTP bridge");
@@ -681,6 +705,24 @@ impl SipServer {
                         }
                     }
                     d.media.abort();
+                    // If recording was on, drain the captured audio and persist it (as-is, no
+                    // transcode). Done off the BYE path so the caller's 200 OK isn't delayed by
+                    // the object write.
+                    if let Some(cap) = &d.capture {
+                        let bytes = std::mem::take(&mut *cap.lock().expect("capture mutex"));
+                        if !bytes.is_empty() {
+                            let recordings = self.recordings.clone();
+                            let tenant = self.default_tenant;
+                            let call_id = d.call_id;
+                            let n = bytes.len();
+                            tokio::spawn(async move {
+                                match recordings.save(tenant, call_id, &bytes).await {
+                                    Ok(_) => tracing::info!(%call_id, bytes = n, "call recording saved"),
+                                    Err(e) => tracing::warn!(error = %e, %call_id, "saving call recording failed"),
+                                }
+                            });
+                        }
+                    }
                     if let Err(e) = self
                         .routing
                         .hangup(self.default_tenant, d.call_id, Some(method.clone()))

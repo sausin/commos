@@ -14,6 +14,7 @@ pub mod object;
 pub mod participant;
 pub mod presence_state;
 pub mod queue;
+pub mod recording;
 pub mod route;
 pub mod thread;
 pub mod user;

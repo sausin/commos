@@ -17,6 +17,7 @@ use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -113,6 +114,8 @@ struct Inner {
     webhook_order: Vec<(Uuid, Uuid)>,
     objects: HashMap<(Uuid, Uuid), Object>,
     object_order: Vec<(Uuid, Uuid)>,
+    recordings: HashMap<(Uuid, Uuid), Recording>,
+    recording_order: Vec<(Uuid, Uuid)>,
     /// SIP shared secrets, keyed by (tenant, username).
     sip_credentials: HashMap<(Uuid, String), String>,
     /// Idempotency ledger: (tenant, key) -> call id.
@@ -299,6 +302,12 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "Object", id: o.base.id.to_string(), expected: 0 });
             }
         }
+        for r in &tx.recordings {
+            let key = (r.base.tenant_id, r.base.id);
+            if g.recordings.contains_key(&key) || r.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Recording", id: r.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -386,6 +395,11 @@ impl Store for MemStore {
                 g.object_order.push(key);
             }
             g.objects.insert(key, o);
+        }
+        for r in tx.recordings {
+            let key = (r.base.tenant_id, r.base.id);
+            g.recording_order.push(key);
+            g.recordings.insert(key, r);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -670,6 +684,15 @@ impl Store for MemStore {
             g.object_order.retain(|k| k != &key);
         }
         Ok(removed)
+    }
+
+    async fn get_recording(&self, tenant: Uuid, id: Uuid) -> Result<Option<Recording>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.recordings.get(&(tenant, id)).cloned())
+    }
+    async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.recording_order, |k| g.recordings.get(k).cloned(), tenant, limit, cursor))
     }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {

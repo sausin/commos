@@ -164,6 +164,10 @@ async fn run(cfg: Config) -> i32 {
         Err(code) => return code,
     };
     let objects = control::objects::ObjectService::new(blob_store, store.clone(), signal.clone());
+    // Call recording (Volume 7): captured RTP audio is stored as-is on the object store and
+    // indexed by a Recording. Off by default; enabled per-deployment via `record_calls`.
+    let recordings =
+        control::recordings::RecordingService::new(objects.clone(), store.clone(), signal.clone());
     let metrics = metrics::Metrics::new();
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
@@ -232,11 +236,16 @@ async fn run(cfg: Config) -> i32 {
             store.clone(),
             cfg.require_sip_auth,
             cfg.sip_realm.clone(),
+            cfg.record_calls,
+            recordings.clone(),
         );
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
         } else {
             tracing::warn!("SIP digest auth: DISABLED (REGISTER accepted unauthenticated) — enable require_sip_auth before exposing SIP");
+        }
+        if cfg.record_calls {
+            tracing::info!("call recording: ENABLED (caller audio stored as-is on hangup)");
         }
         tokio::spawn(async move {
             if let Err(e) = server.run(sip_addr).await {
@@ -270,6 +279,7 @@ async fn run(cfg: Config) -> i32 {
         provisioning,
         webhooks,
         objects,
+        recordings,
         metrics.clone(),
         agents,
         registrations,

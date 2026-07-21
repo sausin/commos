@@ -38,6 +38,11 @@ pub struct Config {
     #[serde(default = "default_sip_realm")]
     pub sip_realm: String,
 
+    /// Record calls (Volume 7). When `true`, the caller's audio is captured as-is (no
+    /// transcoding) and stored as an `audio/basic` recording on hangup. Default `false`.
+    #[serde(default)]
+    pub record_calls: bool,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
@@ -181,6 +186,7 @@ impl Default for Config {
             sip_listen: default_sip_listen(),
             require_sip_auth: false,
             sip_realm: default_sip_realm(),
+            record_calls: false,
             media_ip: default_media_ip(),
             jwt_secret: None,
             dev_tokens: default_true(),

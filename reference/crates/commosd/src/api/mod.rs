@@ -22,6 +22,7 @@ pub mod presence;
 pub mod problem;
 pub mod provision;
 pub mod queues;
+pub mod recordings;
 pub mod registrations;
 pub mod threads;
 pub mod video_rooms;
@@ -127,7 +128,11 @@ pub fn router(state: AppState) -> Router {
         // Object storage — recordings, voicemail, exports, diagnostics (blob + metadata).
         .route("/objects", get(objects::list_objects).post(objects::upload_object))
         .route("/objects/:id", get(objects::get_object).delete(objects::delete_object))
-        .route("/objects/:id/content", get(objects::get_object_content));
+        .route("/objects/:id/content", get(objects::get_object_content))
+        // Call recordings — captured audio + metadata (read-only; produced by the SIP plane).
+        .route("/recordings", get(recordings::list_recordings))
+        .route("/recordings/:id", get(recordings::get_recording))
+        .route("/recordings/:id/content", get(recordings::get_recording_content));
 
     Router::new()
         .nest("/v1", v1)

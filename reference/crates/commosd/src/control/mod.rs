@@ -13,6 +13,7 @@ pub mod policy;
 pub mod provisioning;
 pub mod queue;
 pub mod rating;
+pub mod recordings;
 pub mod realtime;
 pub mod registrations;
 pub mod routing;

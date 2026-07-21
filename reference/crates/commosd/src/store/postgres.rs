@@ -21,6 +21,7 @@ use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -155,6 +156,12 @@ CREATE TABLE IF NOT EXISTS objects (
     created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS recordings (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS recordings_tenant_id_idx ON recordings (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS sip_credentials (
     tenant_id  uuid NOT NULL,
@@ -541,6 +548,9 @@ impl Store for PgStore {
         for o in &tx.objects {
             upsert(&mut dbtx, "objects", "Object", &o.base, &serde_json::to_value(o).map_err(be)?).await?;
         }
+        for r in &tx.recordings {
+            insert_v0(&mut dbtx, "recordings", &r.base, &serde_json::to_value(r).map_err(be)?, "Recording").await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -901,6 +911,18 @@ impl Store for PgStore {
             .bind(tenant.as_uuid()).bind(id.as_uuid())
             .execute(&self.pool).await.map_err(be)?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_recording(&self, tenant: Uuid, id: Uuid) -> Result<Option<Recording>, StoreError> {
+        let row = sqlx::query("SELECT data FROM recordings WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
+        let items = self.list_entities::<Recording>("recordings", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|r| r.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
     }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {

@@ -7,9 +7,33 @@
 //! aborting the task on BYE tears the media down.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
+
+/// A shared capture buffer for call recording. The RTP task appends the **payload** of each
+/// received packet (RTP header stripped) so the buffer is the raw audio bytes as-negotiated —
+/// no transcoding (Volume 7: store audio as-is; the consumer decodes). For G.711 (PCMU/PCMA)
+/// that is an 8 kHz mono stream a browser can decode client-side.
+pub type Capture = Arc<Mutex<Vec<u8>>>;
+
+/// Fixed RTP header length (no CSRC/extension — the common case for G.711 desk phones).
+const RTP_HEADER_LEN: usize = 12;
+/// Cap a single recording so a long/abandoned call can't exhaust memory (~35 min of G.711).
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Append one RTP packet's payload to the capture buffer, bounded by [`MAX_CAPTURE_BYTES`].
+fn capture_payload(cap: &Capture, packet: &[u8]) {
+    if packet.len() <= RTP_HEADER_LEN {
+        return;
+    }
+    let payload = &packet[RTP_HEADER_LEN..];
+    let mut buf = cap.lock().expect("capture mutex not poisoned");
+    if buf.len() + payload.len() <= MAX_CAPTURE_BYTES {
+        buf.extend_from_slice(payload);
+    }
+}
 
 /// A two-leg RTP relay bridging two call legs (CMOS-03-ARCH-021).
 ///
@@ -38,7 +62,7 @@ impl Bridge {
 
 /// Bind two ephemeral UDP sockets and relay RTP between them once each leg has latched onto
 /// its peer. Returns the two bound ports (to advertise in SDP) inside a [`Bridge`].
-pub async fn bind_bridge() -> std::io::Result<Bridge> {
+pub async fn bind_bridge(capture: Option<Capture>) -> std::io::Result<Bridge> {
     // Bind both legs on OS-assigned ports on all interfaces; SDP advertises the media IP.
     let leg_a = UdpSocket::bind("0.0.0.0:0").await?;
     let leg_b = UdpSocket::bind("0.0.0.0:0").await?;
@@ -59,6 +83,11 @@ pub async fn bind_bridge() -> std::io::Result<Bridge> {
                         if peer_a != Some(from) {
                             tracing::debug!(leg = "A", %from, "RTP bridge latched caller peer");
                             peer_a = Some(from);
+                        }
+                        // Record the caller's leg (mono G.711 as-is; full dual-channel/mixed
+                        // recording is future media-plane work).
+                        if let Some(cap) = &capture {
+                            capture_payload(cap, &buf_a[..n]);
                         }
                         if let Some(dst) = peer_b {
                             let _ = leg_b.send_to(&buf_a[..n], dst).await;
@@ -92,14 +121,18 @@ pub async fn bind_bridge() -> std::io::Result<Bridge> {
 
 /// Bind an ephemeral UDP socket for a Call's RTP and echo datagrams back to their sender.
 /// Returns the bound port (to advertise in SDP) and the task handle (abort on hangup).
-pub async fn bind_echo() -> std::io::Result<(u16, JoinHandle<()>)> {
+pub async fn bind_echo(capture: Option<Capture>) -> std::io::Result<(u16, JoinHandle<()>)> {
     // Bind all interfaces on an OS-assigned port; SDP advertises the configured media IP.
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     let port = sock.local_addr()?.port();
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
-        // Reflect each RTP packet straight back to the caller (echo) until the socket errors.
+        // Reflect each RTP packet straight back to the caller (echo) until the socket errors,
+        // capturing the caller's payload when recording is on.
         while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            if let Some(cap) = &capture {
+                capture_payload(cap, &buf[..n]);
+            }
             let _ = sock.send_to(&buf[..n], peer).await;
         }
     });
@@ -116,7 +149,7 @@ mod tests {
     /// packet A→B and B→A once each leg has latched onto its peer.
     #[tokio::test]
     async fn bridge_relays_both_directions() {
-        let bridge = bind_bridge().await.expect("bind bridge");
+        let bridge = bind_bridge(None).await.expect("bind bridge");
         let leg_a: SocketAddr = format!("127.0.0.1:{}", bridge.leg_a_port).parse().unwrap();
         let leg_b: SocketAddr = format!("127.0.0.1:{}", bridge.leg_b_port).parse().unwrap();
 
@@ -152,5 +185,39 @@ mod tests {
         assert_eq!(&buf[..n], b"hello-a");
 
         bridge.abort();
+    }
+
+    #[test]
+    fn capture_strips_rtp_header_and_caps() {
+        let cap: Capture = Arc::new(Mutex::new(Vec::new()));
+        // 12-byte header + 3-byte payload → only the payload is captured.
+        let mut pkt = vec![0u8; RTP_HEADER_LEN];
+        pkt.extend_from_slice(b"\x01\x02\x03");
+        capture_payload(&cap, &pkt);
+        assert_eq!(cap.lock().unwrap().as_slice(), b"\x01\x02\x03");
+        // A runt packet (header only, no payload) adds nothing.
+        capture_payload(&cap, &[0u8; RTP_HEADER_LEN]);
+        assert_eq!(cap.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn echo_captures_caller_payload() {
+        let cap: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (port, task) = bind_echo(Some(cap.clone())).await.unwrap();
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        // Send an RTP-shaped packet (12B header + payload); expect it echoed + captured.
+        let mut pkt = vec![0u8; RTP_HEADER_LEN];
+        pkt.extend_from_slice(b"AUDIO");
+        phone.send_to(&pkt, echo).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(1), phone.recv_from(&mut buf))
+            .await
+            .expect("echo timed out")
+            .expect("recv echo");
+        assert_eq!(&buf[..n], &pkt[..]);
+        // The captured buffer holds only the payload, header stripped.
+        assert_eq!(cap.lock().unwrap().as_slice(), b"AUDIO");
+        task.abort();
     }
 }

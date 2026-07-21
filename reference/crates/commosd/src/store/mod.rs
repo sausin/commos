@@ -31,6 +31,7 @@ use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -64,6 +65,8 @@ pub struct Tx {
     pub webhooks: Vec<Webhook>,
     /// Stored-object metadata (recordings, voicemail, exports, …); bytes live in the ObjectStore.
     pub objects: Vec<Object>,
+    /// Call recordings — a Call ↔ audio Object link.
+    pub recordings: Vec<Recording>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -237,6 +240,14 @@ pub trait Store: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Page<Object>, StoreError>;
     async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_recording(&self, tenant: Uuid, id: Uuid) -> Result<Option<Recording>, StoreError>;
+    async fn list_recordings(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Recording>, StoreError>;
 
     /// SIP shared-secret credentials (Volume 9), keyed by `(tenant, sip username)`. Not a
     /// frozen contract entity — a per-device secret used to authenticate SIP digest and served

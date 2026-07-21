@@ -31,6 +31,7 @@ use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::recording::Recording;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -70,6 +71,8 @@ CREATE TABLE IF NOT EXISTS webhooks     (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS webhooks_tenant_id_idx ON webhooks (tenant_id, id);
 CREATE TABLE IF NOT EXISTS objects      (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
+CREATE TABLE IF NOT EXISTS recordings   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS recordings_tenant_id_idx ON recordings (tenant_id, id);
 CREATE TABLE IF NOT EXISTS sip_credentials (tenant_id TEXT NOT NULL, username TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant_id, username));
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
@@ -360,6 +363,12 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(o).map_err(be)?;
             Self::upsert(&mut dbtx, "objects", "Object", &o.base, &data).await?;
         }
+        for r in &tx.recordings {
+            let data = serde_json::to_string(r).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "recordings", &r.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "Recording", id: r.base.id.to_string(), expected: 0 });
+            }
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -496,6 +505,13 @@ impl Store for SqliteStore {
     }
     async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         self.delete_row("objects", tenant, id).await
+    }
+
+    async fn get_recording(&self, tenant: Uuid, id: Uuid) -> Result<Option<Recording>, StoreError> {
+        self.get_one("recordings", tenant, id).await
+    }
+    async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
+        self.list("recordings", tenant, limit, cursor).await
     }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
