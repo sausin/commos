@@ -28,16 +28,18 @@
 //!
 //! All three are served as `text/plain; charset=utf-8` for the reference implementation.
 //!
-//! Vendor detection here is purely by `Device.vendor_key`. A real fleet also negotiates the
-//! vendor out-of-band — via the phone's `User-Agent` and the `Accept`/MIME type it advertises
-//! — and may hand back vendor-native MIME types; this reference keeps it to the stored key.
+//! Vendor detection prefers the bound `Device.vendor_key`, and falls back to the requesting
+//! phone's `User-Agent` when that key is missing or `unknown` (e.g. an OUI not yet in the
+//! onboarding table) — so a handset still gets its native config rather than the generic block.
+//! A real fleet may additionally negotiate the `Accept`/MIME type and hand back vendor-native
+//! MIME types; this reference keeps the body as plain text.
 //!
 //! ## Secrets
 //! The SIP password is a placeholder (`CHANGEME`): per-device credentials are not stored yet.
 //! Real per-device secrets (and their rotation) come from Volume 9.
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use commos_core::common::Uuid;
@@ -64,17 +66,33 @@ const PAGE_SIZE: usize = 200;
 /// case. We normalise it to 12 lowercase hex chars, find the Extension bound to it, and
 /// return a generic provisioning block. Panic-free: bad input → 404, store error → 500,
 /// both as plain text a phone's log can surface.
-pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> Response {
+pub async fn provision(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(file): Path<String>,
+) -> Response {
+    // The phone identifies itself in the request User-Agent (e.g. "Grandstream GXP2170 …",
+    // "Yealink SIP-T46S …"). We use it both to log which handset asked and as a vendor fallback
+    // when the bound Device's stored vendor is unknown (e.g. an OUI not yet in the table).
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // 1. Parse the MAC out of the requested filename.
     let mac = match normalize_mac(&file) {
         Some(m) => m,
         None => {
+            // Benign (favicon probes, path scans) but cheap to see; keep it at debug so it does
+            // not drown the log, while still being available when chasing a provisioning issue.
+            tracing::debug!(file = %file, "provisioning request ignored: filename is not a MAC address");
             return text(
                 StatusCode::NOT_FOUND,
                 format!("not a provisioning request: {file:?} is not a MAC address\n"),
             );
         }
     };
+    tracing::debug!(mac = %mac, "provisioning request received");
 
     let tenant = match Uuid::parse(DEV_TENANT) {
         Ok(t) => t,
@@ -91,6 +109,17 @@ pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> 
     let account = match find_account(&st, tenant, &mac).await {
         Ok(Some(ext)) => ext,
         Ok(None) => {
+            // A phone asked for a config but no extension is bound to its MAC. This is the most
+            // common provisioning failure — and it used to be invisible: the phone got a 404 and
+            // the daemon logged nothing. Warn (with the MAC) so it shows up in `journalctl -u
+            // commosd`, and point at the fix (align it in onboarding, or set the extension label).
+            tracing::warn!(
+                mac = %mac,
+                user_agent = ?user_agent,
+                "provisioning: no extension is bound to this MAC — the phone cannot auto-provision. \
+                 Align it in /onboarding (its number must be one that gets created), or set that \
+                 extension's label to the MAC. Returning 404."
+            );
             return text(
                 StatusCode::NOT_FOUND,
                 format!("no account provisioned for {mac}\n"),
@@ -116,9 +145,21 @@ pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> 
             None
         }
     };
-    let vendor = device
+    // Resolve the vendor: the bound Device's stored `vendor_key` first, but fall back to the
+    // request's User-Agent when that is missing or `unknown`. This is what makes a Grandstream
+    // whose OUI wasn't recognised at onboarding still get its native config instead of the
+    // generic INI block (which no desk phone can auto-provision from).
+    let stored_vendor = device
         .as_ref()
         .map(|d| d.vendor_key.clone())
+        .filter(|v| !v.trim().is_empty() && v != "unknown");
+    let vendor = stored_vendor
+        .or_else(|| {
+            user_agent
+                .as_deref()
+                .and_then(vendor_from_user_agent)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     // The display name shown on the phone's LCD: the assigned person's name (set from the
@@ -148,6 +189,15 @@ pub async fn provision(State(st): State<AppState>, Path(file): Path<String>) -> 
         &secret,
         &registrar_host,
         registrar_port,
+    );
+    tracing::info!(
+        mac = %mac,
+        extension = %account.number,
+        vendor = %vendor,
+        registrar = %registrar_host,
+        user_agent = ?user_agent,
+        "provisioning: served {vendor} config for {mac} → extension {}",
+        account.number
     );
     text_with(StatusCode::OK, content_type, body)
 }
@@ -283,29 +333,34 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
     )
 }
 
-/// Grandstream-style config. Real Grandstream provisioning uses opaque `P`-value pairs
-/// (`P271`, `P35`, …) whose numbers vary by model; here we emit a readable, clearly-labelled
-/// `key = value` block using the common GS parameter names with their `P`-codes in comments,
-/// which a GS config tool / template can map. Signature line: `account.1.sip_server.address`.
+/// Grandstream config — the **plain-text P-value file** a GXP/GRP/DP/HT handset actually
+/// auto-provisions from: `Pxxx = value` lines with `#` comments. (The previous readable
+/// `account.1.*` block was documentation, not a config the phone consumes — a phone fed that
+/// would fetch it and never register.) The account-1 P-codes are stable across the current GXP/
+/// GRP families: `P271` account active, `P270` account name (LCD label), `P3` display name
+/// (caller-ID), `P35` SIP User ID, `P36` Authenticate ID, `P34` Authenticate Password, `P47`
+/// SIP Server (the server port rides here as `host:port` — there is no separate per-account
+/// server-port code; `P40` is the phone's own local SIP port), `P130` SIP transport (`0` = UDP),
+/// and `P32` register expiration in **minutes**. Signature line: `P47 = <registrar>`.
 fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16) -> String {
+    // The SIP server field carries a non-default port as `host:port`; a standard 5060 is left
+    // bare so it matches what operators expect to see.
+    let sip_server = if port == 5060 { registrar.to_string() } else { format!("{registrar}:{port}") };
     format!(
-        "# CommOS auto-provisioning config (Grandstream)\n\
-         # Grandstream devices provision from opaque Pxx value pairs (model-specific); this\n\
-         # readable block names the common parameters with their P-codes for a GS template.\n\
-         account.1.active = 1                  # P271\n\
-         account.1.name = {display_name}       # P270 (account display name — shown on the LCD)\n\
-         account.1.sip_userid = {number}       # P35  (SIP User ID)\n\
-         account.1.authenticate_id = {number}  # P36  (Authenticate ID)\n\
-         account.1.password = {secret}         # P34  (Authenticate Password)\n\
-         account.1.sip_server.address = {registrar}  # P47  (SIP Server)\n\
-         account.1.sip_server.port = {port}    # SIP server port\n\
-         account.1.sip_transport = 0           # P130 (0 = UDP)\n\
-         account.1.register_expiration = 60    # P32  (minutes)\n",
-        number = ext_number,
+        "# CommOS auto-provisioning config (Grandstream, plain-text P-values)\n\
+         P271 = 1\n\
+         P270 = {display_name}\n\
+         P3 = {display_name}\n\
+         P35 = {number}\n\
+         P36 = {number}\n\
+         P34 = {secret}\n\
+         P47 = {sip_server}\n\
+         P130 = 0\n\
+         P32 = 60\n",
         display_name = display_name,
+        number = ext_number,
         secret = secret,
-        registrar = registrar,
-        port = port,
+        sip_server = sip_server,
     )
 }
 
@@ -355,6 +410,25 @@ fn text_with(status: StatusCode, content_type: String, body: String) -> Response
         body,
     )
         .into_response()
+}
+
+/// Best-effort vendor detection from a phone's HTTP `User-Agent`. Desk phones fetch their config
+/// with a vendor-identifying UA (e.g. `Grandstream GXP2170 1.0.11.34`, `Yealink SIP-T46S …`), so
+/// this recovers the vendor when the OUI wasn't recognised at onboarding. Returns a lowercase
+/// `vendor_key` matching what [`render`] dispatches on, or `None` when unrecognised.
+fn vendor_from_user_agent(ua: &str) -> Option<&'static str> {
+    let ua = ua.to_ascii_lowercase();
+    if ua.contains("yealink") {
+        Some("yealink")
+    } else if ua.contains("grandstream") {
+        Some("grandstream")
+    } else if ua.contains("fanvil") {
+        Some("fanvil")
+    } else if ua.contains("polycom") || ua.contains("poly") {
+        Some("polycom")
+    } else {
+        None
+    }
 }
 
 /// Normalise a provisioning filename to a canonical MAC: strip a trailing `.cfg`, lowercase,
@@ -448,17 +522,36 @@ mod tests {
     }
 
     #[test]
-    fn render_grandstream_has_signature_and_pcodes() {
+    fn render_grandstream_emits_real_pvalues() {
         let (ct, body) = render("grandstream", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060);
         assert_eq!(ct, "text/plain; charset=utf-8");
-        // Grandstream signature line.
-        assert!(body.contains("account.1.sip_server.address = 10.0.0.6"));
-        assert!(body.contains("account.1.sip_userid = 1002"));
-        assert!(body.contains("account.1.password = s3cr3t"));
-        // P-codes documented in comments.
-        assert!(body.contains("P47"));
-        // Display name on the account name (P270).
-        assert!(body.contains("account.1.name = Room 101"));
+        // Real Grandstream plain-text P-values the handset consumes — not the old readable block.
+        assert!(body.contains("P271 = 1")); // account active
+        assert!(body.contains("P35 = 1002")); // SIP User ID
+        assert!(body.contains("P36 = 1002")); // Authenticate ID
+        assert!(body.contains("P34 = s3cr3t")); // Authenticate Password
+        assert!(body.contains("P47 = 10.0.0.6")); // SIP Server (signature line)
+        assert!(body.contains("P270 = Room 101")); // account name (LCD label)
+        assert!(body.contains("P3 = Room 101")); // display name
+        // A standard 5060 is left bare (no host:port) on P47.
+        assert!(!body.contains("P47 = 10.0.0.6:5060"));
+        // Must not regress to the old, non-consumable account.1.* block.
+        assert!(!body.contains("account.1."));
+    }
+
+    #[test]
+    fn render_grandstream_appends_nonstandard_port_to_p47() {
+        let (_ct, body) = render("grandstream", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5070);
+        // A non-default SIP port rides on the server field as host:port.
+        assert!(body.contains("P47 = 10.0.0.6:5070"));
+    }
+
+    #[test]
+    fn vendor_detected_from_user_agent() {
+        assert_eq!(vendor_from_user_agent("Grandstream GXP2170 1.0.11.34"), Some("grandstream"));
+        assert_eq!(vendor_from_user_agent("Yealink SIP-T46S 66.85.0.5"), Some("yealink"));
+        assert_eq!(vendor_from_user_agent("Fanvil X4"), Some("fanvil"));
+        assert_eq!(vendor_from_user_agent("curl/8.0"), None);
     }
 
     #[test]
