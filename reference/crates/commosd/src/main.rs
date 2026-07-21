@@ -168,6 +168,10 @@ async fn run(cfg: Config) -> i32 {
     // indexed by a Recording. Off by default; enabled per-deployment via `record_calls`.
     let recordings =
         control::recordings::RecordingService::new(objects.clone(), store.clone(), signal.clone());
+    // Voicemail (Volume 7): a caller's audio captured when a callee does not answer, stored
+    // as-is on the object store and indexed by a Voicemail. Reuses the recording capture path.
+    let voicemails =
+        control::voicemail::VoicemailService::new(objects.clone(), store.clone(), signal.clone());
     let metrics = metrics::Metrics::new();
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
@@ -238,6 +242,8 @@ async fn run(cfg: Config) -> i32 {
             cfg.sip_realm.clone(),
             cfg.record_calls,
             recordings.clone(),
+            cfg.voicemail_enabled,
+            voicemails.clone(),
         );
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
@@ -246,6 +252,11 @@ async fn run(cfg: Config) -> i32 {
         }
         if cfg.record_calls {
             tracing::info!("call recording: ENABLED (caller audio stored as-is on hangup)");
+        }
+        if cfg.voicemail_enabled {
+            tracing::info!("voicemail: ENABLED (record-on-no-answer for internal extensions; MWI via SIP NOTIFY)");
+        } else {
+            tracing::info!("voicemail: DISABLED (no-answer falls back to the echo path)");
         }
         tokio::spawn(async move {
             if let Err(e) = server.run(sip_addr).await {
@@ -280,6 +291,7 @@ async fn run(cfg: Config) -> i32 {
         webhooks,
         objects,
         recordings,
+        voicemails,
         metrics.clone(),
         agents,
         registrations,

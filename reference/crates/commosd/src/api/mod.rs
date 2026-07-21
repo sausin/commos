@@ -26,6 +26,7 @@ pub mod recordings;
 pub mod registrations;
 pub mod threads;
 pub mod video_rooms;
+pub mod voicemail;
 pub mod webhooks;
 
 use axum::extract::State;
@@ -132,7 +133,13 @@ pub fn router(state: AppState) -> Router {
         // Call recordings — captured audio + metadata (read-only; produced by the SIP plane).
         .route("/recordings", get(recordings::list_recordings))
         .route("/recordings/:id", get(recordings::get_recording))
-        .route("/recordings/:id/content", get(recordings::get_recording_content));
+        .route("/recordings/:id/content", get(recordings::get_recording_content))
+        // Voicemails — captured audio + metadata (produced by the SIP plane on no-answer).
+        // Read/mark-read only; `POST /voicemails/:id/read` clears the message-waiting state.
+        .route("/voicemails", get(voicemail::list_voicemails))
+        .route("/voicemails/:id", get(voicemail::get_voicemail))
+        .route("/voicemails/:id/content", get(voicemail::get_voicemail_content))
+        .route("/voicemails/:id/read", post(voicemail::mark_voicemail_read));
 
     Router::new()
         .nest("/v1", v1)

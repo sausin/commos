@@ -36,6 +36,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -73,6 +74,8 @@ CREATE TABLE IF NOT EXISTS objects      (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
 CREATE TABLE IF NOT EXISTS recordings   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS recordings_tenant_id_idx ON recordings (tenant_id, id);
+CREATE TABLE IF NOT EXISTS voicemails   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS voicemails_tenant_id_idx ON voicemails (tenant_id, id);
 CREATE TABLE IF NOT EXISTS sip_credentials (tenant_id TEXT NOT NULL, username TEXT NOT NULL, secret TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant_id, username));
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
@@ -369,6 +372,11 @@ impl Store for SqliteStore {
                 return Err(StoreError::VersionConflict { entity: "Recording", id: r.base.id.to_string(), expected: 0 });
             }
         }
+        // Voicemails support version-aware update (the `read` flag versions forward).
+        for v in &tx.voicemails {
+            let data = serde_json::to_string(v).map_err(be)?;
+            Self::upsert(&mut dbtx, "voicemails", "Voicemail", &v.base, &data).await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -512,6 +520,13 @@ impl Store for SqliteStore {
     }
     async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
         self.list("recordings", tenant, limit, cursor).await
+    }
+
+    async fn get_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<Option<Voicemail>, StoreError> {
+        self.get_one("voicemails", tenant, id).await
+    }
+    async fn list_voicemails(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Voicemail>, StoreError> {
+        self.list("voicemails", tenant, limit, cursor).await
     }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {

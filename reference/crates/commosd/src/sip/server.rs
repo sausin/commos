@@ -25,6 +25,7 @@ use commos_core::common::{Timestamp, Uuid};
 use crate::control::recordings::RecordingService;
 use crate::control::registrations::{Registration, RegistrationRegistry};
 use crate::control::routing::Routing;
+use crate::control::voicemail::VoicemailService;
 use crate::media::MediaFact;
 use crate::store::Store;
 
@@ -83,6 +84,18 @@ struct CalleeLeg {
     cseq: u32,
 }
 
+/// The mailbox a voicemail dialog is recording for. Set on the no-answer / offline-callee
+/// path; on hangup the captured audio is stored as a [`Voicemail`] and a message-waiting
+/// indication is pushed to the phone.
+struct VoicemailBox {
+    /// Mailbox address-of-record (e.g. `sip:200@host`); its user-part keys the MWI summary.
+    aor: String,
+    /// Where to push the MWI NOTIFY as soon as the voicemail is stored — the phone's contact
+    /// `(address, request-URI)` — when the mailbox is currently registered. `None` for an
+    /// offline mailbox, whose MWI is delivered on its next REGISTER instead.
+    notify: Option<(SocketAddr, String)>,
+}
+
 /// Per-INVITE state, keyed by the SIP `Call-ID`, so BYE/CANCEL can find the Call and its
 /// media. For a bridged call, `callee` carries the second leg so a BYE tears down both sides.
 struct Dialog {
@@ -91,8 +104,12 @@ struct Dialog {
     /// Present only for bridged (internal) calls; `None` for the echo path.
     callee: Option<CalleeLeg>,
     /// Shared RTP capture buffer when recording is on; `None` when the call is not recorded.
-    /// On hangup the buffer's bytes are persisted as a [`Recording`].
+    /// On hangup the buffer's bytes are persisted as a [`Recording`] — or, when `voicemail`
+    /// is set, as a [`Voicemail`].
     capture: Option<rtp::Capture>,
+    /// Set when this dialog is a voicemail (the callee did not answer or is offline); drives
+    /// voicemail storage + MWI on hangup instead of ordinary call recording.
+    voicemail: Option<VoicemailBox>,
 }
 
 /// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
@@ -122,6 +139,10 @@ pub struct SipServer {
     record_calls: bool,
     /// Recording service used to store captured audio when `record_calls` is on.
     recordings: RecordingService,
+    /// Take a voicemail when an internal callee does not answer / is offline (Volume 7).
+    voicemail_enabled: bool,
+    /// Voicemail service used to store captured audio and drive the MWI summary.
+    voicemails: VoicemailService,
 }
 
 impl SipServer {
@@ -136,6 +157,8 @@ impl SipServer {
         realm: impl Into<String>,
         record_calls: bool,
         recordings: RecordingService,
+        voicemail_enabled: bool,
+        voicemails: VoicemailService,
     ) -> Self {
         SipServer {
             registrations,
@@ -150,6 +173,8 @@ impl SipServer {
             nonces: Arc::new(Mutex::new(HashMap::new())),
             record_calls,
             recordings,
+            voicemail_enabled,
+            voicemails,
         }
     }
 
@@ -318,7 +343,15 @@ impl SipServer {
         let contact_header = format!("<{contact}>;expires={expires}");
         let extra = [("Contact", contact_header), ("Expires", expires.to_string())];
         let resp = message::response_with(msg, 200, "OK", &extra);
-        self.send(socket, resp.as_bytes(), src).await
+        let sent = self.send(socket, resp.as_bytes(), src).await;
+
+        // A returning phone should light its message-waiting lamp: push MWI after the 200 OK
+        // if the mailbox has unheard voicemails. Skipped on de-register (expires=0) and when
+        // voicemail is off. Fire-and-forget, so the REGISTER response is never delayed.
+        if self.voicemail_enabled && expires > 0 {
+            self.maybe_notify_mwi(aor, contact);
+        }
+        sent
     }
 
     /// INVITE: create an inbound Call, report ring+answer facts, set up RTP echo, answer
@@ -402,8 +435,10 @@ impl SipServer {
 
         // If the (routed) request-URI names a REGISTERED endpoint, try to bridge the two legs:
         // bind a two-leg RTP relay, INVITE the callee (offering leg B), and on its 200 OK
-        // answer the caller (offering leg A). Any failure (no registered match, callee did not
-        // answer) falls through to the echo path so the dial still completes.
+        // answer the caller (offering leg A). A callee that never answers (or an internal
+        // extension that is offline) diverts to voicemail; a non-mailbox destination
+        // (PSTN-style / +E.164) falls through to the echo path so the dial still completes.
+        let mut voicemail_target: Option<VoicemailBox> = None;
         if let Some(callee_reg) = self.find_registered_callee(effective_uri) {
             match self.try_bridge(&callee_reg, call_id, capture.clone()).await {
                 Some((bridge, callee_leg)) => {
@@ -417,6 +452,7 @@ impl SipServer {
                                 media: Media::Bridge(bridge),
                                 callee: Some(callee_leg),
                                 capture: capture.clone(),
+                                voicemail: None,
                             },
                         );
                         // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
@@ -433,15 +469,67 @@ impl SipServer {
                         "SIP INVITE bridged to registered callee");
                     return self.send(socket, ok.as_bytes(), src).await;
                 }
+                None if self.voicemail_enabled => {
+                    // Rang but never answered → take a voicemail. MWI is pushed to the callee's
+                    // registered contact on hangup.
+                    let notify = resolve_contact_addr(&callee_reg.contact)
+                        .await
+                        .map(|addr| (addr, callee_reg.contact.clone()));
+                    tracing::info!(%call_id, mailbox = %callee_reg.aor,
+                        "registered callee did not answer; diverting to voicemail");
+                    voicemail_target = Some(VoicemailBox { aor: callee_reg.aor.clone(), notify });
+                }
                 None => {
                     tracing::warn!(%call_id, callee = %callee_reg.contact,
                         "registered callee did not answer within timeout; falling back to echo");
                 }
             }
+        } else if self.voicemail_enabled && routed_uri.is_some() {
+            // The dialled number is an internal extension (it resolves to a SIP endpoint) but
+            // no device is registered for it — the mailbox owner is offline. Take a voicemail;
+            // its MWI is delivered on the phone's next REGISTER.
+            tracing::info!(%call_id, mailbox = %effective_uri,
+                "internal extension is offline; diverting to voicemail");
+            voicemail_target = Some(VoicemailBox { aor: effective_uri.to_string(), notify: None });
         }
 
-        // Echo path: non-registered destination (PSTN-style / +E.164), or the callee did not
-        // answer. One UDP socket reflecting RTP back to the caller.
+        // Voicemail path: answer the caller and capture their audio — stored as a Voicemail on
+        // hangup — regardless of `record_calls` (a voicemail is always captured). Greeting/beep
+        // prompt playback is future work (it ties into the IVR prompt runtime); for now the
+        // caller is connected to a capturing echo, exactly as the recording path is.
+        if let Some(vmbox) = voicemail_target {
+            let vm_capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
+            let rtp_port = match rtp::bind_echo(Some(vm_capture.clone())).await {
+                Ok((port, task)) => {
+                    if !call_id_hdr.is_empty() {
+                        self.dialogs.lock().expect("dialogs mutex").insert(
+                            call_id_hdr,
+                            Dialog {
+                                call_id,
+                                media: Media::Echo(task),
+                                callee: None,
+                                capture: Some(vm_capture),
+                                voicemail: Some(vmbox),
+                            },
+                        );
+                    } else {
+                        task.abort();
+                    }
+                    port
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not bind RTP for voicemail; answering without media");
+                    0
+                }
+            };
+            let sdp = self.build_sdp(rtp_port);
+            let ok = self.build_invite_ok(msg, &sdp, call_id);
+            tracing::info!(%call_id, rtp_port, "SIP INVITE answered (voicemail)");
+            return self.send(socket, ok.as_bytes(), src).await;
+        }
+
+        // Echo path: non-mailbox destination (PSTN-style / +E.164), or a no-answer with
+        // voicemail disabled. One UDP socket reflecting RTP back to the caller.
         let rtp_port = match rtp::bind_echo(capture.clone()).await {
             Ok((port, task)) => {
                 if !call_id_hdr.is_empty() {
@@ -452,6 +540,7 @@ impl SipServer {
                             media: Media::Echo(task),
                             callee: None,
                             capture: capture.clone(),
+                            voicemail: None,
                         },
                     );
                 } else {
@@ -663,6 +752,68 @@ impl SipServer {
         }
     }
 
+    /// Persist captured caller audio as a call [`Recording`], fire-and-forget off the BYE path.
+    fn spawn_save_recording(&self, call_id: Uuid, bytes: Vec<u8>) {
+        let recordings = self.recordings.clone();
+        let tenant = self.default_tenant;
+        let n = bytes.len();
+        tokio::spawn(async move {
+            match recordings.save(tenant, call_id, &bytes).await {
+                Ok(_) => tracing::info!(%call_id, bytes = n, "call recording saved"),
+                Err(e) => tracing::warn!(error = %e, %call_id, "saving call recording failed"),
+            }
+        });
+    }
+
+    /// Persist captured caller audio as a [`Voicemail`] for `vmbox`, then push a message-waiting
+    /// indication to the mailbox's phone if it is registered — fire-and-forget off the BYE path.
+    fn spawn_save_voicemail(&self, call_id: Uuid, vmbox: VoicemailBox, bytes: Vec<u8>) {
+        let voicemails = self.voicemails.clone();
+        let tenant = self.default_tenant;
+        let media_ip = self.media_ip;
+        let n = bytes.len();
+        tokio::spawn(async move {
+            let vm = match voicemails.save(tenant, call_id, None, &bytes).await {
+                Ok(vm) => vm,
+                Err(e) => {
+                    tracing::warn!(error = %e, %call_id, "saving voicemail failed");
+                    return;
+                }
+            };
+            tracing::info!(%call_id, voicemail_id = %vm.base.id, bytes = n, mailbox = %vmbox.aor,
+                "voicemail saved");
+            // Push MWI to the mailbox's registered contact, if any (an offline mailbox gets its
+            // MWI on the phone's next REGISTER instead).
+            if let Some((addr, contact_uri)) = &vmbox.notify {
+                let number = user_part(&vmbox.aor).unwrap_or("");
+                let (new, old) = voicemails.mailbox_summary(tenant, number).await.unwrap_or((1, 0));
+                send_mwi_notify(*addr, contact_uri, &vmbox.aor, media_ip, new, old).await;
+            }
+        });
+    }
+
+    /// After a device (re-)registers, light its message-waiting lamp: if the mailbox for `aor`
+    /// has unheard voicemails, push an MWI NOTIFY to its fresh `contact`. Fire-and-forget so the
+    /// REGISTER `200 OK` is never delayed.
+    fn maybe_notify_mwi(&self, aor: String, contact: String) {
+        let voicemails = self.voicemails.clone();
+        let tenant = self.default_tenant;
+        let media_ip = self.media_ip;
+        tokio::spawn(async move {
+            let Some(number) = user_part(&aor) else { return };
+            let (new, old) = match voicemails.mailbox_summary(tenant, number).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if new == 0 {
+                return; // Nothing waiting — do not bother the phone.
+            }
+            if let Some(addr) = resolve_contact_addr(&contact).await {
+                send_mwi_notify(addr, &contact, &aor, media_ip, new, old).await;
+            }
+        });
+    }
+
     /// BYE/CANCEL: hang the Call up (produces the CDR), abort its RTP, and `200 OK`.
     async fn on_bye(
         &self,
@@ -705,22 +856,17 @@ impl SipServer {
                         }
                     }
                     d.media.abort();
-                    // If recording was on, drain the captured audio and persist it (as-is, no
-                    // transcode). Done off the BYE path so the caller's 200 OK isn't delayed by
-                    // the object write.
+                    // Drain the captured audio and persist it (as-is, no transcode), off the BYE
+                    // path so the caller's 200 OK isn't delayed by the object write. A voicemail
+                    // dialog stores a Voicemail and pushes MWI; otherwise, when call recording is
+                    // on, it stores a Recording.
                     if let Some(cap) = &d.capture {
                         let bytes = std::mem::take(&mut *cap.lock().expect("capture mutex"));
                         if !bytes.is_empty() {
-                            let recordings = self.recordings.clone();
-                            let tenant = self.default_tenant;
-                            let call_id = d.call_id;
-                            let n = bytes.len();
-                            tokio::spawn(async move {
-                                match recordings.save(tenant, call_id, &bytes).await {
-                                    Ok(_) => tracing::info!(%call_id, bytes = n, "call recording saved"),
-                                    Err(e) => tracing::warn!(error = %e, %call_id, "saving call recording failed"),
-                                }
-                            });
+                            match d.voicemail {
+                                Some(vmbox) => self.spawn_save_voicemail(d.call_id, vmbox, bytes),
+                                None => self.spawn_save_recording(d.call_id, bytes),
+                            }
                         }
                     }
                     if let Err(e) = self
@@ -824,6 +970,51 @@ fn user_part(uri: &str) -> Option<&str> {
     }
 }
 
+/// Push a message-waiting indication to a phone as an unsolicited SIP `NOTIFY` with an
+/// `application/simple-message-summary` body (RFC 3842). `addr`/`request_uri` are the phone's
+/// contact; `aor` is its mailbox. Fire-and-forget over a throwaway socket — a phone that does
+/// not implement MWI simply ignores it. (A full implementation would honour a prior
+/// SUBSCRIBE; the reference sends the summary unsolicited, which common desk phones accept.)
+async fn send_mwi_notify(
+    addr: SocketAddr,
+    request_uri: &str,
+    aor: &str,
+    media_ip: IpAddr,
+    new: u32,
+    old: u32,
+) {
+    let waiting = if new > 0 { "yes" } else { "no" };
+    // RFC 3842 §5: `Voice-Message: <new>/<old> (<new-urgent>/<old-urgent>)`.
+    let body = format!(
+        "Messages-Waiting: {waiting}\r\n\
+         Message-Account: {aor}\r\n\
+         Voice-Message: {new}/{old} (0/0)\r\n"
+    );
+    let ua = format!("<sip:commos@{media_ip}>");
+    let notify = message::request(
+        "NOTIFY",
+        request_uri,
+        &[
+            ("From", ua.clone()),
+            ("To", format!("<{aor}>")),
+            ("Event", "message-summary".to_string()),
+            ("Subscription-State", "active".to_string()),
+            ("Contact", ua),
+        ],
+        Some(("application/simple-message-summary", &body)),
+    );
+    match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(sock) => {
+            if let Err(e) = sock.send_to(notify.as_bytes(), addr).await {
+                tracing::debug!(error = %e, %addr, "sending MWI NOTIFY failed");
+            } else {
+                tracing::info!(%addr, mailbox = %aor, new, old, "sent MWI NOTIFY");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "could not bind socket for MWI NOTIFY"),
+    }
+}
+
 /// Resolve a contact URI (`sip:200@192.168.1.5:5060`) to the socket address to send requests
 /// to. Parses `host[:port]` (default port 5060), returning a literal IP directly and falling
 /// back to async DNS for hostnames. Best-effort: returns `None` if nothing resolves.
@@ -877,4 +1068,73 @@ fn extract_uri(value: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_part_extracts_and_rejects_domain_only() {
+        assert_eq!(user_part("sip:200@example.com"), Some("200"));
+        assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
+        assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
+        assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    /// Drive [`send_mwi_notify`] at a local UDP "phone" and assert the datagram is a
+    /// well-formed SIP `NOTIFY` carrying a correct `message-summary` body (RFC 3842).
+    #[tokio::test]
+    async fn mwi_notify_is_well_formed_message_summary() {
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_addr = phone.local_addr().unwrap();
+        let media_ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Two new, one old message for mailbox 200.
+        send_mwi_notify(phone_addr, "sip:200@127.0.0.1", "sip:200@host", media_ip, 2, 1).await;
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            phone.recv_from(&mut buf),
+        )
+        .await
+        .expect("MWI NOTIFY not received")
+        .expect("recv");
+
+        let msg = message::parse(&buf[..n]).expect("NOTIFY parses");
+        assert_eq!(msg.method(), Some("NOTIFY"));
+        assert_eq!(msg.header("Event"), Some("message-summary"));
+        assert_eq!(msg.header("Subscription-State"), Some("active"));
+        assert_eq!(msg.header("Content-Type"), Some("application/simple-message-summary"));
+        assert_eq!(msg.header("To"), Some("<sip:200@host>"));
+
+        let body = String::from_utf8_lossy(msg.body());
+        assert!(body.contains("Messages-Waiting: yes"), "body: {body}");
+        assert!(body.contains("Voice-Message: 2/1 (0/0)"), "body: {body}");
+        assert!(body.contains("Message-Account: sip:200@host"), "body: {body}");
+    }
+
+    /// When the mailbox is empty, the summary says "no" waiting messages.
+    #[tokio::test]
+    async fn mwi_notify_reports_no_waiting_when_empty() {
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_addr = phone.local_addr().unwrap();
+        let media_ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        send_mwi_notify(phone_addr, "sip:200@127.0.0.1", "sip:200@host", media_ip, 0, 0).await;
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            phone.recv_from(&mut buf),
+        )
+        .await
+        .expect("MWI NOTIFY not received")
+        .expect("recv");
+        let msg = message::parse(&buf[..n]).expect("NOTIFY parses");
+        let body = String::from_utf8_lossy(msg.body());
+        assert!(body.contains("Messages-Waiting: no"), "body: {body}");
+        assert!(body.contains("Voice-Message: 0/0 (0/0)"), "body: {body}");
+    }
 }

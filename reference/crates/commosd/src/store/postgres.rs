@@ -26,6 +26,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -162,6 +163,12 @@ CREATE TABLE IF NOT EXISTS recordings (
     created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS recordings_tenant_id_idx ON recordings (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS voicemails (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS voicemails_tenant_id_idx ON voicemails (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS sip_credentials (
     tenant_id  uuid NOT NULL,
@@ -551,6 +558,10 @@ impl Store for PgStore {
         for r in &tx.recordings {
             insert_v0(&mut dbtx, "recordings", &r.base, &serde_json::to_value(r).map_err(be)?, "Recording").await?;
         }
+        // Voicemails support version-aware update (the `read` flag versions forward).
+        for v in &tx.voicemails {
+            upsert(&mut dbtx, "voicemails", "Voicemail", &v.base, &serde_json::to_value(v).map_err(be)?).await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -921,6 +932,18 @@ impl Store for PgStore {
     }
     async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
         let items = self.list_entities::<Recording>("recordings", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|r| r.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<Option<Voicemail>, StoreError> {
+        let row = sqlx::query("SELECT data FROM voicemails WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_voicemails(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Voicemail>, StoreError> {
+        let items = self.list_entities::<Voicemail>("voicemails", tenant, limit, cursor).await?;
         let next_cursor = if items.len() == limit { items.last().map(|r| r.base.id.to_string()) } else { None };
         Ok(Page { items, next_cursor })
     }

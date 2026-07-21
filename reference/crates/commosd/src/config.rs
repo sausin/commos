@@ -43,6 +43,16 @@ pub struct Config {
     #[serde(default)]
     pub record_calls: bool,
 
+    /// Take a voicemail when an internal callee does not answer (Volume 7). When `true`
+    /// (the default — voicemail is a core PBX feature), a call to a registered extension that
+    /// rings unanswered, or to a known-but-offline extension, is answered by the platform,
+    /// the caller's audio is captured as-is, stored as a voicemail on hangup, and a
+    /// message-waiting indication (MWI) is pushed to the phone. External/PSTN destinations
+    /// (no mailbox) still fall through to the echo path. Set `false` to restore the plain
+    /// no-answer→echo behaviour.
+    #[serde(default = "default_true")]
+    pub voicemail_enabled: bool,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
@@ -187,6 +197,7 @@ impl Default for Config {
             require_sip_auth: false,
             sip_realm: default_sip_realm(),
             record_calls: false,
+            voicemail_enabled: true,
             media_ip: default_media_ip(),
             jwt_secret: None,
             dev_tokens: default_true(),

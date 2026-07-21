@@ -32,5 +32,6 @@ pub mod user_deactivated;
 pub mod user_suspended;
 pub mod user_updated;
 pub mod video_room_started;
+pub mod voicemail_received;
 pub mod webhook_delivered;
 pub mod webhook_delivery_failed;

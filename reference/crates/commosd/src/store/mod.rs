@@ -36,6 +36,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
 
 pub use mem::MemStore;
@@ -67,6 +68,8 @@ pub struct Tx {
     pub objects: Vec<Object>,
     /// Call recordings — a Call ↔ audio Object link.
     pub recordings: Vec<Recording>,
+    /// Voicemails — a mailbox ↔ audio Object link; the `read` flag versions forward.
+    pub voicemails: Vec<Voicemail>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -248,6 +251,14 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Recording>, StoreError>;
+
+    async fn get_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<Option<Voicemail>, StoreError>;
+    async fn list_voicemails(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Voicemail>, StoreError>;
 
     /// SIP shared-secret credentials (Volume 9), keyed by `(tenant, sip username)`. Not a
     /// frozen contract entity — a per-device secret used to authenticate SIP digest and served

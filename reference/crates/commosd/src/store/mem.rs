@@ -22,6 +22,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -116,6 +117,8 @@ struct Inner {
     object_order: Vec<(Uuid, Uuid)>,
     recordings: HashMap<(Uuid, Uuid), Recording>,
     recording_order: Vec<(Uuid, Uuid)>,
+    voicemails: HashMap<(Uuid, Uuid), Voicemail>,
+    voicemail_order: Vec<(Uuid, Uuid)>,
     /// SIP shared secrets, keyed by (tenant, username).
     sip_credentials: HashMap<(Uuid, String), String>,
     /// Idempotency ledger: (tenant, key) -> call id.
@@ -308,6 +311,18 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "Recording", id: r.base.id.to_string(), expected: 0 });
             }
         }
+        // Voicemails support in-place update (the `read` flag versions forward): a create is
+        // v0, an update carries the next version and the stored row must be exactly one behind.
+        for v in &tx.voicemails {
+            let key = (v.base.tenant_id, v.base.id);
+            if let Some(existing) = g.voicemails.get(&key) {
+                if v.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Voicemail", id: v.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if v.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Voicemail", id: v.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -400,6 +415,13 @@ impl Store for MemStore {
             let key = (r.base.tenant_id, r.base.id);
             g.recording_order.push(key);
             g.recordings.insert(key, r);
+        }
+        for v in tx.voicemails {
+            let key = (v.base.tenant_id, v.base.id);
+            if !g.voicemails.contains_key(&key) {
+                g.voicemail_order.push(key);
+            }
+            g.voicemails.insert(key, v);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -693,6 +715,15 @@ impl Store for MemStore {
     async fn list_recordings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Recording>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
         Ok(page_from(&g.recording_order, |k| g.recordings.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<Option<Voicemail>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.voicemails.get(&(tenant, id)).cloned())
+    }
+    async fn list_voicemails(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Voicemail>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.voicemail_order, |k| g.voicemails.get(k).cloned(), tenant, limit, cursor))
     }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
