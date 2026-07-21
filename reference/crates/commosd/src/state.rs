@@ -20,6 +20,7 @@ use crate::control::realtime::RealtimeService;
 use crate::control::recordings::RecordingService;
 use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
+use crate::control::trunking::TrunkingService;
 use crate::control::voicemail::VoicemailService;
 use crate::control::webhooks::WebhookService;
 use crate::introspect::RecentEvents;
@@ -37,6 +38,8 @@ pub struct AppState {
     /// Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
     pub call_flows: CallFlowService,
     pub ivrs: IvrService,
+    /// PSTN / SIP trunking — carriers, gateways, trunks (outbound), and inbound DIDs.
+    pub trunking: TrunkingService,
     /// Directory write path — people, phones, extensions, routes and their lifecycle.
     pub provisioning: Provisioning,
     /// Outbound webhook subscriptions (register/list/delete).
@@ -82,6 +85,7 @@ impl AppState {
         queues: QueueService,
         call_flows: CallFlowService,
         ivrs: IvrService,
+        trunking: TrunkingService,
         provisioning: Provisioning,
         webhooks: WebhookService,
         objects: ObjectService,
@@ -105,6 +109,7 @@ impl AppState {
             queues,
             call_flows,
             ivrs,
+            trunking,
             provisioning,
             webhooks,
             objects,

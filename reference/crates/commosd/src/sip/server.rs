@@ -21,8 +21,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use commos_core::common::{Timestamp, Uuid};
+use commos_core::entities::gateway::{Gateway, GatewayHealth, GatewayKind};
 use commos_core::entities::ivr::Ivr;
 
+use crate::control::dialplan;
 use crate::control::ivr::IvrService;
 use crate::control::objects::ObjectService;
 use crate::control::recordings::RecordingService;
@@ -166,6 +168,9 @@ pub struct SipServer {
     ivrs: IvrService,
     /// Object service — fetch an IVR's prompt audio Object for playback.
     objects: ObjectService,
+    /// Home country code (digits) used to classify a dialled number as external (E.164) for
+    /// outbound trunk routing and to normalise inbound DID numbers.
+    default_cc: String,
 }
 
 impl SipServer {
@@ -184,6 +189,7 @@ impl SipServer {
         voicemails: VoicemailService,
         ivrs: IvrService,
         objects: ObjectService,
+        default_cc: impl Into<String>,
     ) -> Self {
         SipServer {
             registrations,
@@ -202,6 +208,7 @@ impl SipServer {
             voicemails,
             ivrs,
             objects,
+            default_cc: default_cc.into(),
         }
     }
 
@@ -485,71 +492,121 @@ impl SipServer {
         let routed_uri = self.resolve_route(request_uri).await;
         let effective_uri = routed_uri.as_deref().unwrap_or(request_uri);
 
-        // An extension routing to `ivr:<id>` runs the IVR menu runtime: answer with SDP, play
-        // the prompt, and collect DTMF (the caller's audio is not recorded here).
-        if let Some(ivr_id) = self.resolve_ivr_target(request_uri).await {
+        // Inbound DID: an INVITE from a carrier to a provisioned external number is routed to its
+        // `destination_ref`. The effective target is that DID destination if matched, else the
+        // extension route, else the raw request-URI.
+        let did_dest = self.resolve_did(request_uri).await;
+        if did_dest.is_some() {
+            tracing::info!(%call_id, number = %request_uri, dest = ?did_dest, "inbound DID routed");
+        }
+        let target: String = did_dest.clone().unwrap_or_else(|| effective_uri.to_string());
+
+        // The target (from a DID or an extension route) may name an `ivr:<id>` menu: run the IVR
+        // runtime (answer with SDP, play the prompt, collect DTMF).
+        if let Some(ivr_id) = match ivr_id_of(&target) {
+            Some(id) => Some(id),
+            None => self.resolve_ivr_target(request_uri).await,
+        } {
             return self.answer_with_ivr(socket, msg, src, call_id, &call_id_hdr, ivr_id).await;
         }
 
-        // If the (routed) request-URI names a REGISTERED endpoint, try to bridge the two legs:
-        // bind a two-leg RTP relay, INVITE the callee (offering leg B), and on its 200 OK
-        // answer the caller (offering leg A). A callee that never answers (or an internal
-        // extension that is offline) diverts to voicemail; a non-mailbox destination
-        // (PSTN-style / +E.164) falls through to the echo path so the dial still completes.
         let mut voicemail_target: Option<VoicemailBox> = None;
-        if let Some(callee_reg) = self.find_registered_callee(effective_uri) {
-            match self.try_bridge(&callee_reg, call_id, capture.clone()).await {
-                Some((bridge, callee_leg)) => {
+        // A direct voicemail target (e.g. a DID → "voicemail").
+        if target == "voicemail" || target.starts_with("voicemail:") {
+            voicemail_target = Some(VoicemailBox { aor: target.clone(), notify: None });
+        }
+
+        // If the target names a REGISTERED endpoint, bridge the two legs: bind a two-leg RTP
+        // relay, INVITE the callee (offering leg B), and on its 200 OK answer the caller
+        // (offering leg A). A callee that never answers (or an internal extension that is
+        // offline) diverts to voicemail.
+        if voicemail_target.is_none() {
+            if let Some(callee_reg) = find_registered(&self.registrations, self.default_tenant, &target) {
+                match self.try_bridge(&callee_reg, call_id, capture.clone()).await {
+                    Some((bridge, callee_leg)) => {
+                        let leg_a_port = bridge.leg_a_port;
+                        if !call_id_hdr.is_empty() {
+                            let callee_call_id = callee_leg.call_id.clone();
+                            self.dialogs.lock().expect("dialogs mutex").insert(
+                                call_id_hdr.clone(),
+                                Dialog {
+                                    call_id,
+                                    media: Media::Bridge(bridge),
+                                    callee: Some(callee_leg),
+                                    capture: capture.clone(),
+                                    voicemail: None,
+                                    info_tx: None,
+                                },
+                            );
+                            // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
+                            self.bye_aliases
+                                .lock()
+                                .expect("aliases mutex")
+                                .insert(callee_call_id, call_id_hdr.clone());
+                        } else {
+                            bridge.abort();
+                        }
+                        let sdp = self.build_sdp(leg_a_port);
+                        let ok = self.build_invite_ok(msg, &sdp, call_id);
+                        tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
+                            "SIP INVITE bridged to registered callee");
+                        return self.send(socket, ok.as_bytes(), src).await;
+                    }
+                    None if self.voicemail_enabled => {
+                        // Rang but never answered → take a voicemail. MWI is pushed to the
+                        // callee's registered contact on hangup.
+                        let notify = resolve_contact_addr(&callee_reg.contact)
+                            .await
+                            .map(|addr| (addr, callee_reg.contact.clone()));
+                        tracing::info!(%call_id, mailbox = %callee_reg.aor,
+                            "registered callee did not answer; diverting to voicemail");
+                        voicemail_target = Some(VoicemailBox { aor: callee_reg.aor.clone(), notify });
+                    }
+                    None => {
+                        tracing::warn!(%call_id, callee = %callee_reg.contact,
+                            "registered callee did not answer within timeout; falling back to echo");
+                    }
+                }
+            } else if self.voicemail_enabled && (routed_uri.is_some() || did_dest.is_some()) {
+                // The target is an internal endpoint (an extension route or a DID destination) but
+                // nobody is registered for it — the mailbox owner is offline. Take a voicemail; its
+                // MWI is delivered on the phone's next REGISTER.
+                tracing::info!(%call_id, mailbox = %target, "internal endpoint is offline; diverting to voicemail");
+                voicemail_target = Some(VoicemailBox { aor: target.clone(), notify: None });
+            }
+        }
+
+        // Outbound PSTN / SIP trunk: an external E.164 destination with a configured ONLINE SIP
+        // gateway is placed to the carrier and relayed (reuses the two-leg bridge). A caller
+        // dialling a real phone number reaches it. Falls through to echo if the trunk fails.
+        if voicemail_target.is_none() {
+            if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
+                if let Some((bridge, leg)) = self.try_trunk(&gateway, &e164, call_id, capture.clone()).await {
                     let leg_a_port = bridge.leg_a_port;
                     if !call_id_hdr.is_empty() {
-                        let callee_call_id = callee_leg.call_id.clone();
+                        let callee_call_id = leg.call_id.clone();
                         self.dialogs.lock().expect("dialogs mutex").insert(
                             call_id_hdr.clone(),
                             Dialog {
                                 call_id,
                                 media: Media::Bridge(bridge),
-                                callee: Some(callee_leg),
+                                callee: Some(leg),
                                 capture: capture.clone(),
                                 voicemail: None,
                                 info_tx: None,
                             },
                         );
-                        // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
-                        self.bye_aliases
-                            .lock()
-                            .expect("aliases mutex")
-                            .insert(callee_call_id, call_id_hdr);
+                        self.bye_aliases.lock().expect("aliases mutex").insert(callee_call_id, call_id_hdr.clone());
                     } else {
                         bridge.abort();
                     }
                     let sdp = self.build_sdp(leg_a_port);
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
-                    tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
-                        "SIP INVITE bridged to registered callee");
+                    tracing::info!(%call_id, %e164, gateway = ?gateway.address, "SIP INVITE routed outbound via trunk");
                     return self.send(socket, ok.as_bytes(), src).await;
                 }
-                None if self.voicemail_enabled => {
-                    // Rang but never answered → take a voicemail. MWI is pushed to the callee's
-                    // registered contact on hangup.
-                    let notify = resolve_contact_addr(&callee_reg.contact)
-                        .await
-                        .map(|addr| (addr, callee_reg.contact.clone()));
-                    tracing::info!(%call_id, mailbox = %callee_reg.aor,
-                        "registered callee did not answer; diverting to voicemail");
-                    voicemail_target = Some(VoicemailBox { aor: callee_reg.aor.clone(), notify });
-                }
-                None => {
-                    tracing::warn!(%call_id, callee = %callee_reg.contact,
-                        "registered callee did not answer within timeout; falling back to echo");
-                }
+                tracing::warn!(%call_id, %e164, "outbound trunk failed; falling back to echo");
             }
-        } else if self.voicemail_enabled && routed_uri.is_some() {
-            // The dialled number is an internal extension (it resolves to a SIP endpoint) but
-            // no device is registered for it — the mailbox owner is offline. Take a voicemail;
-            // its MWI is delivered on the phone's next REGISTER.
-            tracing::info!(%call_id, mailbox = %effective_uri,
-                "internal extension is offline; diverting to voicemail");
-            voicemail_target = Some(VoicemailBox { aor: effective_uri.to_string(), notify: None });
         }
 
         // Voicemail path: answer the caller and capture their audio — stored as a Voicemail on
@@ -645,8 +702,62 @@ impl SipServer {
     async fn resolve_ivr_target(&self, request_uri: &str) -> Option<Uuid> {
         let number = user_part(request_uri)?;
         let dest = self.routing.resolve_extension(self.default_tenant, number).await?;
-        let id = dest.strip_prefix("ivr:")?.trim();
-        Uuid::parse(id).ok()
+        ivr_id_of(&dest)
+    }
+
+    /// Resolve an inbound **DID**: if the dialled number (in E.164) is a provisioned DID, return
+    /// its `destination_ref` — where an inbound carrier call to this number is routed. `None`
+    /// when the request-URI is not a known external number for this tenant.
+    async fn resolve_did(&self, request_uri: &str) -> Option<String> {
+        let e164 = dialplan::normalize_e164(request_uri, &self.default_cc)?;
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_dids(self.default_tenant, 200, cursor).await.ok()?;
+            if let Some(did) = page.items.iter().find(|d| d.e164 == e164) {
+                return Some(did.destination_ref.clone());
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return None,
+            }
+        }
+    }
+
+    /// Select an outbound gateway for a **dialled target**: if it is an external E.164 number and
+    /// an `ONLINE` `SIP` gateway with an address exists, return `(gateway, e164)` to place the
+    /// call to the carrier. `None` for an internal target or when no usable gateway is configured.
+    async fn select_outbound_gateway(&self, target: &str) -> Option<(Gateway, String)> {
+        let e164 = dialplan::normalize_e164(target, &self.default_cc)?;
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_gateways(self.default_tenant, 200, cursor).await.ok()?;
+            if let Some(gw) = page.items.iter().find(|g| {
+                g.kind == GatewayKind::Sip
+                    && g.health == GatewayHealth::Online
+                    && g.address.as_deref().is_some_and(|a| !a.is_empty())
+            }) {
+                return Some((gw.clone(), e164));
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return None,
+            }
+        }
+    }
+
+    /// The digest credentials to authenticate to `carrier_id`'s carrier, from its Trunk's `auth`.
+    async fn trunk_credentials(&self, carrier_id: Uuid) -> Option<(String, String)> {
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_trunks(self.default_tenant, 200, cursor).await.ok()?;
+            if let Some(t) = page.items.iter().find(|t| t.carrier_id == carrier_id) {
+                return t.credentials();
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return None,
+            }
+        }
     }
 
     /// Load an IVR's prompt audio: the recorded prompt Object (μ-law) when set, else a short
@@ -838,17 +949,6 @@ impl SipServer {
         self.send(socket, ok.as_bytes(), src).await
     }
 
-    /// Find a registered callee whose AoR user-part matches the request-URI's user-part
-    /// (e.g. request-URI `sip:200@example.com` ↔ registration AoR `sip:200@host`). Returns
-    /// `None` for a domain-only URI or an unregistered destination (external `+E.164`).
-    fn find_registered_callee(&self, request_uri: &str) -> Option<Registration> {
-        let want = user_part(request_uri)?;
-        self.registrations
-            .list(self.default_tenant)
-            .into_iter()
-            .find(|r| user_part(&r.aor).is_some_and(|u| u.eq_ignore_ascii_case(want)))
-    }
-
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.
     ///
     /// Binds a two-leg [`rtp::Bridge`], sends an INVITE offering leg B to the callee's
@@ -977,6 +1077,157 @@ impl SipServer {
             to: callee_to,
             call_id: leg_call_id,
             cseq: cseq_num,
+        };
+        Some((bridge, leg))
+    }
+
+    /// Place an **outbound** call to the PSTN/SIP carrier via `gateway`, bridged to the caller.
+    ///
+    /// Binds a two-leg [`rtp::Bridge`], sends an INVITE to the gateway for `sip:<e164>@<gateway>`
+    /// offering leg B, and — if the carrier challenges with `401`/`407` — retries once with a
+    /// digest `Authorization`/`Proxy-Authorization` computed from the carrier's [`Trunk`] auth.
+    /// On a 2xx it ACKs and returns the live bridge + callee-leg state (so a BYE tears the trunk
+    /// leg down). Returns `None` (after aborting the bridge) on any failure.
+    ///
+    /// TODO(B2BUA): the outbound leg is best-effort like [`Self::try_bridge`]; full transaction
+    /// state / retransmission and codec negotiation with the carrier are future work.
+    async fn try_trunk(
+        &self,
+        gateway: &Gateway,
+        e164: &str,
+        call_id: Uuid,
+        capture: Option<rtp::Capture>,
+    ) -> Option<(rtp::Bridge, CalleeLeg)> {
+        let gw_address = gateway.address.as_deref()?;
+        let addr = match resolve_contact_addr(gw_address).await {
+            Some(a) => a,
+            None => {
+                tracing::warn!(gateway = %gw_address, "outbound trunk: gateway address unresolvable");
+                return None;
+            }
+        };
+        let bridge = rtp::bind_bridge(capture).await.ok()?;
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "outbound trunk: could not bind SIP socket");
+                bridge.abort();
+                return None;
+            }
+        };
+
+        // Request-URI toward the carrier, and outbound-leg dialog identifiers.
+        let request_uri = format!("sip:{e164}@{gw_address}");
+        let leg_call_id = format!("{}@commos-trunk", call_id.to_string().replace('-', ""));
+        let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
+        let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
+        let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
+        let cnonce = from_tag.clone();
+        let sdp = self.build_sdp(bridge.leg_b_port);
+        let creds = self.trunk_credentials(gateway.carrier_id).await;
+
+        // Send the INVITE, retrying once with digest auth if the carrier challenges.
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut auth: Option<(&str, String)> = None;
+        let mut resp = None;
+        for cseq in 1u32..=2 {
+            let mut headers = vec![
+                ("From", from_hdr.clone()),
+                ("To", format!("<{request_uri}>")),
+                ("Call-ID", leg_call_id.clone()),
+                ("CSeq", format!("{cseq} INVITE")),
+                ("Contact", contact_hdr.clone()),
+            ];
+            if let Some((name, value)) = &auth {
+                headers.push((name, value.clone()));
+            }
+            let invite = message::request("INVITE", &request_uri, &headers, Some(("application/sdp", &sdp)));
+            if sock.send_to(invite.as_bytes(), addr).await.is_err() {
+                bridge.abort();
+                return None;
+            }
+            let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
+                loop {
+                    let (n, _from) = sock.recv_from(&mut buf).await.ok()?;
+                    let m = match message::parse(&buf[..n]) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    match m.status() {
+                        Some(s) if (100..200).contains(&s) => continue,
+                        Some(s) => return Some((s, m)),
+                        None => continue,
+                    }
+                }
+            })
+            .await;
+            let (status, msg) = match answer {
+                Ok(Some(v)) => v,
+                _ => {
+                    bridge.abort();
+                    return None;
+                }
+            };
+            if (200..300).contains(&status) {
+                resp = Some(msg);
+                break;
+            }
+            // A challenge on the first attempt → compute digest auth and retry.
+            if (status == 401 || status == 407) && auth.is_none() {
+                let (chdr, ahdr) = if status == 407 {
+                    ("Proxy-Authenticate", "Proxy-Authorization")
+                } else {
+                    ("WWW-Authenticate", "Authorization")
+                };
+                match (msg.header(chdr).and_then(super::digest::parse_challenge), &creds) {
+                    (Some(challenge), Some((user, pass))) => {
+                        let value = super::digest::authorization_value(user, pass, "INVITE", &request_uri, &challenge, &cnonce);
+                        auth = Some((ahdr, value));
+                        continue;
+                    }
+                    _ => {
+                        tracing::warn!(gateway = %gw_address, status, "outbound trunk: auth required but no usable trunk credentials");
+                        bridge.abort();
+                        return None;
+                    }
+                }
+            }
+            tracing::info!(gateway = %gw_address, status, "outbound trunk: carrier rejected the call");
+            bridge.abort();
+            return None;
+        }
+        let resp = match resp {
+            Some(r) => r,
+            None => {
+                bridge.abort();
+                return None;
+            }
+        };
+
+        let callee_to = resp.header("To").map(str::to_string).unwrap_or_else(|| format!("<{request_uri}>"));
+        let callee_target = resp.header("Contact").and_then(extract_uri).unwrap_or_else(|| request_uri.clone());
+        let ack_cseq = if auth.is_some() { 2 } else { 1 };
+        let mut ack_headers = vec![
+            ("From", from_hdr.clone()),
+            ("To", callee_to.clone()),
+            ("Call-ID", leg_call_id.clone()),
+            ("CSeq", format!("{ack_cseq} ACK")),
+        ];
+        if let Some((name, value)) = &auth {
+            ack_headers.push((name, value.clone()));
+        }
+        let ack = message::request("ACK", &callee_target, &ack_headers, None);
+        let _ = sock.send_to(ack.as_bytes(), addr).await;
+        tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = bridge.leg_b_port,
+            "outbound trunk: call placed to carrier");
+
+        let leg = CalleeLeg {
+            addr,
+            request_uri: callee_target,
+            from: from_hdr,
+            to: callee_to,
+            call_id: leg_call_id,
+            cseq: ack_cseq,
         };
         Some((bridge, leg))
     }
@@ -1237,6 +1488,11 @@ fn media_sdp(media_ip: IpAddr, port: u16) -> String {
         port = port,
         te = dtmf::TELEPHONE_EVENT_PT,
     )
+}
+
+/// Parse an `ivr:<uuidv7>` destination reference to the IVR id, else `None`.
+fn ivr_id_of(dest: &str) -> Option<Uuid> {
+    Uuid::parse(dest.trim().strip_prefix("ivr:")?.trim()).ok()
 }
 
 /// The dial-target user-part of an IVR `destination_ref` — leniently, since an option value may

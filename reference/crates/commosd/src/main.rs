@@ -158,6 +158,8 @@ async fn run(cfg: Config) -> i32 {
     // Routing programs (Volume 2/7): versioned CallFlows with publish/rollback, and IVR nodes.
     let call_flows = control::callflow::CallFlowService::new(store.clone(), signal.clone());
     let ivrs = control::ivr::IvrService::new(store.clone(), signal.clone());
+    // PSTN / SIP trunking (Volume 7): carriers, gateways, trunks (outbound), inbound DIDs.
+    let trunking = control::trunking::TrunkingService::new(store.clone(), signal.clone());
     let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
     let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
     // Object storage: local filesystem by default; S3-compatible when configured + built with
@@ -249,6 +251,7 @@ async fn run(cfg: Config) -> i32 {
             voicemails.clone(),
             ivrs.clone(),
             objects.clone(),
+            cfg.default_country_code.clone(),
         );
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
@@ -294,6 +297,7 @@ async fn run(cfg: Config) -> i32 {
         queues,
         call_flows,
         ivrs,
+        trunking,
         provisioning,
         webhooks,
         objects,

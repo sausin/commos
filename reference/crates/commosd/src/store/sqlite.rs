@@ -36,7 +36,11 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
+use commos_core::entities::carrier::Carrier;
+use commos_core::entities::did::Did;
+use commos_core::entities::gateway::Gateway;
 use commos_core::entities::ivr::Ivr;
+use commos_core::entities::trunk::Trunk;
 use commos_core::entities::video_room::VideoRoom;
 use commos_core::entities::voicemail::Voicemail;
 use commos_core::entities::webhook::Webhook;
@@ -67,6 +71,14 @@ CREATE INDEX IF NOT EXISTS call_flows_tenant_id_idx ON call_flows (tenant_id, id
 CREATE TABLE IF NOT EXISTS ivrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ivrs_tenant_id_idx ON ivrs (tenant_id, id);
 CREATE TABLE IF NOT EXISTS call_flow_revisions (tenant_id TEXT NOT NULL, call_flow_id TEXT NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant_id, call_flow_id, version));
+CREATE TABLE IF NOT EXISTS carriers     (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS carriers_tenant_id_idx ON carriers (tenant_id, id);
+CREATE TABLE IF NOT EXISTS gateways     (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS gateways_tenant_id_idx ON gateways (tenant_id, id);
+CREATE TABLE IF NOT EXISTS trunks       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS trunks_tenant_id_idx ON trunks (tenant_id, id);
+CREATE TABLE IF NOT EXISTS dids         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS dids_tenant_id_idx ON dids (tenant_id, id);
 CREATE TABLE IF NOT EXISTS users        (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users (tenant_id, id);
 CREATE TABLE IF NOT EXISTS extensions   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
@@ -357,6 +369,22 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(iv).map_err(be)?;
             Self::upsert(&mut dbtx, "ivrs", "IVR", &iv.base, &data).await?;
         }
+        for c in &tx.carriers {
+            let data = serde_json::to_string(c).map_err(be)?;
+            Self::upsert(&mut dbtx, "carriers", "Carrier", &c.base, &data).await?;
+        }
+        for gw in &tx.gateways {
+            let data = serde_json::to_string(gw).map_err(be)?;
+            Self::upsert(&mut dbtx, "gateways", "Gateway", &gw.base, &data).await?;
+        }
+        for tk in &tx.trunks {
+            let data = serde_json::to_string(tk).map_err(be)?;
+            Self::upsert(&mut dbtx, "trunks", "Trunk", &tk.base, &data).await?;
+        }
+        for d in &tx.dids {
+            let data = serde_json::to_string(d).map_err(be)?;
+            Self::upsert(&mut dbtx, "dids", "DID", &d.base, &data).await?;
+        }
         // Immutable, append-only: a (flow, version) collision must never overwrite history.
         for r in &tx.call_flow_revisions {
             let data = serde_json::to_string(r).map_err(be)?;
@@ -547,6 +575,46 @@ impl Store for SqliteStore {
                 serde_json::from_str(&data).map_err(be)
             })
             .collect()
+    }
+
+    async fn get_carrier(&self, tenant: Uuid, id: Uuid) -> Result<Option<Carrier>, StoreError> {
+        self.get_one("carriers", tenant, id).await
+    }
+    async fn list_carriers(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Carrier>, StoreError> {
+        self.list("carriers", tenant, limit, cursor).await
+    }
+    async fn delete_carrier(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("carriers", tenant, id).await
+    }
+
+    async fn get_gateway(&self, tenant: Uuid, id: Uuid) -> Result<Option<Gateway>, StoreError> {
+        self.get_one("gateways", tenant, id).await
+    }
+    async fn list_gateways(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Gateway>, StoreError> {
+        self.list("gateways", tenant, limit, cursor).await
+    }
+    async fn delete_gateway(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("gateways", tenant, id).await
+    }
+
+    async fn get_trunk(&self, tenant: Uuid, id: Uuid) -> Result<Option<Trunk>, StoreError> {
+        self.get_one("trunks", tenant, id).await
+    }
+    async fn list_trunks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Trunk>, StoreError> {
+        self.list("trunks", tenant, limit, cursor).await
+    }
+    async fn delete_trunk(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("trunks", tenant, id).await
+    }
+
+    async fn get_did(&self, tenant: Uuid, id: Uuid) -> Result<Option<Did>, StoreError> {
+        self.get_one("dids", tenant, id).await
+    }
+    async fn list_dids(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Did>, StoreError> {
+        self.list("dids", tenant, limit, cursor).await
+    }
+    async fn delete_did(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("dids", tenant, id).await
     }
 
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {

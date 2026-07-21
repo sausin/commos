@@ -10,12 +10,16 @@ use axum::async_trait;
 use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::call_flow::{CallFlow, CallFlowRevision};
+use commos_core::entities::carrier::Carrier;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
+use commos_core::entities::did::Did;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::gateway::Gateway;
 use commos_core::entities::ivr::Ivr;
 use commos_core::entities::message::Message;
+use commos_core::entities::trunk::Trunk;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
@@ -111,6 +115,15 @@ struct Inner {
     ivr_order: Vec<(Uuid, Uuid)>,
     /// Immutable revisions keyed by (tenant, call_flow_id, version).
     call_flow_revisions: HashMap<(Uuid, Uuid, u64), CallFlowRevision>,
+    /// PSTN / SIP trunking tables, each with their own insertion-order index.
+    carriers: HashMap<(Uuid, Uuid), Carrier>,
+    carrier_order: Vec<(Uuid, Uuid)>,
+    gateways: HashMap<(Uuid, Uuid), Gateway>,
+    gateway_order: Vec<(Uuid, Uuid)>,
+    trunks: HashMap<(Uuid, Uuid), Trunk>,
+    trunk_order: Vec<(Uuid, Uuid)>,
+    dids: HashMap<(Uuid, Uuid), Did>,
+    did_order: Vec<(Uuid, Uuid)>,
     /// Provisioning (user/extension/device) tables.
     users: HashMap<(Uuid, Uuid), User>,
     user_order: Vec<(Uuid, Uuid)>,
@@ -275,6 +288,47 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "IVR", id: iv.base.id.to_string(), expected: 0 });
             }
         }
+        // Trunking config entities support version-aware update, like the other config entities.
+        for c in &tx.carriers {
+            let key = (c.base.tenant_id, c.base.id);
+            if let Some(existing) = g.carriers.get(&key) {
+                if c.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Carrier", id: c.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if c.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Carrier", id: c.base.id.to_string(), expected: 0 });
+            }
+        }
+        for gw in &tx.gateways {
+            let key = (gw.base.tenant_id, gw.base.id);
+            if let Some(existing) = g.gateways.get(&key) {
+                if gw.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Gateway", id: gw.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if gw.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Gateway", id: gw.base.id.to_string(), expected: 0 });
+            }
+        }
+        for tk in &tx.trunks {
+            let key = (tk.base.tenant_id, tk.base.id);
+            if let Some(existing) = g.trunks.get(&key) {
+                if tk.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Trunk", id: tk.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if tk.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Trunk", id: tk.base.id.to_string(), expected: 0 });
+            }
+        }
+        for d in &tx.dids {
+            let key = (d.base.tenant_id, d.base.id);
+            if let Some(existing) = g.dids.get(&key) {
+                if d.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "DID", id: d.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if d.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "DID", id: d.base.id.to_string(), expected: 0 });
+            }
+        }
         // CallFlow revisions are immutable and append-only: a (flow, version) collision is a
         // conflict (history is never rewritten).
         for r in &tx.call_flow_revisions {
@@ -427,6 +481,34 @@ impl Store for MemStore {
         }
         for r in tx.call_flow_revisions {
             g.call_flow_revisions.insert((r.tenant_id, r.call_flow_id, r.version), r);
+        }
+        for c in tx.carriers {
+            let key = (c.base.tenant_id, c.base.id);
+            if !g.carriers.contains_key(&key) {
+                g.carrier_order.push(key);
+            }
+            g.carriers.insert(key, c);
+        }
+        for gw in tx.gateways {
+            let key = (gw.base.tenant_id, gw.base.id);
+            if !g.gateways.contains_key(&key) {
+                g.gateway_order.push(key);
+            }
+            g.gateways.insert(key, gw);
+        }
+        for tk in tx.trunks {
+            let key = (tk.base.tenant_id, tk.base.id);
+            if !g.trunks.contains_key(&key) {
+                g.trunk_order.push(key);
+            }
+            g.trunks.insert(key, tk);
+        }
+        for d in tx.dids {
+            let key = (d.base.tenant_id, d.base.id);
+            if !g.dids.contains_key(&key) {
+                g.did_order.push(key);
+            }
+            g.dids.insert(key, d);
         }
         for u in tx.users {
             let key = (u.base.tenant_id, u.base.id);
@@ -717,6 +799,70 @@ impl Store for MemStore {
             .collect();
         revs.sort_by_key(|r| r.version);
         Ok(revs)
+    }
+
+    async fn get_carrier(&self, tenant: Uuid, id: Uuid) -> Result<Option<Carrier>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.carriers.get(&(tenant, id)).cloned())
+    }
+    async fn list_carriers(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Carrier>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.carrier_order, |k| g.carriers.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_carrier(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.carriers.remove(&key).is_some();
+        if removed { g.carrier_order.retain(|k| k != &key); }
+        Ok(removed)
+    }
+
+    async fn get_gateway(&self, tenant: Uuid, id: Uuid) -> Result<Option<Gateway>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.gateways.get(&(tenant, id)).cloned())
+    }
+    async fn list_gateways(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Gateway>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.gateway_order, |k| g.gateways.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_gateway(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.gateways.remove(&key).is_some();
+        if removed { g.gateway_order.retain(|k| k != &key); }
+        Ok(removed)
+    }
+
+    async fn get_trunk(&self, tenant: Uuid, id: Uuid) -> Result<Option<Trunk>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.trunks.get(&(tenant, id)).cloned())
+    }
+    async fn list_trunks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Trunk>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.trunk_order, |k| g.trunks.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_trunk(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.trunks.remove(&key).is_some();
+        if removed { g.trunk_order.retain(|k| k != &key); }
+        Ok(removed)
+    }
+
+    async fn get_did(&self, tenant: Uuid, id: Uuid) -> Result<Option<Did>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.dids.get(&(tenant, id)).cloned())
+    }
+    async fn list_dids(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Did>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.did_order, |k| g.dids.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_did(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.dids.remove(&key).is_some();
+        if removed { g.did_order.retain(|k| k != &key); }
+        Ok(removed)
     }
 
     async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {

@@ -147,6 +147,110 @@ fn unquote(value: &str) -> String {
     }
 }
 
+/// The fields of a server's `WWW-Authenticate` / `Proxy-Authenticate` Digest **challenge** that
+/// a client (UAC) needs to answer it — the mirror of [`Credentials`] on the client side.
+pub struct ChallengeParams {
+    pub realm: String,
+    pub nonce: String,
+    pub qop: Option<String>,
+}
+
+/// Parse a Digest challenge header value (as a carrier sends on `401`/`407`). Liberal in the
+/// same way as [`Credentials::parse`]. Returns `None` if `realm` or `nonce` is absent.
+pub fn parse_challenge(header_value: &str) -> Option<ChallengeParams> {
+    let body = {
+        let trimmed = header_value.trim();
+        match trimmed.get(..6) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("Digest") => trimmed[6..].trim_start(),
+            _ => trimmed,
+        }
+    };
+    let (mut realm, mut nonce, mut qop) = (None, None, None);
+    for pair in split_digest_params(body) {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "realm" => realm = Some(unquote(v.trim())),
+                "nonce" => nonce = Some(unquote(v.trim())),
+                "qop" => qop = Some(unquote(v.trim())),
+                _ => {}
+            }
+        }
+    }
+    Some(ChallengeParams { realm: realm?, nonce: nonce?, qop })
+}
+
+/// Build the `Authorization` / `Proxy-Authorization` header **value** answering a challenge, as
+/// a UAC authenticating to a carrier. Uses `qop=auth` with `nc=00000001` when the challenge
+/// offers it, else the legacy form. `cnonce` should be a per-request opaque token.
+#[allow(clippy::too_many_arguments)]
+pub fn authorization_value(
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    challenge: &ChallengeParams,
+    cnonce: &str,
+) -> String {
+    let use_qop = challenge
+        .qop
+        .as_deref()
+        .map(|q| q.split(',').any(|x| x.trim().eq_ignore_ascii_case("auth")))
+        .unwrap_or(false);
+    let (qop_opt, nc, cnonce_opt) = if use_qop {
+        (Some("auth"), Some("00000001"), Some(cnonce))
+    } else {
+        (None, None, None)
+    };
+    let response = compute_response(
+        username, &challenge.realm, password, method, uri, &challenge.nonce, qop_opt, nc, cnonce_opt,
+    );
+    let mut s = format!(
+        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", \
+         response=\"{response}\", algorithm=MD5",
+        realm = challenge.realm,
+        nonce = challenge.nonce,
+    );
+    if use_qop {
+        s.push_str(&format!(", qop=auth, nc=00000001, cnonce=\"{cnonce}\""));
+    }
+    s
+}
+
+#[cfg(test)]
+mod uac_tests {
+    use super::*;
+
+    #[test]
+    fn parses_challenge_and_builds_verifiable_authorization() {
+        // A carrier's 407 challenge.
+        let challenge = parse_challenge(
+            "Digest realm=\"carrier.net\", nonce=\"abc123\", qop=\"auth\", algorithm=MD5",
+        )
+        .unwrap();
+        assert_eq!(challenge.realm, "carrier.net");
+        assert_eq!(challenge.nonce, "abc123");
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
+
+        // Our UAC answer, then verify it the way a server would.
+        let hdr = authorization_value("acme", "s3cret", "INVITE", "sip:+14155550100@carrier.net", &challenge, "0a4f113b");
+        let creds = Credentials::parse(&hdr).unwrap();
+        assert_eq!(creds.username, "acme");
+        assert_eq!(creds.qop.as_deref(), Some("auth"));
+        assert!(verify(&creds, "INVITE", "s3cret"), "server should accept our digest");
+        // A wrong password does not verify.
+        assert!(!verify(&creds, "INVITE", "wrong"));
+    }
+
+    #[test]
+    fn legacy_challenge_without_qop_still_works() {
+        let challenge = parse_challenge("Digest realm=\"r\", nonce=\"n\"").unwrap();
+        assert!(challenge.qop.is_none());
+        let hdr = authorization_value("u", "p", "INVITE", "sip:x@y", &challenge, "cnonce");
+        let creds = Credentials::parse(&hdr).unwrap();
+        assert!(verify(&creds, "INVITE", "p"));
+    }
+}
+
 /// Lowercase hex MD5 of `input` — the primitive every Digest hash (`HA1`, `HA2`, the final
 /// response) is built from.
 fn md5_hex(input: &str) -> String {
