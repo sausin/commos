@@ -21,10 +21,11 @@
 //! at the bottom for what this defers.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::async_trait;
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::Json;
 
@@ -44,40 +45,85 @@ pub const ADMIN_DEV_TENANT: &str = "01920000-0000-7000-8000-000000000001";
 /// How long a freshly-minted admin session token stays valid (seconds). 12 hours.
 const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 
+/// Failed `/admin/login` attempts from one source IP before it is locked out.
+const MAX_LOGIN_FAILS: u32 = 5;
+/// How long a source IP is locked out after [`MAX_LOGIN_FAILS`] failures (seconds).
+const LOGIN_LOCKOUT_SECS: i64 = 300;
+
+/// Per-source-IP brute-force state for `/admin/login`.
+#[derive(Clone, Copy)]
+struct LoginAttempts {
+    fails: u32,
+    /// Unix seconds until which this IP is locked out (0 = not locked).
+    locked_until: i64,
+}
+
 /// Ephemeral admin authentication state, held on `AppState` by the hub.
 ///
-/// Cheap to clone (`Arc` handle over the session map). `password: None` means **dev mode** —
+/// Cheap to clone (`Arc` handles over the maps). `password_sha256: None` means **dev mode** —
 /// no admin password has been configured, so [`login`](Self::login) refuses to mint tokens
 /// and the extractor falls back to tenant-bearer auth.
 #[derive(Clone)]
 pub struct AdminAuth {
-    /// The configured admin password, or `None` in dev mode. Stored in the clear for the
-    /// MVP; hashing at rest is a documented follow-up (see module security notes).
-    password: Option<String>,
+    /// SHA-256 of the configured admin password, or `None` in dev mode. The plaintext is never
+    /// retained: login hashes its input and compares digests in constant time.
+    password_sha256: Option<[u8; 32]>,
     /// Live admin sessions: opaque token → expiry (unix seconds). In-memory only.
     sessions: Arc<Mutex<HashMap<String, i64>>>,
+    /// Per-source-IP failed-login tracking for brute-force lockout. In-memory only.
+    attempts: Arc<Mutex<HashMap<IpAddr, LoginAttempts>>>,
 }
 
 impl AdminAuth {
     /// Construct admin auth. `password: None` ⇒ dev mode (no admin password configured).
     pub fn new(password: Option<String>) -> Self {
         AdminAuth {
-            password,
+            password_sha256: password.map(|p| Sha256::digest(p.as_bytes()).into()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Whether admin auth is in dev mode (no password configured).
     pub fn is_dev_mode(&self) -> bool {
-        self.password.is_none()
+        self.password_sha256.is_none()
     }
 
-    /// Attempt a login. On a constant-time match against the configured password, mint a
+    /// Whether `ip` is currently locked out from logging in. Returns the seconds remaining if so.
+    /// Prunes expired lockouts lazily.
+    fn lockout_remaining(&self, ip: IpAddr) -> Option<i64> {
+        let now = now_unix();
+        let mut g = self.attempts.lock().expect("admin attempts mutex");
+        g.retain(|_, a| a.locked_until > now || a.fails > 0);
+        g.get(&ip)
+            .filter(|a| a.locked_until > now)
+            .map(|a| a.locked_until - now)
+    }
+
+    /// Record a failed login from `ip`, locking it out once [`MAX_LOGIN_FAILS`] is reached.
+    fn record_failure(&self, ip: IpAddr) {
+        let now = now_unix();
+        let mut g = self.attempts.lock().expect("admin attempts mutex");
+        let a = g.entry(ip).or_insert(LoginAttempts { fails: 0, locked_until: 0 });
+        a.fails = a.fails.saturating_add(1);
+        if a.fails >= MAX_LOGIN_FAILS {
+            a.locked_until = now + LOGIN_LOCKOUT_SECS;
+            a.fails = 0; // reset the counter; the lockout is the penalty now
+        }
+    }
+
+    /// Clear failed-attempt state for `ip` after a successful login.
+    fn record_success(&self, ip: IpAddr) {
+        self.attempts.lock().expect("admin attempts mutex").remove(&ip);
+    }
+
+    /// Attempt a login. On a constant-time match against the configured password hash, mint a
     /// fresh opaque token, store it with a 12h expiry, and return it. Returns `None` if no
     /// password is configured (dev mode) or the password does not match.
     pub fn login(&self, password: &str) -> Option<String> {
-        let configured = self.password.as_deref()?;
-        if !constant_time_eq(password, configured) {
+        let configured = self.password_sha256.as_ref()?;
+        let presented: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+        if !constant_time_eq_bytes(&presented, configured) {
             return None;
         }
         // Opaque 256-bit token from two UUIDv7s (getrandom-backed via the uuid crate);
@@ -226,6 +272,7 @@ pub struct LogoutResponse {
 /// already act as admin. A wrong password is `401`.
 pub async fn login<S>(
     State(state): State<S>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, Problem>
 where
@@ -238,12 +285,28 @@ where
              use a tenant/dev bearer token, which acts as admin in dev mode",
         ));
     }
+    // Brute-force lockout: after too many failures from one source IP, refuse further attempts
+    // for a cooldown window so the admin password cannot be guessed by unlimited online tries.
+    let ip = peer.ip();
+    if let Some(secs) = admin.lockout_remaining(ip) {
+        return Err(Problem::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            format!("too many failed login attempts; retry in {secs}s"),
+        ));
+    }
     match admin.login(&req.password) {
-        Some(token) => Ok(Json(LoginResponse {
-            token,
-            expires_in: SESSION_TTL_SECS,
-        })),
-        None => Err(Problem::unauthorized("invalid admin password")),
+        Some(token) => {
+            admin.record_success(ip);
+            Ok(Json(LoginResponse {
+                token,
+                expires_in: SESSION_TTL_SECS,
+            }))
+        }
+        None => {
+            admin.record_failure(ip);
+            Err(Problem::unauthorized("invalid admin password"))
+        }
     }
 }
 
@@ -284,18 +347,15 @@ fn now_unix() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
-/// Constant-time string equality.
-///
-/// Both inputs are hashed with SHA-256 (fixed 32-byte digests) and the digests compared with
-/// no early exit. Hashing first means neither the comparison time nor the loop bound leaks
-/// the configured password's length — length would otherwise be a side channel on a raw
-/// byte-by-byte compare.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let ha = Sha256::digest(a.as_bytes());
-    let hb = Sha256::digest(b.as_bytes());
+/// Constant-time equality of two equal-length byte slices (here, two SHA-256 digests). No early
+/// exit, so the comparison time does not leak how many leading bytes matched.
+fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
     let mut diff = 0u8;
-    for i in 0..ha.len() {
-        diff |= ha[i] ^ hb[i];
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
     }
     diff == 0
 }
@@ -391,11 +451,39 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_matches_semantics() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "abcd"));
-        assert!(constant_time_eq("", ""));
+    fn constant_time_eq_bytes_matches_semantics() {
+        assert!(constant_time_eq_bytes(b"abc", b"abc"));
+        assert!(!constant_time_eq_bytes(b"abc", b"abd"));
+        assert!(!constant_time_eq_bytes(b"abc", b"abcd"));
+        assert!(constant_time_eq_bytes(b"", b""));
+    }
+
+    #[test]
+    fn password_is_not_stored_in_plaintext() {
+        // The struct holds only a SHA-256 digest of the password, never the password itself.
+        let admin = AdminAuth::new(Some(PASSWORD.to_string()));
+        let expected: [u8; 32] = Sha256::digest(PASSWORD.as_bytes()).into();
+        assert_eq!(admin.password_sha256, Some(expected));
+        // A correct/incorrect password still logs in / is rejected via the hash comparison.
+        assert!(admin.login(PASSWORD).is_some());
+        assert!(admin.login("nope").is_none());
+    }
+
+    #[test]
+    fn login_locks_out_after_repeated_failures() {
+        let admin = AdminAuth::new(Some(PASSWORD.to_string()));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(admin.lockout_remaining(ip).is_none());
+        for _ in 0..MAX_LOGIN_FAILS {
+            admin.record_failure(ip);
+        }
+        // Now locked out with a positive cooldown.
+        assert!(admin.lockout_remaining(ip).is_some_and(|s| s > 0));
+        // A different IP is unaffected.
+        assert!(admin.lockout_remaining("203.0.113.8".parse().unwrap()).is_none());
+        // A success clears the state.
+        admin.record_success(ip);
+        assert!(admin.lockout_remaining(ip).is_none());
     }
 
     #[test]

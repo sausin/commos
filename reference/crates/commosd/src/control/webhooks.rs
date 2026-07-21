@@ -81,15 +81,28 @@ fn wants(subscribed: &[String], event_type: &str) -> bool {
     subscribed.iter().any(|t| t == "*" || t == event_type)
 }
 
+/// Outcome of resolving a webhook's signing secret.
+enum SecretResolution {
+    /// No secret is configured — the operator opted out of signing; deliver unsigned.
+    Unsigned,
+    /// The configured secret resolved.
+    Secret(String),
+    /// A secret IS configured but its reference could not be resolved. We must **not** fall back
+    /// to sending unsigned (a fail-open receiver would then accept a forgeable payload), so the
+    /// delivery is refused and recorded as a failure.
+    Unresolvable,
+}
+
 /// Resolve a webhook's signing secret from its reference (`env://`/`file://`), if set.
-/// A reference that fails to resolve yields `None` (the delivery goes out unsigned, logged).
-fn resolve_secret(secret_ref: &Option<String>) -> Option<String> {
-    let uri = secret_ref.as_ref()?;
+fn resolve_secret(secret_ref: &Option<String>) -> SecretResolution {
+    let Some(uri) = secret_ref.as_ref() else {
+        return SecretResolution::Unsigned;
+    };
     match (SecretRef { ref_uri: uri.clone() }).resolve() {
-        Ok(s) => Some(s),
+        Ok(s) => SecretResolution::Secret(s),
         Err(e) => {
-            tracing::warn!(error = %e, "webhook secret reference did not resolve; delivering unsigned");
-            None
+            tracing::warn!(error = %e, "webhook signing secret did not resolve; refusing to deliver unsigned");
+            SecretResolution::Unresolvable
         }
     }
 }
@@ -126,7 +139,25 @@ async fn deliver_event(store: &Arc<dyn Store>, signal: &RelaySignal, event: &Eve
     };
 
     for w in hooks.into_iter().filter(|w| w.active && wants(&w.event_types, event_type)) {
-        let secret = resolve_secret(&w.secret_ref);
+        let secret = match resolve_secret(&w.secret_ref) {
+            SecretResolution::Unsigned => None,
+            SecretResolution::Secret(s) => Some(s),
+            SecretResolution::Unresolvable => {
+                // Fail closed: record a failure and skip the delivery rather than send unsigned.
+                let ev = webhook_failed_event(
+                    tenant,
+                    &w,
+                    delivered_event_id,
+                    "signing secret configured but could not be resolved; delivery refused",
+                );
+                if let Err(e) = store.commit(Tx { events: vec![ev], ..Default::default() }).await {
+                    tracing::warn!(error = %e, "recording webhook signing failure failed");
+                } else {
+                    signal.wake();
+                }
+                continue;
+            }
+        };
         let result = webhook_delivery::deliver(&w.url, secret.as_deref(), &body).await;
         let ev = build_result_event(tenant, &w, delivered_event_id, &result);
         // Record the delivery outcome through the outbox (at-least-once, EVT-014).
@@ -171,18 +202,30 @@ fn build_result_event(
             format!("{}:{}:WebhookDeliveryFailed", w.base.id, delivered_event_id),
         )
         .to_json(),
-        Err(e) => Envelope::new(
-            WebhookDeliveryFailed {
-                webhook_id: w.base.id,
-                delivered_event_id,
-                attempt: 1,
-                error: e.to_string(),
-            },
-            &ctx,
-            format!("{}:{}:WebhookDeliveryFailed", w.base.id, delivered_event_id),
-        )
-        .to_json(),
+        Err(e) => webhook_failed_event(tenant, w, delivered_event_id, &e.to_string()),
     }
+}
+
+/// Build a `WebhookDeliveryFailed` envelope with an explicit error string. Shared by the
+/// transport/HTTP failure path and the fail-closed "secret unresolvable" refusal.
+fn webhook_failed_event(
+    tenant: Uuid,
+    w: &Webhook,
+    delivered_event_id: Uuid,
+    error: &str,
+) -> serde_json::Value {
+    let ctx = Correlation::root(tenant);
+    Envelope::new(
+        WebhookDeliveryFailed {
+            webhook_id: w.base.id,
+            delivered_event_id,
+            attempt: 1,
+            error: error.to_string(),
+        },
+        &ctx,
+        format!("{}:{}:WebhookDeliveryFailed", w.base.id, delivered_event_id),
+    )
+    .to_json()
 }
 
 /// Run the webhook dispatcher: subscribe to the bus and deliver each event to matching

@@ -67,6 +67,14 @@ pub async fn create_message(
     if body.sender_ref.trim().is_empty() {
         return Err(Problem::bad_request("sender_ref is required"));
     }
+    // Bound client-supplied strings before they are persisted verbatim, so a caller cannot grow
+    // the store without limit with a single oversized field.
+    if body.sender_ref.len() > 512 {
+        return Err(Problem::bad_request("sender_ref must be at most 512 characters"));
+    }
+    if body.body.as_ref().is_some_and(|b| b.len() > 16 * 1024) {
+        return Err(Problem::bad_request("body must be at most 16384 characters"));
+    }
     let channel_id = Uuid::parse(&body.channel_id)
         .map_err(|_| Problem::bad_request("channel_id is not a valid UUIDv7"))?;
     let thread_id = match body.thread_id {

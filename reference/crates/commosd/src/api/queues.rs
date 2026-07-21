@@ -68,6 +68,13 @@ pub async fn create_queue(
     tenant: TenantContext,
     Json(body): Json<CreateQueue>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Bound the member set so a single request cannot store an unbounded blob.
+    if body.members.len() > 1024 {
+        return Err(Problem::bad_request("members must be at most 1024 entries"));
+    }
+    if body.members.iter().any(|m| m.len() > 512) {
+        return Err(Problem::bad_request("each member ref must be at most 512 characters"));
+    }
     let queue = st
         .queues
         .create_queue(

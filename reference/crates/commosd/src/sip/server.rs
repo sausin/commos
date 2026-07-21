@@ -629,9 +629,19 @@ impl SipServer {
         let reflect = offer.preferred_audio().unwrap_or_else(default_codec);
         tracing::info!(%call_id, endpoint_codec = %g711.sdp_name(), reflect_codec = %reflect.name, te_pt, "codecs negotiated");
 
-        // The caller's SDES key, if it offered SRTP — used to key the caller (leg A) side of a
-        // bridge/trunk and to answer the caller over RTP/SAVP.
-        let caller_crypto = self.caller_crypto(&body);
+        // Whether the INVITE arrived over a confidential (TLS) transport. SDES SRTP keying is
+        // only honoured on a secure transport — see `caller_crypto` — so the media key is never
+        // exposed in cleartext SDP over plain UDP.
+        let secure = resp.is_secure();
+        if !secure && self.srtp_enabled && sdes::offers_savp(&body) {
+            tracing::warn!(%call_id, %src,
+                "caller offered SRTP/SAVP over a non-TLS transport; answering plain RTP (SDES key \
+                 would otherwise be exposed in cleartext SDP). Use SIPS to enable SRTP.");
+        }
+
+        // The caller's SDES key, if it offered SRTP over a secure transport — used to key the
+        // caller (leg A) side of a bridge/trunk and to answer the caller over RTP/SAVP.
+        let caller_crypto = self.caller_crypto(&body, secure);
 
         // Inbound DID: an INVITE from a carrier to a provisioned external number is routed to its
         // `destination_ref`. The effective target is that DID destination if matched, else the
@@ -764,7 +774,7 @@ impl SipServer {
             let vm_capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
             // Encrypt the voicemail media path when the caller offers SRTP: the capture stores the
             // decrypted G.711 (as before), only the wire is protected.
-            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body) {
+            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body, secure) {
                 Some((c, s)) => (Some(c), Some(s)),
                 None => (None, None),
             };
@@ -803,7 +813,7 @@ impl SipServer {
         // Echo path: non-mailbox destination (PSTN-style / +E.164), or a no-answer with
         // voicemail disabled. One UDP socket reflecting RTP back to the caller — decrypting then
         // re-encrypting each packet when the caller negotiated SRTP.
-        let (echo_crypto, echo_srtp) = match self.negotiate_srtp(&body) {
+        let (echo_crypto, echo_srtp) = match self.negotiate_srtp(&body, secure) {
             Some((c, s)) => (Some(c), Some(s)),
             None => (None, None),
         };
@@ -1589,15 +1599,18 @@ impl SipServer {
     /// `a=crypto` line to advertise back (a fresh CommOS key) and the [`srtp::SrtpSession`] that
     /// keys the media task — `inbound` from the caller's key, `outbound` from ours. `None` when
     /// SRTP is off or the caller offered plain RTP (which is then answered in the clear).
-    fn negotiate_srtp(&self, body: &str) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
-        Some(srtp_answer(&self.caller_crypto(body)?))
+    fn negotiate_srtp(&self, body: &str, secure: bool) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
+        Some(srtp_answer(&self.caller_crypto(body, secure)?))
     }
 
-    /// The caller's SDES key from its SDP `body`, when SRTP is enabled and the caller offered the
-    /// secure profile — the basis for keying the caller (leg A) side of a bridge/trunk or an
-    /// endpoint path. `None` for a plain-RTP caller (answered in the clear).
-    fn caller_crypto(&self, body: &str) -> Option<sdes::CryptoAttr> {
-        (self.srtp_enabled && sdes::offers_savp(body))
+    /// The caller's SDES key from its SDP `body`, when SRTP is enabled, the caller offered the
+    /// secure profile, AND the signalling arrived over a confidential (TLS) transport. SDES puts
+    /// the master key in the SDP, so accepting it over plaintext UDP would hand the key to any
+    /// passive observer of the signalling — no real confidentiality. Over cleartext transports we
+    /// therefore decline SRTP and answer plain RTP rather than pretend to encrypt. `None` for a
+    /// plain-RTP caller or an insecure transport.
+    fn caller_crypto(&self, body: &str, secure: bool) -> Option<sdes::CryptoAttr> {
+        (self.srtp_enabled && secure && sdes::offers_savp(body))
             .then(|| sdes::CryptoAttr::from_sdp(body))
             .flatten()
     }

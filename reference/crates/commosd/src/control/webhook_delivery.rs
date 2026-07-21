@@ -36,8 +36,12 @@ use tokio::time::timeout;
 /// as a [`DeliveryError::Timeout`].
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The header carrying the request-body signature when a `secret` is supplied.
+/// The header carrying the request signature when a `secret` is supplied.
 const SIGNATURE_HEADER: &str = "X-CommOS-Signature";
+
+/// The header carrying the signed unix-seconds timestamp. It is part of the signed material, so
+/// a receiver can enforce a freshness window and reject replays of a captured delivery.
+const TIMESTAMP_HEADER: &str = "X-CommOS-Timestamp";
 
 /// A successfully delivered webhook — i.e. the endpoint returned *a* well-formed HTTP response.
 ///
@@ -196,7 +200,16 @@ fn build_request(host: &str, port: u16, path: &str, secret: Option<&str>, body: 
     head.push_str("Connection: close\r\n");
 
     if let Some(secret) = secret {
-        let signature = sign(secret.as_bytes(), body);
+        // Sign over `<timestamp>.<body>` (not the body alone) and send the timestamp alongside,
+        // so a receiver enforcing a freshness window can reject a replayed delivery. The
+        // timestamp is bound into the MAC, so it cannot be altered without breaking the signature.
+        let ts = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut signed_input = Vec::with_capacity(body.len() + 16);
+        signed_input.extend_from_slice(ts.to_string().as_bytes());
+        signed_input.push(b'.');
+        signed_input.extend_from_slice(body);
+        let signature = sign(secret.as_bytes(), &signed_input);
+        head.push_str(&format!("{TIMESTAMP_HEADER}: {ts}\r\n"));
         head.push_str(&format!("{SIGNATURE_HEADER}: sha256={signature}\r\n"));
     }
 
@@ -400,7 +413,6 @@ mod tests {
 
         let secret = "topsecret";
         let body = br#"{"event":"call.completed"}"#;
-        let expected_sig = format!("sha256={}", sign(secret.as_bytes(), body));
 
         // A one-shot server: accept a single connection, read the request, assert the signature,
         // and reply 200. Runs concurrently with the client below.
@@ -420,10 +432,28 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&buf).to_lowercase();
-            let sig_line = format!("{}: {}", SIGNATURE_HEADER, expected_sig).to_lowercase();
+            // The signature now covers `<timestamp>.<body>`, so both headers must be present and
+            // the signature well-formed. Recompute it from the timestamp the request carried to
+            // prove the MAC binds the timestamp (a replay-defense receiver would do the same).
             assert!(
-                request.contains(&sig_line),
-                "signature header present and correct; got request:\n{}",
+                request.contains(&format!("{}: sha256=", SIGNATURE_HEADER).to_lowercase()),
+                "signature header present; got request:\n{}",
+                String::from_utf8_lossy(&buf)
+            );
+            let ts_hdr = format!("{}: ", TIMESTAMP_HEADER).to_lowercase();
+            let ts: i64 = request
+                .lines()
+                .find_map(|l| l.strip_prefix(&ts_hdr))
+                .and_then(|v| v.trim().parse().ok())
+                .expect("timestamp header present and numeric");
+            let mut signed_input = Vec::new();
+            signed_input.extend_from_slice(ts.to_string().as_bytes());
+            signed_input.push(b'.');
+            signed_input.extend_from_slice(body);
+            let expected = format!("sha256={}", sign(secret.as_bytes(), &signed_input));
+            assert!(
+                request.contains(&expected.to_lowercase()),
+                "signature binds the timestamp+body; got request:\n{}",
                 String::from_utf8_lossy(&buf)
             );
             assert!(request.contains("content-type: application/json"));

@@ -246,12 +246,24 @@ pub(crate) fn is_emergency(to_ref: &str) -> bool {
         (Some(open), Some(close)) if close > open => to_ref[open + 1..close].trim(),
         _ => to_ref.trim(),
     };
-    // Strip a URI scheme and any @host / ;params, leaving the user part.
+    // Strip a URI scheme, leaving `user[@host][;params]`.
     let after_scheme = addr
         .strip_prefix("sips:")
         .or_else(|| addr.strip_prefix("sip:"))
         .or_else(|| addr.strip_prefix("tel:"))
         .unwrap_or(addr);
+
+    // A destination that names an explicit `@host` is a routable URI to a *specific* endpoint.
+    // The emergency bypass must apply only to a plain emergency number, never to one smuggled as
+    // the user-part of an off-net URI (e.g. `sip:911@attacker-gateway`) — otherwise an attacker
+    // routes to a host of their choosing while skipping the cap and international guardrail. If a
+    // non-empty host is present, this is not an emergency shortcut; let normal policy classify it.
+    if let Some((_, host)) = after_scheme.split_once('@') {
+        if !host.trim().is_empty() {
+            return false;
+        }
+    }
+
     let user = after_scheme.split('@').next().unwrap_or(after_scheme);
     let user = user.split(';').next().unwrap_or(user);
     // Drop visual separators, then compare the significant characters.
@@ -287,13 +299,29 @@ mod tests {
     #[test]
     fn classify_covers_each_class() {
         assert_eq!(classify("911", "1"), DestinationClass::Emergency);
-        assert_eq!(classify("sip:112@gw", "1"), DestinationClass::Emergency);
+        // A bare/`tel:` emergency number bypasses; one hosted on a specific @host does NOT (it is
+        // a routable URI, classified by normal rules — here an on-net sip alias).
+        assert_eq!(classify("tel:112", "1"), DestinationClass::Emergency);
+        assert_eq!(classify("sip:112@gw", "1"), DestinationClass::Internal);
         assert_eq!(classify("sip:100", "1"), DestinationClass::Internal);
         assert_eq!(classify("100", "1"), DestinationClass::Internal);
         assert_eq!(classify("+14155550100", "1"), DestinationClass::National);
         assert_eq!(classify("+442071838750", "1"), DestinationClass::International);
         // Un-normalisable, non-internal alias falls through to International (conservative).
         assert_eq!(classify("sip:alice@host", "1"), DestinationClass::Internal); // sip alias -> internal
+    }
+
+    #[test]
+    fn emergency_number_on_offnet_host_does_not_bypass_policy() {
+        // The classic bypass: an emergency number smuggled as the user-part of an off-net URI must
+        // NOT classify as Emergency (which would skip the cap + international guardrail).
+        assert!(!is_emergency("sip:911@attacker-gateway.example"));
+        assert!(!is_emergency("\"x\" <sip:112@premium-gw.example>"));
+        assert_ne!(classify("sip:911@attacker-gateway.example", "1"), DestinationClass::Emergency);
+        // Plain emergency dials still bypass.
+        assert!(is_emergency("911"));
+        assert!(is_emergency("tel:112"));
+        assert!(is_emergency("sip:999")); // no host — a bare emergency number under a scheme
     }
 
     #[test]

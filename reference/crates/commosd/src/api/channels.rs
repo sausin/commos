@@ -64,6 +64,16 @@ pub async fn create_channel(
     tenant: TenantContext,
     Json(body): Json<CreateChannel>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Bound the name and the member set so a single request cannot store an unbounded blob.
+    if body.name.as_ref().is_some_and(|n| n.len() > 256) {
+        return Err(Problem::bad_request("name must be at most 256 characters"));
+    }
+    if body.members.len() > 1024 {
+        return Err(Problem::bad_request("members must be at most 1024 entries"));
+    }
+    if body.members.iter().any(|m| m.len() > 512) {
+        return Err(Problem::bad_request("each member ref must be at most 512 characters"));
+    }
     let channel = st
         .messaging
         .create_channel(tenant.tenant_id, body.kind, body.name, body.members)
