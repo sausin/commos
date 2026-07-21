@@ -707,6 +707,8 @@ impl SipServer {
             tenant,
             call_id,
             self.voicemails.clone(),
+            self.registrations.clone(),
+            self.media_ip,
             info_rx,
             stop_rx,
         ));
@@ -737,12 +739,15 @@ impl SipServer {
     /// records the caller (after a beep) until they hang up (graceful `stop`) or the cap, and
     /// stores a [`Voicemail`]. Other selections/timeouts hold the line until hangup — full
     /// mid-call transfer to the chosen destination is future work (tied to B2BUA transfer).
+    #[allow(clippy::too_many_arguments)]
     async fn ivr_driver(
         sock: UdpSocket,
         cfg: ivr::IvrConfig,
         tenant: Uuid,
         call_id: Uuid,
         voicemails: VoicemailService,
+        registrations: RegistrationRegistry,
+        media_ip: IpAddr,
         mut info_rx: tokio::sync::mpsc::UnboundedReceiver<char>,
         mut stop_rx: tokio::sync::watch::Receiver<bool>,
     ) {
@@ -773,8 +778,22 @@ impl SipServer {
                     Err(e) => tracing::warn!(error = %e, %call_id, "saving IVR voicemail failed"),
                 }
             }
-            _ => {
-                // Hold the line until the caller hangs up (no dead-air ambiguity).
+            ivr::IvrOutcome::Selected { destination, .. } => {
+                // A dial target: bridge the caller to a live registered extension, mid-call.
+                if let (Some(peer), Some(callee)) =
+                    (result.peer, find_registered(&registrations, tenant, &destination))
+                {
+                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, &mut stop_rx).await {
+                        return; // relayed until the caller hung up
+                    }
+                } else {
+                    tracing::info!(%call_id, %destination, "IVR: no registered endpoint for selection");
+                }
+                // Unreachable/unregistered/queue target → hold the line until hangup.
+                let _ = stop_rx.changed().await;
+            }
+            ivr::IvrOutcome::Timeout | ivr::IvrOutcome::Invalid => {
+                // No usable selection → hold the line until the caller hangs up.
                 let _ = stop_rx.changed().await;
             }
         }
@@ -1124,25 +1143,9 @@ impl SipServer {
         self.reply(socket, msg, 200, "OK", src).await
     }
 
-    /// Build the SDP answer advertising the RTP port: PCMU/8000 plus RFC 4733
-    /// `telephone-event/8000` (dynamic PT [`dtmf::TELEPHONE_EVENT_PT`]) so phones send DTMF
-    /// in-band for the IVR runtime; harmless on the echo/bridge paths (they relay it).
+    /// Build the SDP answer advertising the RTP port (see [`media_sdp`]).
     fn build_sdp(&self, rtp_port: u16) -> String {
-        format!(
-            "v=0\r\n\
-             o=commos 0 0 IN IP4 {ip}\r\n\
-             s=CommOS\r\n\
-             c=IN IP4 {ip}\r\n\
-             t=0 0\r\n\
-             m=audio {port} RTP/AVP 0 {te}\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:{te} telephone-event/8000\r\n\
-             a=fmtp:{te} 0-16\r\n\
-             a=sendrecv\r\n",
-            ip = self.media_ip,
-            port = rtp_port,
-            te = dtmf::TELEPHONE_EVENT_PT,
-        )
+        media_sdp(self.media_ip, rtp_port)
     }
 
     /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
@@ -1213,6 +1216,194 @@ fn user_part(uri: &str) -> Option<&str> {
     } else {
         Some(user)
     }
+}
+
+/// The SDP body advertising `port` at `media_ip`: PCMU/8000 plus RFC 4733
+/// `telephone-event/8000` (dynamic PT [`dtmf::TELEPHONE_EVENT_PT`]) so phones send DTMF in-band
+/// for the IVR runtime; harmless on the echo/bridge paths (they relay it).
+fn media_sdp(media_ip: IpAddr, port: u16) -> String {
+    format!(
+        "v=0\r\n\
+         o=commos 0 0 IN IP4 {ip}\r\n\
+         s=CommOS\r\n\
+         c=IN IP4 {ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP 0 {te}\r\n\
+         a=rtpmap:0 PCMU/8000\r\n\
+         a=rtpmap:{te} telephone-event/8000\r\n\
+         a=fmtp:{te} 0-16\r\n\
+         a=sendrecv\r\n",
+        ip = media_ip,
+        port = port,
+        te = dtmf::TELEPHONE_EVENT_PT,
+    )
+}
+
+/// The dial-target user-part of an IVR `destination_ref` — leniently, since an option value may
+/// be `sip:200@host`, a bare `200`, or `ext:200`. Returns `None` for non-endpoint targets like
+/// `queue:sales` (which carry a `:` and match no registration user-part).
+fn dial_target(dest: &str) -> Option<&str> {
+    let s = dest
+        .trim()
+        .trim_start_matches("ext:")
+        .trim_start_matches('<')
+        .trim_start_matches("sips:")
+        .trim_start_matches("sip:")
+        .trim_start_matches("tel:");
+    let user = match s.split_once('@') {
+        Some((u, _)) => u,
+        None => s,
+    };
+    let user = user.split(['>', ';']).next().unwrap_or(user).trim();
+    (!user.is_empty()).then_some(user)
+}
+
+/// Find a currently-registered endpoint whose AoR user-part matches an IVR `destination_ref`.
+fn find_registered(
+    regs: &RegistrationRegistry,
+    tenant: Uuid,
+    dest: &str,
+) -> Option<Registration> {
+    let want = dial_target(dest)?;
+    regs.list(tenant)
+        .into_iter()
+        .find(|r| user_part(&r.aor).is_some_and(|u| u.eq_ignore_ascii_case(want)))
+}
+
+/// Bridge an in-progress IVR caller to a registered `callee`, mid-call, with no re-INVITE to the
+/// caller: the IVR's own socket `sock_a` (caller already latched at `peer_a`) becomes leg A, and
+/// a fresh leg-B socket is offered to the callee via an outbound INVITE. Once the callee answers,
+/// RTP is relayed A↔B until `stop` (the caller hangs up), when a BYE tears the callee leg down.
+///
+/// Returns `true` if the call was bridged (and has now ended), `false` if the callee could not be
+/// reached (the caller should then be held / hung up). Blind, media-plane transfer — the caller's
+/// phone is untouched at the signalling layer, so it works with any endpoint.
+///
+/// TODO(B2BUA): the outbound leg is best-effort (as [`SipServer::try_bridge`]); full mid-dialog
+/// correctness (transactions, retransmission, ringback tone during setup) is future work.
+async fn ivr_transfer(
+    sock_a: &UdpSocket,
+    peer_a: SocketAddr,
+    callee: &Registration,
+    media_ip: IpAddr,
+    call_id: Uuid,
+    stop_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let addr = match resolve_contact_addr(&callee.contact).await {
+        Some(a) => a,
+        None => {
+            tracing::warn!(contact = %callee.contact, "IVR transfer: callee contact unresolvable");
+            return false;
+        }
+    };
+    // Leg B (callee RTP) and a throwaway signalling socket for the outbound dialog.
+    let (sock_b, sig) = match (UdpSocket::bind("0.0.0.0:0").await, UdpSocket::bind("0.0.0.0:0").await) {
+        (Ok(b), Ok(s)) => (b, s),
+        _ => {
+            tracing::warn!("IVR transfer: could not bind media/signalling sockets");
+            return false;
+        }
+    };
+    let leg_b_port = match sock_b.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return false,
+    };
+
+    // Outbound-leg dialog identifiers, derived from the CommOS Call id (mirrors try_bridge).
+    let leg_call_id = format!("{}@commos-ivr", call_id.to_string().replace('-', ""));
+    let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
+    let from_hdr = format!("<sip:commos@{media_ip}>;tag={from_tag}");
+    let sdp = media_sdp(media_ip, leg_b_port);
+    let invite = message::request(
+        "INVITE",
+        &callee.contact,
+        &[
+            ("From", from_hdr.clone()),
+            ("To", format!("<{}>", callee.aor)),
+            ("Call-ID", leg_call_id.clone()),
+            ("CSeq", "1 INVITE".to_string()),
+            ("Contact", format!("<sip:commos@{media_ip}>")),
+        ],
+        Some(("application/sdp", &sdp)),
+    );
+    if sig.send_to(invite.as_bytes(), addr).await.is_err() {
+        return false;
+    }
+
+    // Await a 2xx (ignoring provisional 1xx) up to the answer timeout.
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
+        loop {
+            let (n, _from) = sig.recv_from(&mut buf).await.ok()?;
+            let resp = match message::parse(&buf[..n]) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            match resp.status() {
+                Some(s) if (100..200).contains(&s) => continue,
+                Some(s) if (200..300).contains(&s) => return Some(resp),
+                Some(_) => return None,
+                None => continue,
+            }
+        }
+    })
+    .await;
+    let resp = match answer {
+        Ok(Some(r)) => r,
+        _ => {
+            tracing::info!(callee = %callee.aor, "IVR transfer: callee did not answer");
+            return false;
+        }
+    };
+    let callee_to = resp.header("To").map(str::to_string).unwrap_or_else(|| format!("<{}>", callee.aor));
+    let callee_target = resp.header("Contact").and_then(extract_uri).unwrap_or_else(|| callee.contact.clone());
+    let ack = message::request(
+        "ACK",
+        &callee_target,
+        &[
+            ("From", from_hdr.clone()),
+            ("To", callee_to.clone()),
+            ("Call-ID", leg_call_id.clone()),
+            ("CSeq", "1 ACK".to_string()),
+        ],
+        None,
+    );
+    let _ = sig.send_to(ack.as_bytes(), addr).await;
+    tracing::info!(%call_id, callee = %callee.aor, leg_b_port, "IVR transfer: bridged to registered callee");
+
+    // Relay RTP: caller (sock_a/peer_a) ↔ callee (sock_b/peer_b, latched on first packet).
+    let mut peer_b: Option<SocketAddr> = None;
+    let mut buf_a = [0u8; 2048];
+    let mut buf_b = [0u8; 2048];
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => break,
+            r = sock_a.recv_from(&mut buf_a) => match r {
+                Ok((n, _)) => { if let Some(pb) = peer_b { let _ = sock_b.send_to(&buf_a[..n], pb).await; } }
+                Err(_) => break,
+            },
+            r = sock_b.recv_from(&mut buf_b) => match r {
+                Ok((n, from)) => { peer_b.get_or_insert(from); let _ = sock_a.send_to(&buf_b[..n], peer_a).await; }
+                Err(_) => break,
+            },
+        }
+    }
+
+    // Caller hung up → BYE the callee leg (best-effort, fire-and-forget).
+    let bye = message::request(
+        "BYE",
+        &callee_target,
+        &[
+            ("From", from_hdr),
+            ("To", callee_to),
+            ("Call-ID", leg_call_id),
+            ("CSeq", "2 BYE".to_string()),
+        ],
+        None,
+    );
+    let _ = sig.send_to(bye.as_bytes(), addr).await;
+    tracing::info!(%call_id, "IVR transfer: relay ended, BYE sent to callee");
+    true
 }
 
 /// Push a message-waiting indication to a phone as an unsolicited SIP `NOTIFY` with an
@@ -1325,6 +1516,39 @@ mod tests {
         assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
         assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
         assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    #[test]
+    fn dial_target_handles_ivr_destination_forms() {
+        // An IVR option value may be a URI, a bare number, or an `ext:` shorthand.
+        assert_eq!(dial_target("sip:200@host"), Some("200"));
+        assert_eq!(dial_target("<sip:alice@host:5060>"), Some("alice"));
+        assert_eq!(dial_target("ext:201"), Some("201"));
+        assert_eq!(dial_target("202"), Some("202"));
+        // Non-endpoint targets (queues) don't resolve to a plain user-part match.
+        assert_eq!(dial_target("queue:sales"), Some("queue:sales"));
+        assert_eq!(dial_target(""), None);
+    }
+
+    #[test]
+    fn find_registered_matches_destination_to_a_live_registration() {
+        let regs = RegistrationRegistry::new();
+        let tenant = Uuid::now_v7();
+        regs.register(
+            tenant,
+            "sip:200@example.com".to_string(),
+            "sip:200@192.168.1.9:5060".to_string(),
+            None,
+            3600,
+        );
+        // A bare number, an `ext:` form, and a full URI all resolve to the registration.
+        assert!(find_registered(&regs, tenant, "200").is_some());
+        assert!(find_registered(&regs, tenant, "ext:200").is_some());
+        assert!(find_registered(&regs, tenant, "sip:200@anywhere").is_some());
+        // A different number, a queue target, and another tenant do not.
+        assert!(find_registered(&regs, tenant, "999").is_none());
+        assert!(find_registered(&regs, tenant, "queue:sales").is_none());
+        assert!(find_registered(&regs, Uuid::now_v7(), "200").is_none());
     }
 
     /// Drive [`send_mwi_notify`] at a local UDP "phone" and assert the datagram is a
