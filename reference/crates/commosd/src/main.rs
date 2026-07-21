@@ -16,6 +16,7 @@ mod control;
 mod introspect;
 mod media;
 mod metrics;
+mod objectstore;
 mod relay;
 mod sip;
 mod state;
@@ -156,6 +157,12 @@ async fn run(cfg: Config) -> i32 {
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
     let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
     let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
+    // Object storage: bytes on the local filesystem under {data_dir}/objects (recordings,
+    // voicemail, exports, diagnostics); an S3/MinIO binding drops in behind the same trait.
+    let object_root = format!("{}/objects", cfg.data_dir.trim_end_matches('/'));
+    let blob_store: Arc<dyn objectstore::ObjectStore> =
+        Arc::new(objectstore::LocalObjectStore::new(object_root));
+    let objects = control::objects::ObjectService::new(blob_store, store.clone(), signal.clone());
     let metrics = metrics::Metrics::new();
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
@@ -239,6 +246,7 @@ async fn run(cfg: Config) -> i32 {
         queues,
         provisioning,
         webhooks,
+        objects,
         metrics.clone(),
         agents,
         registrations,

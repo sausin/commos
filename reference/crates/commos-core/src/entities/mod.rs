@@ -10,6 +10,7 @@ pub mod channel;
 pub mod device;
 pub mod extension;
 pub mod message;
+pub mod object;
 pub mod participant;
 pub mod presence_state;
 pub mod queue;

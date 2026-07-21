@@ -18,6 +18,7 @@ use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
+use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::route::Route;
@@ -148,6 +149,12 @@ CREATE TABLE IF NOT EXISTS webhooks (
     created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhooks_tenant_id_idx ON webhooks (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS objects (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS objects_tenant_id_idx ON objects (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
@@ -523,6 +530,9 @@ impl Store for PgStore {
         for w in &tx.webhooks {
             upsert(&mut dbtx, "webhooks", "Webhook", &w.base, &serde_json::to_value(w).map_err(be)?).await?;
         }
+        for o in &tx.objects {
+            upsert(&mut dbtx, "objects", "Object", &o.base, &serde_json::to_value(o).map_err(be)?).await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -862,6 +872,24 @@ impl Store for PgStore {
     }
     async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         let res = sqlx::query("DELETE FROM webhooks WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_object(&self, tenant: Uuid, id: Uuid) -> Result<Option<Object>, StoreError> {
+        let row = sqlx::query("SELECT data FROM objects WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_objects(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Object>, StoreError> {
+        let items = self.list_entities::<Object>("objects", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|o| o.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM objects WHERE tenant_id = $1 AND id = $2")
             .bind(tenant.as_uuid()).bind(id.as_uuid())
             .execute(&self.pool).await.map_err(be)?;
         Ok(res.rows_affected() > 0)

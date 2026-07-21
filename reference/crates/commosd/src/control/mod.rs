@@ -7,6 +7,7 @@ pub mod billing;
 pub mod configexport;
 pub mod dialplan;
 pub mod messaging;
+pub mod objects;
 pub mod onboarding;
 pub mod policy;
 pub mod provisioning;

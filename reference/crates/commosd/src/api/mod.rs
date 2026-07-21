@@ -16,6 +16,7 @@ pub mod directory;
 pub mod health;
 pub mod introspect;
 pub mod messages;
+pub mod objects;
 pub mod onboarding;
 pub mod presence;
 pub mod problem;
@@ -122,7 +123,11 @@ pub fn router(state: AppState) -> Router {
         )
         // Webhooks — subscribe HTTP endpoints to the event stream (writes admin-gated).
         .route("/webhooks", get(webhooks::list_webhooks).post(webhooks::create_webhook))
-        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook));
+        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook))
+        // Object storage — recordings, voicemail, exports, diagnostics (blob + metadata).
+        .route("/objects", get(objects::list_objects).post(objects::upload_object))
+        .route("/objects/:id", get(objects::get_object).delete(objects::delete_object))
+        .route("/objects/:id/content", get(objects::get_object_content));
 
     Router::new()
         .nest("/v1", v1)

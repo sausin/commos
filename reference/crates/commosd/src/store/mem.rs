@@ -14,6 +14,7 @@ use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
+use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::route::Route;
@@ -110,6 +111,8 @@ struct Inner {
     route_order: Vec<(Uuid, Uuid)>,
     webhooks: HashMap<(Uuid, Uuid), Webhook>,
     webhook_order: Vec<(Uuid, Uuid)>,
+    objects: HashMap<(Uuid, Uuid), Object>,
+    object_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -284,6 +287,16 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "Webhook", id: w.base.id.to_string(), expected: 0 });
             }
         }
+        for o in &tx.objects {
+            let key = (o.base.tenant_id, o.base.id);
+            if let Some(existing) = g.objects.get(&key) {
+                if o.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Object", id: o.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if o.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Object", id: o.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -364,6 +377,13 @@ impl Store for MemStore {
                 g.webhook_order.push(key);
             }
             g.webhooks.insert(key, w);
+        }
+        for o in tx.objects {
+            let key = (o.base.tenant_id, o.base.id);
+            if !g.objects.contains_key(&key) {
+                g.object_order.push(key);
+            }
+            g.objects.insert(key, o);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -628,6 +648,24 @@ impl Store for MemStore {
         let removed = g.webhooks.remove(&key).is_some();
         if removed {
             g.webhook_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+
+    async fn get_object(&self, tenant: Uuid, id: Uuid) -> Result<Option<Object>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.objects.get(&(tenant, id)).cloned())
+    }
+    async fn list_objects(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Object>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.object_order, |k| g.objects.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.objects.remove(&key).is_some();
+        if removed {
+            g.object_order.retain(|k| k != &key);
         }
         Ok(removed)
     }

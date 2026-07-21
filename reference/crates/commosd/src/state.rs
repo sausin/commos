@@ -11,6 +11,7 @@ use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
 use crate::control::messaging::MessagingService;
+use crate::control::objects::ObjectService;
 use crate::control::provisioning::Provisioning;
 use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub provisioning: Provisioning,
     /// Outbound webhook subscriptions (register/list/delete).
     pub webhooks: WebhookService,
+    /// Object storage — recordings, voicemail, exports, diagnostics (blob + metadata).
+    pub objects: ObjectService,
     /// Prometheus metrics registry (scraped at `/metrics`).
     pub metrics: Metrics,
     /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
@@ -68,6 +71,7 @@ impl AppState {
         queues: QueueService,
         provisioning: Provisioning,
         webhooks: WebhookService,
+        objects: ObjectService,
         metrics: Metrics,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
@@ -86,6 +90,7 @@ impl AppState {
             queues,
             provisioning,
             webhooks,
+            objects,
             metrics,
             agents,
             registrations,

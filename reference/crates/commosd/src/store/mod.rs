@@ -28,6 +28,7 @@ use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
+use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::route::Route;
@@ -61,6 +62,8 @@ pub struct Tx {
     pub routes: Vec<Route>,
     /// Integration entities — outbound webhook subscriptions.
     pub webhooks: Vec<Webhook>,
+    /// Stored-object metadata (recordings, voicemail, exports, …); bytes live in the ObjectStore.
+    pub objects: Vec<Object>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -225,6 +228,15 @@ pub trait Store: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Page<Webhook>, StoreError>;
     async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_object(&self, tenant: Uuid, id: Uuid) -> Result<Option<Object>, StoreError>;
+    async fn list_objects(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Object>, StoreError>;
+    async fn delete_object(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(
