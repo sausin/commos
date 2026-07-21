@@ -115,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/onboarding/environments", get(onboarding::list_environments))
         .route("/onboarding/suggest", get(onboarding::suggest))
         .route("/onboarding/apply", post(onboarding::apply))
+        .route("/onboarding/reboot", post(onboarding::reboot))
         // Config-as-code (pbx.yaml) export/import — CMOS-14-DEP-080/082.
         .route("/config", get(config::export_config).post(config::import_config))
         // Provisioning directory — people, phones, extensions, routes. Reads are

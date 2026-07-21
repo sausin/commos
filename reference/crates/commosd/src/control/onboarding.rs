@@ -241,10 +241,128 @@ pub fn primary_host_ip() -> Option<IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
-pub fn suggest_ip_plan(device_count: u32) -> IpPlan {
-    let host = primary_host_ip();
+// --- Interface enumeration ----------------------------------------------------------------
+
+/// A usable IPv4 network interface the operator can align the phone plan on. On a host with
+/// more than one NIC (a Pi with Wi-Fi + Ethernet, a server with a dedicated voice VLAN port),
+/// the wizard must ask *which* one carries the phones — otherwise the "primary outbound" guess
+/// can pick the wrong subnet and every provisioning record points at the wrong LAN.
+#[derive(Clone, Debug, Serialize)]
+pub struct HostInterface {
+    /// Kernel interface name (e.g. `eth0`, `wlan0`, `br0`).
+    pub name: String,
+    /// The interface's own IPv4 address (e.g. `192.168.1.10`).
+    pub ipv4: String,
+    /// The prefix length of the connected network (e.g. `24`).
+    pub prefix_len: u8,
+    /// The network in CIDR form (e.g. `192.168.1.0/24`) — this is the range phones live on.
+    pub cidr: String,
+    /// True for the interface the OS would use for outbound traffic (the default guess).
+    pub is_primary: bool,
+}
+
+/// Parse `/proc/net/route` into connected IPv4 networks: `(iface, network, mask)` as
+/// host-order `u32`s. The kernel prints Destination/Mask as little-endian hex, so we
+/// `swap_bytes()` to line them up with `u32::from(Ipv4Addr)`. Only directly-connected routes
+/// (a non-zero mask) are useful for mapping a local address to its subnet + interface.
+fn connected_networks() -> Vec<(String, u32, u32)> {
+    let raw = match std::fs::read_to_string("/proc/net/route") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in raw.lines().skip(1) {
+        // Columns: Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+        let c: Vec<&str> = line.split_whitespace().collect();
+        if c.len() < 8 {
+            continue;
+        }
+        let dest = u32::from_str_radix(c[1], 16).ok().map(u32::swap_bytes);
+        let mask = u32::from_str_radix(c[7], 16).ok().map(u32::swap_bytes);
+        if let (Some(d), Some(m)) = (dest, mask) {
+            if m != 0 {
+                out.push((c[0].to_string(), d, m));
+            }
+        }
+    }
+    out
+}
+
+/// The host's own IPv4 addresses, read from the routing trie (`/proc/net/fib_trie`). Each
+/// address the kernel owns appears as a `/32 host LOCAL` leaf; loopback is skipped. Native
+/// `/proc` parsing keeps this dependency-free and working on a Raspberry Pi.
+fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let raw = match std::fs::read_to_string("/proc/net/fib_trie") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut pending: Option<Ipv4Addr> = None;
+    for line in raw.lines() {
+        let t = line.trim();
+        // A leaf node line is `|-- 192.168.1.10` or `+-- 192.168.1.10`.
+        let leaf = t.strip_prefix("|-- ").or_else(|| t.strip_prefix("+-- "));
+        if let Some(addr) = leaf {
+            pending = addr.parse::<Ipv4Addr>().ok();
+        } else if t.contains("host LOCAL") {
+            if let Some(ip) = pending.take() {
+                if !ip.is_loopback() && !ip.is_unspecified() && !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Enumerate the host's usable IPv4 interfaces (loopback excluded), each mapped to the
+/// connected network it sits on. The operator picks one so the phone plan aligns on the right
+/// LAN. Returns an empty list on a non-Linux host (the wizard then falls back to the primary
+/// outbound IP).
+pub fn list_interfaces() -> Vec<HostInterface> {
+    let networks = connected_networks();
+    let primary = match primary_host_ip() {
+        Some(IpAddr::V4(v4)) => Some(v4),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for addr in local_ipv4_addresses() {
+        let a = u32::from(addr);
+        // Most-specific connected route that contains this address gives its iface + prefix.
+        let best = networks
+            .iter()
+            .filter(|(_, net, mask)| (a & mask) == (net & mask))
+            .max_by_key(|(_, _, mask)| mask.count_ones());
+        let (name, prefix_len, cidr) = match best {
+            Some((iface, _net, mask)) => {
+                let net_addr = Ipv4Addr::from(a & mask);
+                let plen = mask.count_ones() as u8;
+                (iface.clone(), plen, format!("{net_addr}/{plen}"))
+            }
+            // No connected route found: assume a /24, the LAN default.
+            None => {
+                let o = addr.octets();
+                ("?".to_string(), 24, format!("{}.{}.{}.0/24", o[0], o[1], o[2]))
+            }
+        };
+        out.push(HostInterface {
+            name,
+            ipv4: addr.to_string(),
+            prefix_len,
+            cidr,
+            is_primary: primary == Some(addr),
+        });
+    }
+    // Primary interface first, then by name, so the recommended choice is pre-selected.
+    out.sort_by(|a, b| b.is_primary.cmp(&a.is_primary).then(a.name.cmp(&b.name)));
+    out
+}
+
+/// Suggest an IP plan for a specific host IPv4 (the operator's chosen interface). Falls back to
+/// the primary outbound IP when `host` is `None`.
+pub fn suggest_ip_plan_for(host: Option<Ipv4Addr>, device_count: u32) -> IpPlan {
     match host {
-        Some(IpAddr::V4(v4)) => {
+        Some(v4) => {
             let o = v4.octets();
             let subnet = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
             let gateway = format!("{}.{}.{}.1", o[0], o[1], o[2]);
@@ -290,6 +408,7 @@ pub fn suggest_ip_plan(device_count: u32) -> IpPlan {
     }
 }
 
+
 // --- MAC / device discovery ---------------------------------------------------------------
 
 /// A neighbour found on the LAN, with a best-effort guess at whether it's a SIP phone.
@@ -309,7 +428,7 @@ pub struct DiscoveredDevice {
 fn vendor_for_oui(oui: &str) -> Option<&'static str> {
     match oui {
         "00:15:65" | "80:5e:c0" | "24:9a:d8" | "00:1f:c1" => Some("Yealink"),
-        "00:0b:82" | "c0:74:ad" | "00:0b:83" => Some("Grandstream"),
+        "00:0b:82" | "c0:74:ad" | "00:0b:83" | "ec:74:d7" => Some("Grandstream"),
         "00:04:f2" | "64:16:7f" | "48:25:67" => Some("Polycom"),
         "00:04:13" | "00:1a:4b" => Some("Snom"),
         "0c:38:3e" | "70:2a:d5" => Some("Fanvil"),
@@ -358,9 +477,15 @@ pub fn discovered_devices() -> Vec<DiscoveredDevice> {
 pub struct ProvisioningGuide {
     pub domain: String,
     pub provisioning_url: String,
-    /// DHCP option 66 value (provisioning/config server).
+    /// Whether the guide assumes TLS (HTTPS provisioning + SIPS). See [`tls_advice`].
+    pub tls: bool,
+    /// Plain-language guidance about the TLS choice — the "should I turn SSL on?" answer.
+    pub tls_advice: String,
+    /// DHCP option 66 value — the config-server path, with a trailing slash so phones append
+    /// their own filename cleanly.
     pub dhcp_option_66: String,
-    /// DHCP option 67 value (per-device bootfile name pattern).
+    /// DHCP option 67 value. Empty by design: phones derive their own config filename and
+    /// dnsmasq cannot template a per-MAC bootfile here, so option 67 is not used.
     pub dhcp_option_67: String,
     /// Ready-to-paste ISC `dhcpd`/`dnsmasq` lines.
     pub dhcp_dnsmasq: Vec<String>,
@@ -369,27 +494,74 @@ pub struct ProvisioningGuide {
     pub note: String,
 }
 
-pub fn provisioning_guide(domain: &str, host_ip: &str, http_port: u16, sip_port: u16) -> ProvisioningGuide {
-    let provisioning_url = format!("http://{host_ip}:{http_port}/provision");
+/// Build the auto-provisioning guide. `tls` controls whether phones are pointed at HTTPS/SIPS
+/// or plain HTTP/SIP-UDP.
+///
+/// **SSL is optional and off by default for a reason.** On a LAN you rarely have a certificate
+/// that a desk phone will trust — a self-signed cert makes most phones *reject* the provisioning
+/// fetch and the TLS SIP registration outright, so a well-meaning "turn on SSL" breaks the fleet.
+/// Plain HTTP/UDP on a trusted LAN is the pragmatic default (and CommOS already encrypts the
+/// media with SRTP regardless). Turn TLS on only when you have a CA-signed certificate for the
+/// PBX hostname (public CA or an internal CA already installed on the phones).
+pub fn provisioning_guide(
+    domain: &str,
+    host_ip: &str,
+    http_port: u16,
+    sip_port: u16,
+    tls: bool,
+) -> ProvisioningGuide {
+    let scheme = if tls { "https" } else { "http" };
+    let provisioning_url = format!("{scheme}://{host_ip}:{http_port}/provision");
+    let srv_record = if tls {
+        // SIPS is carried over TCP; phones look up _sips._tcp.
+        format!("_sips._tcp.{domain}.     300 IN SRV  0 0 {sip_port} pbx.{domain}.")
+    } else {
+        format!("_sip._udp.{domain}.      300 IN SRV  0 0 {sip_port} pbx.{domain}.")
+    };
+    let tls_advice = if tls {
+        "TLS is ON. Phones will only trust an HTTPS/SIPS endpoint whose certificate is signed by \
+         a CA they already trust. A self-signed certificate will be REJECTED by most desk phones \
+         — install a CA-signed cert for the PBX hostname first, or leave SSL off."
+            .to_string()
+    } else {
+        "SSL is OFF (recommended on a trusted LAN). Local phones would reject a self-signed \
+         certificate, so provisioning and SIP run in the clear over the LAN; call media is still \
+         encrypted with SRTP. Turn SSL on only once you have a CA-signed certificate for the PBX."
+            .to_string()
+    };
     ProvisioningGuide {
         domain: domain.to_string(),
         provisioning_url: provisioning_url.clone(),
-        dhcp_option_66: provisioning_url.clone(),
-        dhcp_option_67: "{mac}.cfg".to_string(),
+        tls,
+        tls_advice,
+        // Option 66 is the config-server *path*; note the trailing slash — Grandstream (and
+        // others) append their own filename to it, so without it the phone builds a malformed
+        // URL like `…/provisioncfg<mac>.xml` that never resolves.
+        dhcp_option_66: format!("{provisioning_url}/"),
+        // Deliberately empty: phones name their own config file (Grandstream `cfg<mac>.xml`,
+        // Yealink/others `<mac>.cfg`), and dnsmasq cannot expand a `{mac}` macro into option 67 —
+        // it would send the literal text `{mac}.cfg`. So option 67 is not used; CommOS serves
+        // whatever filename the phone asks for.
+        dhcp_option_67: String::new(),
         dhcp_dnsmasq: vec![
-            format!("# dnsmasq: point phones at CommOS for auto-provisioning"),
-            format!("dhcp-option=66,\"{provisioning_url}\""),
-            format!("dhcp-option=67,\"{{mac}}.cfg\""),
+            format!("# dnsmasq: point phones at CommOS for auto-provisioning."),
+            format!("# Option 66 is the config-server path (keep the trailing slash). Each phone"),
+            format!("# appends its OWN filename — Grandstream cfg<mac>.xml, others <mac>.cfg — and"),
+            format!("# CommOS serves every one of those, so no per-MAC bootfile (option 67) is"),
+            format!("# needed; dnsmasq can't expand a {{mac}} macro there anyway."),
+            format!("dhcp-option=66,\"{provisioning_url}/\""),
         ],
         dns_bind_zone: vec![
             format!("; CommOS records for {domain}"),
             format!("pbx.{domain}.            300 IN A    {host_ip}"),
-            format!("_sip._udp.{domain}.      300 IN SRV  0 0 {sip_port} pbx.{domain}."),
+            srv_record,
         ],
         note: format!(
-            "Set DHCP option 66 to the provisioning URL and add the DNS records above. Phones \
-             that support DHCP option 66 will fetch their config from CommOS on next boot; \
-             others can be pointed at {provisioning_url} manually."
+            "Set DHCP option 66 to the provisioning path (with the trailing slash) and add the \
+             DNS records above. Do NOT set option 67 — phones name their own config file \
+             (Grandstream requests cfg<mac>.xml / cfg<mac>, others <mac>.cfg) and CommOS serves \
+             each. Phones fetch their config from CommOS on next boot; others can be pointed at \
+             {provisioning_url}/ manually."
         ),
     }
 }
@@ -407,55 +579,159 @@ pub struct BuiltEntities {
 }
 
 /// Normalise a MAC to 12 lowercase hex chars (`00:15:65:AA:BB:CC` → `001565aabbcc`), or `None`.
-fn mac_hex(s: &str) -> Option<String> {
+pub fn mac_hex(s: &str) -> Option<String> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_ascii_lowercase();
     (hex.len() == 12).then_some(hex)
+}
+
+/// An explicit operator choice: this phone (by MAC) is *this* extension number, optionally with
+/// a human display name. Collected in the wizard so the operator lines up handsets and numbers
+/// directly, rather than trusting the order phones happened to appear in the ARP table.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MacBinding {
+    pub mac: String,
+    pub number: String,
+    /// The name shown on the phone's LCD after provisioning (e.g. `"Front Desk"`, `"Room 101"`).
+    /// Empty/absent → a default of `Ext <number>`.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// Build the people, extensions, routes, and phones for a confirmed onboarding choice. Each
 /// extension gets a person and a **real Route** (`sip:<number>@<domain>`) that the control
 /// plane resolves on an inbound call; the extension's `route_id` points at it. Discovered
-/// phones (from ARP) are bound to the first extensions by writing the device MAC into the
-/// extension `label` — exactly what the provisioning endpoint keys on, so a phone that fetches
-/// its config gets that account.
+/// phones (from ARP) are bound to extensions by writing the device MAC into the extension
+/// `label` — exactly what the provisioning endpoint keys on, so a phone that fetches its config
+/// gets that account.
+///
+/// Extensions are created for the union of the sequential series (`start .. start+device_count`)
+/// and every number the operator explicitly bound a phone to, so an aligned handset always gets
+/// an extension even if its number falls outside the series. Bindings whose MAC is not a valid
+/// 12-hex address are logged and skipped rather than silently ignored.
 pub fn build_entities(
     tenant: Uuid,
     device_count: u32,
     series_start: &str,
     domain: &str,
+    bindings: &[MacBinding],
 ) -> BuiltEntities {
     let start: u32 = series_start.parse().unwrap_or(100);
-    let phones: Vec<DiscoveredDevice> =
-        discovered_devices().into_iter().filter(|d| d.likely_phone).collect();
+    // Discovered phones, keyed by normalised MAC so an explicit binding can recover the phone's
+    // IP + vendor. Also used for the fallback (bind-by-ARP-order) when no explicit bindings.
+    let discovered = discovered_devices();
+    let by_mac: std::collections::HashMap<String, DiscoveredDevice> = discovered
+        .iter()
+        .filter_map(|d| mac_hex(&d.mac).map(|m| (m, d.clone())))
+        .collect();
+
+    // Explicit operator bindings win: extension number → (normalised MAC, display name).
+    // Anything the operator aligned by hand is honoured exactly; nothing is guessed on top of it.
+    let bound_by_number: std::collections::HashMap<String, (String, Option<String>)> = bindings
+        .iter()
+        .filter_map(|b| {
+            mac_hex(&b.mac).map(|m| {
+                let name = b
+                    .display_name
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                (b.number.trim().to_string(), (m, name))
+            })
+        })
+        .collect();
+
+    // Surface bindings we cannot honour rather than dropping them silently: a MAC that is not
+    // 12 hex chars can never match the provisioning lookup, so warn (with the offending value)
+    // instead of quietly skipping it.
+    for b in bindings {
+        if mac_hex(&b.mac).is_none() && !b.number.trim().is_empty() {
+            tracing::warn!(
+                mac = %b.mac,
+                number = %b.number,
+                "onboarding binding ignored: not a valid MAC (need 12 hex digits) — this phone will NOT auto-provision"
+            );
+        }
+    }
+
+    // Fallback only when the operator gave no explicit alignment: bind discovered likely-phones
+    // to the first extensions in ARP order (the previous behaviour).
+    let auto_phones: Vec<&DiscoveredDevice> = if bound_by_number.is_empty() {
+        discovered.iter().filter(|d| d.likely_phone).collect()
+    } else {
+        Vec::new()
+    };
+
+    // The extension numbers to create: the sequential plan (`start .. start+device_count`) UNION
+    // every explicitly bound number. Previously only the sequence was built, so a phone the
+    // operator aligned to a number *outside* the series was silently dropped — its extension was
+    // never created, its MAC never became a `label`, and provisioning answered "no account
+    // provisioned". Taking the union guarantees an operator-aligned phone always gets its
+    // extension. Sequential numbers come first (matching the plan the operator saw); any extra
+    // bound numbers follow in ascending order for a stable, deterministic result.
+    let mut numbers: Vec<String> = (0..device_count).map(|i| (start + i).to_string()).collect();
+    let in_seq: std::collections::HashSet<String> = numbers.iter().cloned().collect();
+    let mut extra: Vec<String> =
+        bound_by_number.keys().filter(|n| !in_seq.contains(*n)).cloned().collect();
+    extra.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    });
+    if !extra.is_empty() {
+        tracing::info!(
+            extra = ?extra,
+            "onboarding: creating extensions for operator-aligned phones outside the {start}+{device_count} series"
+        );
+    }
+    numbers.extend(extra);
 
     let mut users = Vec::new();
     let mut extensions = Vec::new();
     let mut devices = Vec::new();
     let mut routes = Vec::new();
 
-    for i in 0..device_count {
-        let number = (start + i).to_string();
-        let user = User::new(tenant, format!("Extension {number}"));
+    for (i, number) in numbers.iter().enumerate() {
+        let number = number.clone();
+
+        // The person behind this extension. When the operator gave a display name it becomes the
+        // User's name (and, via provisioning, the text on the phone's LCD); otherwise a default.
+        let display_name = bound_by_number
+            .get(&number)
+            .and_then(|(_, name)| name.clone())
+            .unwrap_or_else(|| format!("Extension {number}"));
+        let user = User::new(tenant, display_name);
 
         // A real route: dialing this number reaches the SIP endpoint that registers as it.
         let route = Route::new(tenant, format!("sip:{number}@{domain}"));
         let mut ext = Extension::new(tenant, number.clone(), route.base.id);
 
-        // Bind a discovered phone to this extension when one is available.
-        if let Some(phone) = phones.get(i as usize) {
-            if let Some(mac) = mac_hex(&phone.mac) {
-                ext.label = Some(mac.clone());
-                let vendor = phone
-                    .vendor
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-                    .to_ascii_lowercase();
-                let mut dev = Device::new(tenant, vendor, "unknown");
-                dev.mac = Some(mac);
-                dev.assigned_user_id = Some(user.base.id);
-                dev.network = Some(DeviceNetwork { ip: Some(phone.ip.clone()), ..Default::default() });
-                devices.push(dev);
-            }
+        // Resolve the MAC to bind to this extension: the operator's explicit choice first,
+        // else the discovered phone at this position (only when no explicit bindings exist).
+        let bound: Option<(String, Option<DiscoveredDevice>)> =
+            if let Some((mac, _)) = bound_by_number.get(&number) {
+                Some((mac.clone(), by_mac.get(mac).cloned()))
+            } else if bound_by_number.is_empty() {
+                auto_phones
+                    .get(i)
+                    .and_then(|phone| mac_hex(&phone.mac).map(|m| (m, Some((*phone).clone()))))
+            } else {
+                None
+            };
+
+        if let Some((mac, phone)) = bound {
+            ext.label = Some(mac.clone());
+            let vendor = phone
+                .as_ref()
+                .and_then(|p| p.vendor.clone())
+                .unwrap_or_else(|| "unknown".to_string())
+                .to_ascii_lowercase();
+            let mut dev = Device::new(tenant, vendor, "unknown");
+            dev.mac = Some(mac);
+            dev.assigned_user_id = Some(user.base.id);
+            dev.network = Some(DeviceNetwork {
+                ip: phone.as_ref().map(|p| p.ip.clone()),
+                ..Default::default()
+            });
+            devices.push(dev);
         }
         routes.push(route);
         extensions.push(ext);
@@ -474,20 +750,40 @@ pub struct OnboardingSuggestion {
     pub device_count: u32,
     pub extension_plan: ExtensionPlan,
     pub ip_plan: IpPlan,
+    /// The host's usable IPv4 interfaces. When more than one exists, the wizard asks which to
+    /// align the phone plan on so the right subnet is used.
+    pub interfaces: Vec<HostInterface>,
+    /// The interface name the plan was computed for (the operator's choice, or the primary).
+    pub selected_interface: Option<String>,
     pub discovered_devices: Vec<DiscoveredDevice>,
     pub provisioning: ProvisioningGuide,
 }
 
-/// Build the whole suggestion. Auto-detects host IP and LAN devices; everything else follows
-/// from the environment + fleet size.
+/// Build the whole suggestion. Auto-detects host interfaces and LAN devices; everything else
+/// follows from the environment + fleet size. When `interface` names one of the host's NICs,
+/// the IP plan and provisioning records align on that interface's subnet; otherwise the primary
+/// outbound interface is used. `tls` chooses HTTPS/SIPS vs plain HTTP/SIP in the guide (off by
+/// default — see [`provisioning_guide`]).
 pub fn suggest(
     env: Environment,
     device_count: u32,
     domain: &str,
     http_port: u16,
     sip_port: u16,
+    interface: Option<&str>,
+    tls: bool,
 ) -> OnboardingSuggestion {
-    let ip_plan = suggest_ip_plan(device_count);
+    let interfaces = list_interfaces();
+    // Resolve the chosen interface: an explicit name if it matches, else the primary, else the
+    // first enumerated interface.
+    let chosen = interface
+        .and_then(|name| interfaces.iter().find(|i| i.name == name))
+        .or_else(|| interfaces.iter().find(|i| i.is_primary))
+        .or_else(|| interfaces.first());
+    let chosen_ip = chosen.and_then(|i| i.ipv4.parse::<Ipv4Addr>().ok());
+    let selected_interface = chosen.map(|i| i.name.clone());
+
+    let ip_plan = suggest_ip_plan_for(chosen_ip, device_count);
     let host_ip = ip_plan
         .detected_host_ip
         .clone()
@@ -496,10 +792,126 @@ pub fn suggest(
         environment: profile_for(env),
         device_count,
         extension_plan: suggest_extension_plan(env, device_count),
-        provisioning: provisioning_guide(domain, &host_ip, http_port, sip_port),
+        provisioning: provisioning_guide(domain, &host_ip, http_port, sip_port, tls),
         discovered_devices: discovered_devices(),
+        interfaces,
+        selected_interface,
         ip_plan,
     }
+}
+
+// --- Reboot / re-provision -----------------------------------------------------------------
+
+/// A phone to nudge into re-provisioning, addressed by its LAN IP.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RebootTarget {
+    pub ip: String,
+    /// The extension the phone registers as, if known — used only to address the SIP request.
+    #[serde(default)]
+    pub number: Option<String>,
+}
+
+/// The result of a reboot sweep.
+#[derive(Clone, Debug, Serialize)]
+pub struct RebootOutcome {
+    pub attempted: usize,
+    pub sent: usize,
+    /// `"<ip>: <reason>"` for each target we could not reach.
+    pub failed: Vec<String>,
+    /// The source address the requests egressed from (the chosen interface).
+    pub source_ip: Option<String>,
+}
+
+/// Ask each phone to reboot and re-fetch its config, by sending an unsolicited SIP `NOTIFY`
+/// with `Event: check-sync;reboot=true` — the de-facto standard "resync now" nudge that Yealink,
+/// Grandstream, Polycom, Fanvil and Snom phones honour on the LAN. This is what makes onboarding
+/// feel instant: apply the plan, hit reboot, and the handsets come back registered on their new
+/// extension instead of waiting for the next power-cycle.
+///
+/// Best-effort and connectionless: we fire one datagram per target from `src_ip` (so it egresses
+/// the interface the operator aligned on) to `phone_sip_port` (5060 by convention). A phone that
+/// ignores unsolicited NOTIFYs simply won't reboot — it still provisions on its next boot. We do
+/// not wait for the `200 OK`.
+pub fn reboot_phones(
+    src_ip: Option<Ipv4Addr>,
+    targets: &[RebootTarget],
+    our_sip_port: u16,
+    phone_sip_port: u16,
+) -> RebootOutcome {
+    // Address the requests from the chosen interface when we have it, else the primary IP, so
+    // the Via/Contact carry a routable source and the packet leaves the right NIC.
+    let src = src_ip.or_else(|| match primary_host_ip() {
+        Some(IpAddr::V4(v4)) => Some(v4),
+        _ => None,
+    });
+
+    let mut sent = 0usize;
+    let mut failed = Vec::new();
+
+    // One socket for the whole sweep; bind to the chosen source so egress is deterministic.
+    let bind_addr = match src {
+        Some(ip) => format!("{ip}:0"),
+        None => "0.0.0.0:0".to_string(),
+    };
+    let sock = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            return RebootOutcome {
+                attempted: targets.len(),
+                sent: 0,
+                failed: vec![format!("could not open a socket on {bind_addr}: {e}")],
+                source_ip: src.map(|s| s.to_string()),
+            };
+        }
+    };
+    let src_str = src.map(|s| s.to_string()).unwrap_or_else(|| "commos".to_string());
+
+    for t in targets {
+        let ip = t.ip.trim();
+        if ip.parse::<Ipv4Addr>().is_err() {
+            failed.push(format!("{ip}: not an IPv4 address"));
+            continue;
+        }
+        let to = t.number.as_deref().filter(|n| !n.is_empty()).unwrap_or("phone");
+        let msg = check_sync_notify(&src_str, our_sip_port, ip, phone_sip_port, to);
+        match sock.send_to(msg.as_bytes(), format!("{ip}:{phone_sip_port}")) {
+            Ok(_) => sent += 1,
+            Err(e) => failed.push(format!("{ip}: {e}")),
+        }
+    }
+
+    RebootOutcome {
+        attempted: targets.len(),
+        sent,
+        failed,
+        source_ip: src.map(|s| s.to_string()),
+    }
+}
+
+/// Build a minimal, out-of-dialog SIP `NOTIFY … Event: check-sync;reboot=true` request. Unique
+/// branch/tag/Call-ID come from a UUID so retries don't collide. `\r\n` line endings per RFC 3261.
+fn check_sync_notify(
+    src_ip: &str,
+    src_port: u16,
+    phone_ip: &str,
+    phone_port: u16,
+    to: &str,
+) -> String {
+    let id = Uuid::now_v7().to_string().replace('-', "");
+    let (branch, tag, call_id) = (&id[0..16], &id[8..24], &id);
+    format!(
+        "NOTIFY sip:{to}@{phone_ip}:{phone_port} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {src_ip}:{src_port};branch=z9hG4bK{branch}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:commos@{src_ip}>;tag={tag}\r\n\
+         To: <sip:{to}@{phone_ip}:{phone_port}>\r\n\
+         Call-ID: {call_id}@{src_ip}\r\n\
+         CSeq: 1 NOTIFY\r\n\
+         Contact: <sip:commos@{src_ip}:{src_port}>\r\n\
+         Event: check-sync;reboot=true\r\n\
+         Content-Length: 0\r\n\
+         \r\n"
+    )
 }
 
 #[cfg(test)]
@@ -520,17 +932,120 @@ mod tests {
     #[test]
     fn ip_plan_flags_oversized_fleet() {
         // 300 phones can't fit a single /24 phone pool.
-        let plan = suggest_ip_plan(300);
+        let plan = suggest_ip_plan_for(Some(Ipv4Addr::new(192, 168, 1, 10)), 300);
         assert!(!plan.fits);
         assert!(plan.recommendation.is_some());
+        assert_eq!(plan.detected_subnet.as_deref(), Some("192.168.1.0/24"));
     }
 
     #[test]
     fn provisioning_guide_is_paste_ready() {
-        let g = provisioning_guide("commos.local", "192.168.1.10", 8080, 5060);
-        assert_eq!(g.dhcp_option_66, "http://192.168.1.10:8080/provision");
+        let g = provisioning_guide("commos.local", "192.168.1.10", 8080, 5060, false);
+        // Option 66 is the config-server path with a trailing slash (phones append their filename).
+        assert_eq!(g.dhcp_option_66, "http://192.168.1.10:8080/provision/");
+        // Option 67 is deliberately unused — phones name their own config file.
+        assert!(g.dhcp_option_67.is_empty());
+        assert!(!g.dhcp_dnsmasq.iter().any(|l| l.contains("option=67") || l.contains("dhcp-option=67")));
         assert!(g.dns_bind_zone.iter().any(|l| l.contains("_sip._udp.commos.local")));
         assert!(g.dns_bind_zone.iter().any(|l| l.contains("A    192.168.1.10")));
+    }
+
+    #[test]
+    fn provisioning_guide_tls_uses_https_and_sips() {
+        let off = provisioning_guide("commos.local", "192.168.1.10", 8080, 5061, false);
+        assert!(off.provisioning_url.starts_with("http://"));
+        assert!(!off.tls);
+        assert!(off.dns_bind_zone.iter().any(|l| l.contains("_sip._udp")));
+
+        let on = provisioning_guide("commos.local", "192.168.1.10", 8443, 5061, true);
+        assert!(on.provisioning_url.starts_with("https://"));
+        assert!(on.tls);
+        assert!(on.dns_bind_zone.iter().any(|l| l.contains("_sips._tcp")));
+        // The advice must warn that self-signed certs are rejected.
+        assert!(on.tls_advice.to_lowercase().contains("self-signed"));
+    }
+
+    #[test]
+    fn explicit_bindings_align_mac_to_number() {
+        let tenant = Uuid::now_v7();
+        let bindings = vec![
+            MacBinding {
+                mac: "00:15:65:AA:BB:CC".into(),
+                number: "101".into(),
+                display_name: Some("Front Desk".into()),
+            },
+            MacBinding { mac: "0c-38-3e-11-22-33".into(), number: "103".into(), display_name: None },
+        ];
+        let built = build_entities(tenant, 5, "100", "commos.local", &bindings);
+        // Extension 101 carries the first MAC as its provisioning label.
+        let ext101 = built.extensions.iter().find(|e| e.number == "101").unwrap();
+        assert_eq!(ext101.label.as_deref(), Some("001565aabbcc"));
+        // Extension 103 carries the second MAC (any separator style is normalised).
+        let ext103 = built.extensions.iter().find(|e| e.number == "103").unwrap();
+        assert_eq!(ext103.label.as_deref(), Some("0c383e112233"));
+        // Two phones were bound to two devices; unbound extensions carry no label.
+        assert_eq!(built.devices.len(), 2);
+        assert!(built.extensions.iter().filter(|e| e.label.is_some()).count() == 2);
+        // The operator's display name becomes the person's name (→ the phone's LCD); an unnamed
+        // binding falls back to the default.
+        let ext101_dev = built
+            .devices
+            .iter()
+            .find(|d| d.mac.as_deref() == Some("001565aabbcc"))
+            .unwrap();
+        let user = built
+            .users
+            .iter()
+            .find(|u| Some(u.base.id) == ext101_dev.assigned_user_id)
+            .unwrap();
+        assert_eq!(user.display_name, "Front Desk");
+    }
+
+    #[test]
+    fn binding_outside_the_series_is_still_created_and_bound() {
+        // Regression: a phone aligned to a number *outside* the `start .. start+device_count`
+        // series used to be dropped — no extension, no label — so provisioning answered
+        // "no account provisioned". It must now get its own extension, bound to its MAC.
+        let tenant = Uuid::now_v7();
+        let bindings = vec![MacBinding {
+            mac: "ec:74:d7:5a:9b:3c".into(),
+            number: "250".into(), // well outside 100..102
+            display_name: Some("Lobby".into()),
+        }];
+        let built = build_entities(tenant, 2, "100", "commos.local", &bindings);
+        // The two sequential extensions plus the one for the out-of-series binding.
+        assert_eq!(built.extensions.len(), 3);
+        let ext250 = built.extensions.iter().find(|e| e.number == "250").unwrap();
+        assert_eq!(ext250.label.as_deref(), Some("ec74d75a9b3c"));
+        // A device is bound so the provisioning endpoint resolves the MAC → this account.
+        assert!(built.devices.iter().any(|d| d.mac.as_deref() == Some("ec74d75a9b3c")));
+    }
+
+    #[test]
+    fn check_sync_notify_is_well_formed() {
+        let msg = check_sync_notify("192.168.1.10", 5060, "192.168.1.55", 5060, "101");
+        assert!(msg.starts_with("NOTIFY sip:101@192.168.1.55:5060 SIP/2.0\r\n"));
+        assert!(msg.contains("Event: check-sync;reboot=true\r\n"));
+        assert!(msg.contains("Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bK"));
+        assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn reboot_rejects_bad_ip_but_still_reports() {
+        let targets = vec![RebootTarget { ip: "not-an-ip".into(), number: None }];
+        let out = reboot_phones(Some(Ipv4Addr::new(127, 0, 0, 1)), &targets, 5060, 5060);
+        assert_eq!(out.attempted, 1);
+        assert_eq!(out.sent, 0);
+        assert_eq!(out.failed.len(), 1);
+    }
+
+    #[test]
+    fn build_entities_without_bindings_still_builds_plan() {
+        let tenant = Uuid::now_v7();
+        let built = build_entities(tenant, 3, "100", "commos.local", &[]);
+        assert_eq!(built.extensions.len(), 3);
+        assert_eq!(built.users.len(), 3);
+        assert_eq!(built.routes.len(), 3);
     }
 
     #[test]

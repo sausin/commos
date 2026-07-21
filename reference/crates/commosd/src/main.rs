@@ -88,8 +88,40 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Resolve the config path to use when `--config` is not given.
+///
+/// Historically the binary looked only at `./pbx.yaml`, but the installer writes the config to
+/// the data dir (`/var/lib/commos/pbx.yaml` as root). So a bare `commosd` on an installed box
+/// missed its own config and silently booted on defaults. Search the conventional locations, in
+/// order, and use the first that exists:
+///
+/// 1. `$COMMOS_CONFIG` — explicit override (wins if set, even when the file is missing, so a
+///    typo surfaces as a clear "cannot read config" error rather than a silent defaults boot),
+/// 2. `./pbx.yaml` — the working-directory config (dev / `--data-dir ./data`),
+/// 3. `/etc/commos/pbx.yaml` — the FHS config location,
+/// 4. `/var/lib/commos/pbx.yaml` — where the installer writes it by default.
+///
+/// Falls back to `./pbx.yaml` (which `Config::load` reports as "booting with defaults") when none
+/// exists, preserving the zero-config boot.
+fn default_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("COMMOS_CONFIG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    const CANDIDATES: [&str; 3] =
+        ["pbx.yaml", "/etc/commos/pbx.yaml", "/var/lib/commos/pbx.yaml"];
+    for candidate in CANDIDATES {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("pbx.yaml")
+}
+
 fn parse_args() -> Result<PathBuf, i32> {
-    let mut path = PathBuf::from("pbx.yaml");
+    let mut path = default_config_path();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -358,6 +390,7 @@ async fn run(cfg: Config) -> i32 {
         admin,
         cfg.media_ip,
         cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
+        describe_storage(&cfg),
         bus.clone(),
         recent,
     );
@@ -530,6 +563,36 @@ fn ensure_jwt_secret(data_dir: &str) -> Result<Vec<u8>, String> {
 /// Default (no `database_url`): the **embedded SQLite** store — durable with zero external
 /// dependency (ADR-0012), the right fit for a single box / Raspberry Pi. `postgres://…`
 /// selects PostgreSQL (multi-node / HA); `memory://` selects the ephemeral in-process store.
+/// A human-readable, secret-free description of where the system of record lives — shown to the
+/// operator at the end of onboarding so they know exactly where their configuration was saved.
+/// Mirrors [`select_store`]'s branching. Never echoes a resolved DSN (it may carry credentials):
+/// PostgreSQL is named without its connection string; SQLite paths are safe and are made absolute.
+fn describe_storage(cfg: &Config) -> String {
+    let abs = |p: &str| {
+        std::fs::canonicalize(p)
+            .ok()
+            .map(|x| x.display().to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    match &cfg.database_url {
+        None => format!("embedded SQLite database at {}", abs(&cfg.default_sqlite_path())),
+        Some(secret) => match secret.resolve() {
+            Ok(d) if d.starts_with("postgres://") || d.starts_with("postgresql://") => {
+                "an external PostgreSQL database (configured via database_url)".to_string()
+            }
+            Ok(d) if d == "memory://" || d == ":memory:" => {
+                "an in-process memory store — NOT durable, lost on restart".to_string()
+            }
+            Ok(d) => {
+                let path = d.strip_prefix("sqlite:").unwrap_or(&d);
+                format!("SQLite database at {}", abs(path))
+            }
+            // Can't resolve the reference here; don't guess or leak it.
+            Err(_) => "the database referenced by database_url".to_string(),
+        },
+    }
+}
+
 async fn select_store(cfg: &Config) -> Result<Arc<dyn store::Store>, i32> {
     let dsn = match &cfg.database_url {
         Some(secret) => match secret.resolve() {
