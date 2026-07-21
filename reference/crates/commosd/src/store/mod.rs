@@ -34,6 +34,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::webhook::Webhook;
 
 pub use mem::MemStore;
 pub use postgres::PgStore;
@@ -58,6 +59,8 @@ pub struct Tx {
     pub extensions: Vec<Extension>,
     pub devices: Vec<Device>,
     pub routes: Vec<Route>,
+    /// Integration entities — outbound webhook subscriptions.
+    pub webhooks: Vec<Webhook>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -213,6 +216,15 @@ pub trait Store: Send + Sync {
     /// the id did not exist for this tenant.
     async fn delete_extension(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
     async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    async fn get_webhook(&self, tenant: Uuid, id: Uuid) -> Result<Option<Webhook>, StoreError>;
+    async fn list_webhooks(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Webhook>, StoreError>;
+    async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

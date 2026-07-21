@@ -42,6 +42,24 @@ pub struct Info {
     pub os: &'static str,
 }
 
+/// `GET /metrics` — Prometheus / OpenMetrics exposition (Volume 15 §OBS-010). Unauthenticated
+/// operational signal, served as `text/plain`.
+pub async fn metrics(State(st): State<AppState>) -> impl axum::response::IntoResponse {
+    let uptime = (time::OffsetDateTime::now_utc() - st.started_at.into_offset())
+        .whole_seconds()
+        .max(0) as u64;
+    let body = st.metrics.render(
+        uptime,
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        st.registrations.total(),
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+}
+
 /// Build/runtime info — handy for verifying which artifact (and which architecture) is running.
 pub async fn info(State(st): State<AppState>) -> Json<Info> {
     Json(Info {

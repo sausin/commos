@@ -20,6 +20,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
@@ -107,6 +108,8 @@ struct Inner {
     device_order: Vec<(Uuid, Uuid)>,
     routes: HashMap<(Uuid, Uuid), Route>,
     route_order: Vec<(Uuid, Uuid)>,
+    webhooks: HashMap<(Uuid, Uuid), Webhook>,
+    webhook_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -271,6 +274,16 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "Route", id: r.base.id.to_string(), expected: 0 });
             }
         }
+        for w in &tx.webhooks {
+            let key = (w.base.tenant_id, w.base.id);
+            if let Some(existing) = g.webhooks.get(&key) {
+                if w.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Webhook", id: w.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if w.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Webhook", id: w.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -344,6 +357,13 @@ impl Store for MemStore {
                 g.route_order.push(key);
             }
             g.routes.insert(key, r);
+        }
+        for w in tx.webhooks {
+            let key = (w.base.tenant_id, w.base.id);
+            if !g.webhooks.contains_key(&key) {
+                g.webhook_order.push(key);
+            }
+            g.webhooks.insert(key, w);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -590,6 +610,24 @@ impl Store for MemStore {
         let removed = g.routes.remove(&key).is_some();
         if removed {
             g.route_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+
+    async fn get_webhook(&self, tenant: Uuid, id: Uuid) -> Result<Option<Webhook>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.webhooks.get(&(tenant, id)).cloned())
+    }
+    async fn list_webhooks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Webhook>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.webhook_order, |k| g.webhooks.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.webhooks.remove(&key).is_some();
+        if removed {
+            g.webhook_order.retain(|k| k != &key);
         }
         Ok(removed)
     }

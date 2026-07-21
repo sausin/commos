@@ -56,6 +56,21 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
+    /// Home country code (digits, no `+`) used to classify a dialled number as national vs
+    /// international for the origination policy. Default `"1"`.
+    #[serde(default = "default_country_code")]
+    pub default_country_code: String,
+
+    /// Allow international calls (Volume 9 toll-fraud guardrail). Default `false` — outbound
+    /// international is **blocked** until an operator opts in, the safe default for a PBX.
+    #[serde(default)]
+    pub allow_international: bool,
+
+    /// Cap on concurrent in-progress calls per tenant (velocity guardrail). `None` (default)
+    /// means no cap.
+    #[serde(default)]
+    pub max_concurrent_calls: Option<u32>,
+
     /// Admin password — a **reference**, never inline (CMOS-14-DEP-083). When set, the
     /// privileged setup routes (onboarding apply, config import) require an admin session
     /// obtained via `POST /admin/login`. When unset (the default), admin auth is in dev mode:
@@ -142,6 +157,9 @@ impl Default for Config {
             dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
+            default_country_code: default_country_code(),
+            allow_international: false,
+            max_concurrent_calls: None,
             admin_password: None,
             log: LogConfig::default(),
         }
@@ -158,6 +176,10 @@ fn default_media_ip() -> IpAddr {
 
 fn default_data_dir() -> String {
     ".".to_string()
+}
+
+fn default_country_code() -> String {
+    "1".to_string()
 }
 
 fn default_sip_listen() -> Option<SocketAddr> {

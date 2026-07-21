@@ -24,12 +24,26 @@ pub mod queues;
 pub mod registrations;
 pub mod threads;
 pub mod video_rooms;
+pub mod webhooks;
 
+use axum::extract::State;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
+
+/// Middleware: count every handled HTTP request into the metrics registry.
+async fn count_request(
+    State(st): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    st.metrics.inc_http();
+    next.run(req).await
+}
 
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
@@ -105,7 +119,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/routes/:id",
             get(directory::get_route).patch(directory::patch_route).delete(directory::delete_route),
-        );
+        )
+        // Webhooks — subscribe HTTP endpoints to the event stream (writes admin-gated).
+        .route("/webhooks", get(webhooks::list_webhooks).post(webhooks::create_webhook))
+        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook));
 
     Router::new()
         .nest("/v1", v1)
@@ -118,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
         .route("/info", get(health::info))
+        .route("/metrics", get(health::metrics))
         // Live operations dashboard + setup wizard (self-contained HTML, unauthenticated).
         .route("/dashboard", get(dashboard::dashboard))
         .route("/onboarding", get(onboarding::wizard))
@@ -126,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         // Non-normative introspection for bring-up/testing.
         .route("/_introspect/events", get(introspect::recent_events))
         .route("/_introspect/events/stream", get(introspect::stream_events))
+        .layer(middleware::from_fn_with_state(state.clone(), count_request))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

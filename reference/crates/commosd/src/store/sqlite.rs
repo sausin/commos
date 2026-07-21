@@ -34,6 +34,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
@@ -64,6 +65,8 @@ CREATE TABLE IF NOT EXISTS devices      (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id, id);
 CREATE TABLE IF NOT EXISTS routes       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS routes_tenant_id_idx ON routes (tenant_id, id);
+CREATE TABLE IF NOT EXISTS webhooks     (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS webhooks_tenant_id_idx ON webhooks (tenant_id, id);
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 "#;
@@ -345,6 +348,10 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(r).map_err(be)?;
             Self::upsert(&mut dbtx, "routes", "Route", &r.base, &data).await?;
         }
+        for w in &tx.webhooks {
+            let data = serde_json::to_string(w).map_err(be)?;
+            Self::upsert(&mut dbtx, "webhooks", "Webhook", &w.base, &data).await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -461,6 +468,16 @@ impl Store for SqliteStore {
     }
     async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         self.delete_row("routes", tenant, id).await
+    }
+
+    async fn get_webhook(&self, tenant: Uuid, id: Uuid) -> Result<Option<Webhook>, StoreError> {
+        self.get_one("webhooks", tenant, id).await
+    }
+    async fn list_webhooks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Webhook>, StoreError> {
+        self.list("webhooks", tenant, limit, cursor).await
+    }
+    async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("webhooks", tenant, id).await
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

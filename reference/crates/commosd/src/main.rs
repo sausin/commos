@@ -15,6 +15,7 @@ mod config;
 mod control;
 mod introspect;
 mod media;
+mod metrics;
 mod relay;
 mod sip;
 mod state;
@@ -136,11 +137,26 @@ async fn run(cfg: Config) -> i32 {
     let (fact_tx, mut fact_rx) = tokio::sync::mpsc::unbounded_channel::<media::MediaFact>();
     let media = Arc::new(LoopbackMedia::new(fact_tx));
     let signal = RelaySignal::new();
-    let routing = Routing::new(store.clone(), media, signal.clone());
+    let policy = control::policy::PolicyLimits {
+        allow_international: cfg.allow_international,
+        max_concurrent_calls: cfg.max_concurrent_calls,
+    };
+    if !policy.allow_international {
+        tracing::info!("origination policy: international calling BLOCKED (set allow_international to permit)");
+    }
+    let routing = Routing::new(
+        store.clone(),
+        media,
+        signal.clone(),
+        policy,
+        cfg.default_country_code.clone(),
+    );
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
     let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
+    let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
+    let metrics = metrics::Metrics::new();
     let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
 
@@ -222,6 +238,8 @@ async fn run(cfg: Config) -> i32 {
         realtime,
         queues,
         provisioning,
+        webhooks,
+        metrics.clone(),
         agents,
         registrations,
         auth,
@@ -242,6 +260,38 @@ async fn run(cfg: Config) -> i32 {
         signal.clone(),
         shutdown_rx.clone(),
     ));
+
+    // Webhook dispatcher (Volume 5 §EVT-014): deliver relayed events to registered endpoints.
+    tokio::spawn(control::webhooks::run(
+        store.clone(),
+        signal.clone(),
+        bus.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    // Metrics collector: fold the relayed event stream into counters. Subscribing to the bus
+    // keeps the control plane free of metrics plumbing (Volume 15 §OBS-010).
+    {
+        let metrics = metrics.clone();
+        let mut rx = bus.subscribe();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => { if *shutdown.borrow() { break; } }
+                    recv = rx.recv() => match recv {
+                        Ok(ev) => {
+                            if let Some(t) = ev.get("type").and_then(|v| v.as_str()) {
+                                metrics.on_event(t);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        });
+    }
 
     // --- bind & serve ----------------------------------------------------------------
     let listener = match TcpListener::bind(cfg.listen).await {

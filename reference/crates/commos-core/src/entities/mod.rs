@@ -17,3 +17,4 @@ pub mod route;
 pub mod thread;
 pub mod user;
 pub mod video_room;
+pub mod webhook;

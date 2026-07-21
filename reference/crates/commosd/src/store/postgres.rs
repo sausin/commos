@@ -24,6 +24,7 @@ use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
+use commos_core::entities::webhook::Webhook;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
 
@@ -141,6 +142,12 @@ CREATE TABLE IF NOT EXISTS routes (
     created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS routes_tenant_id_idx ON routes (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhooks_tenant_id_idx ON webhooks (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
@@ -513,6 +520,9 @@ impl Store for PgStore {
         for r in &tx.routes {
             upsert(&mut dbtx, "routes", "Route", &r.base, &serde_json::to_value(r).map_err(be)?).await?;
         }
+        for w in &tx.webhooks {
+            upsert(&mut dbtx, "webhooks", "Webhook", &w.base, &serde_json::to_value(w).map_err(be)?).await?;
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -834,6 +844,24 @@ impl Store for PgStore {
     }
     async fn delete_route(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         let res = sqlx::query("DELETE FROM routes WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_webhook(&self, tenant: Uuid, id: Uuid) -> Result<Option<Webhook>, StoreError> {
+        let row = sqlx::query("SELECT data FROM webhooks WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_webhooks(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Webhook>, StoreError> {
+        let items = self.list_entities::<Webhook>("webhooks", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|w| w.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_webhook(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM webhooks WHERE tenant_id = $1 AND id = $2")
             .bind(tenant.as_uuid()).bind(id.as_uuid())
             .execute(&self.pool).await.map_err(be)?;
         Ok(res.rows_affected() > 0)

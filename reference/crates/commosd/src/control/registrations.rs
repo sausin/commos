@@ -100,6 +100,11 @@ impl RegistrationRegistry {
         reg
     }
 
+    /// Total live registrations across all tenants (for the `commos_registrations` gauge).
+    pub fn total(&self) -> u64 {
+        self.inner.lock().expect("registration mutex not poisoned").len() as u64
+    }
+
     /// All registrations for a tenant (tenant-scoped; other tenants are invisible).
     pub fn list(&self, tenant: Uuid) -> Vec<Registration> {
         let map = self.inner.lock().expect("registration mutex not poisoned");

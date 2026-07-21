@@ -16,7 +16,9 @@ use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
 use crate::control::registrations::RegistrationRegistry;
 use crate::control::routing::Routing;
+use crate::control::webhooks::WebhookService;
 use crate::introspect::RecentEvents;
+use crate::metrics::Metrics;
 use crate::store::Store;
 
 /// Cheap-to-clone application state (all fields are `Arc`/handles).
@@ -29,6 +31,10 @@ pub struct AppState {
     pub queues: QueueService,
     /// Directory write path — people, phones, extensions, routes and their lifecycle.
     pub provisioning: Provisioning,
+    /// Outbound webhook subscriptions (register/list/delete).
+    pub webhooks: WebhookService,
+    /// Prometheus metrics registry (scraped at `/metrics`).
+    pub metrics: Metrics,
     /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
     pub agents: AgentRegistry,
     /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
@@ -61,6 +67,8 @@ impl AppState {
         realtime: RealtimeService,
         queues: QueueService,
         provisioning: Provisioning,
+        webhooks: WebhookService,
+        metrics: Metrics,
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
         auth: AuthConfig,
@@ -77,6 +85,8 @@ impl AppState {
             realtime,
             queues,
             provisioning,
+            webhooks,
+            metrics,
             agents,
             registrations,
             auth,

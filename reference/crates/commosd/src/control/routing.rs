@@ -5,7 +5,8 @@
 //! entity, the mutation and its event are committed atomically to the outbox, the media
 //! plane is commanded over the typed boundary, and the event surfaces on the bus.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use commos_core::common::Uuid;
 use commos_core::entities::call::{Call, CallState, Direction};
@@ -19,6 +20,7 @@ use commos_core::events::call_started::CallStarted;
 use commos_core::events::call_transferred::{CallTransferred, TransferType};
 
 use crate::control::billing;
+use crate::control::policy::{self, PolicyLimits, PolicyRequest};
 use crate::media::{MediaCommand, MediaFact, MediaPlane};
 use crate::relay::RelaySignal;
 use crate::store::{Store, StoreError, Tx};
@@ -40,6 +42,8 @@ pub enum RoutingError {
     NotFound,
     #[error("illegal call action: {0}")]
     IllegalState(String),
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -51,11 +55,46 @@ pub struct Routing {
     store: Arc<dyn Store>,
     media: Arc<dyn MediaPlane>,
     signal: RelaySignal,
+    /// Origination policy / fraud guardrails (Volume 9): international blocked by default,
+    /// optional concurrent-call cap, emergency bypass.
+    policy: PolicyLimits,
+    /// Home country code (digits) used to classify national vs international destinations.
+    default_cc: String,
+    /// Live count of in-progress calls per tenant — the input to the velocity guardrail.
+    /// In-memory (like registrations): a capacity signal, not durable state.
+    active: Arc<Mutex<HashMap<Uuid, u32>>>,
 }
 
 impl Routing {
-    pub fn new(store: Arc<dyn Store>, media: Arc<dyn MediaPlane>, signal: RelaySignal) -> Self {
-        Routing { store, media, signal }
+    pub fn new(
+        store: Arc<dyn Store>,
+        media: Arc<dyn MediaPlane>,
+        signal: RelaySignal,
+        policy: PolicyLimits,
+        default_cc: impl Into<String>,
+    ) -> Self {
+        Routing {
+            store,
+            media,
+            signal,
+            policy,
+            default_cc: default_cc.into(),
+            active: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Current in-progress call count for a tenant.
+    fn active_count(&self, tenant: Uuid) -> u32 {
+        *self.active.lock().expect("active-calls mutex").get(&tenant).unwrap_or(&0)
+    }
+    fn active_inc(&self, tenant: Uuid) {
+        *self.active.lock().expect("active-calls mutex").entry(tenant).or_insert(0) += 1;
+    }
+    fn active_dec(&self, tenant: Uuid) {
+        let mut g = self.active.lock().expect("active-calls mutex");
+        if let Some(n) = g.get_mut(&tenant) {
+            *n = n.saturating_sub(1);
+        }
     }
 
     /// Originate a Call: create it in `INITIATED`, emit `CallStarted`, command media.
@@ -75,6 +114,28 @@ impl Routing {
                     return Ok(existing);
                 }
             }
+        }
+
+        // Fraud/authorization guardrail (Volume 9): classify the destination and enforce
+        // policy before any Call is created. `caller_has_identity` is true because the request
+        // arrives on an authenticated tenant bearer; per-user capability enforcement is layered
+        // on once per-user auth lands (the evaluator already accepts capabilities).
+        let pol = policy::evaluate(
+            &PolicyRequest {
+                to_ref: &req.to_ref,
+                caller_has_identity: true,
+                caller_capabilities: &[],
+                active_calls: self.active_count(tenant),
+            },
+            &self.policy,
+            &self.default_cc,
+        );
+        if !pol.allowed() {
+            return Err(RoutingError::PolicyDenied(pol.reason));
+        }
+        if !pol.obligations.is_empty() {
+            tracing::info!(obligations = ?pol.obligations, reason = %pol.reason,
+                "call permitted with obligations");
         }
 
         let call = Call::originate(tenant, req.direction, &req.from_ref, &req.to_ref);
@@ -121,6 +182,7 @@ impl Routing {
         if let crate::media::MediaAck::Rejected { reason, .. } = ack {
             return Err(RoutingError::MediaRejected(reason));
         }
+        self.active_inc(tenant);
 
         // The Call starts INITIATED. Ring and answer arrive asynchronously as media facts
         // and are applied by `apply_fact` (media→control, CMOS-03-ARCH-003) — not computed
@@ -165,6 +227,7 @@ impl Routing {
             })
             .await?;
         self.signal.wake();
+        self.active_inc(tenant);
         Ok(call)
     }
 
@@ -329,6 +392,7 @@ impl Routing {
             })
             .await?;
         self.signal.wake();
+        self.active_dec(tenant);
 
         self.media.dispatch(MediaCommand::Hangup { call_id: call.base.id });
         Ok(call)
@@ -374,7 +438,27 @@ mod tests {
     fn routing() -> (Routing, Arc<dyn Store>, FactRx) {
         let store: Arc<dyn Store> = Arc::new(MemStore::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = Routing::new(store.clone(), Arc::new(LoopbackMedia::new(tx)), RelaySignal::new());
+        let r = Routing::new(
+            store.clone(),
+            Arc::new(LoopbackMedia::new(tx)),
+            RelaySignal::new(),
+            PolicyLimits::default(),
+            "1",
+        );
+        (r, store, rx)
+    }
+
+    /// A Routing wired with explicit policy limits, for the guardrail tests.
+    fn routing_with(limits: PolicyLimits) -> (Routing, Arc<dyn Store>, FactRx) {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = Routing::new(
+            store.clone(),
+            Arc::new(LoopbackMedia::new(tx)),
+            RelaySignal::new(),
+            limits,
+            "1",
+        );
         (r, store, rx)
     }
 
@@ -426,5 +510,53 @@ mod tests {
             r.hold(t, Uuid::now_v7()).await,
             Err(RoutingError::NotFound)
         ));
+    }
+
+    fn req_to(to: &str) -> OriginateRequest {
+        OriginateRequest {
+            direction: Direction::Outbound,
+            from_ref: "sip:100".to_string(),
+            to_ref: to.to_string(),
+            idempotency_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn international_is_blocked_by_default_but_national_allowed() {
+        let (r, _s, _f) = routing(); // PolicyLimits::default(): allow_international = false
+        let t = Uuid::now_v7();
+        // National (+1, home cc) is permitted.
+        assert!(r.originate(t, req_to("+14155550100")).await.is_ok());
+        // International (+44 UK) is denied — the default toll-fraud guardrail.
+        assert!(matches!(
+            r.originate(t, req_to("+442071234567")).await,
+            Err(RoutingError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn international_allowed_when_opted_in() {
+        let (r, _s, _f) = routing_with(PolicyLimits { allow_international: true, ..Default::default() });
+        let t = Uuid::now_v7();
+        assert!(r.originate(t, req_to("+442071234567")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrency_cap_denies_excess_calls() {
+        let (r, _s, _f) = routing_with(PolicyLimits { max_concurrent_calls: Some(1), ..Default::default() });
+        let t = Uuid::now_v7();
+        assert!(r.originate(t, req_to("+14155550100")).await.is_ok()); // active → 1
+        assert!(matches!(
+            r.originate(t, req_to("+14155550101")).await,
+            Err(RoutingError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn emergency_bypasses_every_guardrail() {
+        // A zero cap would block everything — except an emergency call.
+        let (r, _s, _f) = routing_with(PolicyLimits { max_concurrent_calls: Some(0), allow_international: false });
+        let t = Uuid::now_v7();
+        assert!(r.originate(t, req_to("911")).await.is_ok());
     }
 }

@@ -30,6 +30,7 @@ fn map_routing_err(e: RoutingError) -> Problem {
         RoutingError::NotFound => Problem::not_found("no such call"),
         RoutingError::IllegalState(m) => Problem::new(StatusCode::CONFLICT, "illegal_state", m),
         RoutingError::MediaRejected(m) => Problem::new(StatusCode::BAD_GATEWAY, "media_rejected", m),
+        RoutingError::PolicyDenied(m) => Problem::new(StatusCode::FORBIDDEN, "policy_denied", m),
         RoutingError::Store(e) => Problem::internal(e.to_string()),
     }
 }
