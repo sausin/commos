@@ -523,6 +523,7 @@ struct ProvisionRequest {
 ///   * `<mac>.cfg` / bare `<mac>` — Yealink and the generic convention,
 ///   * `cfg<mac>` / `cfg<mac>.cfg` / `cfg<mac>.xml` — Grandstream (it prefixes `cfg` and, on
 ///     newer firmware, appends `.xml`).
+///
 /// The MAC may carry `:`/`-`/`.` separators and any case. A trailing `.xml` selects the XML form;
 /// the leading `cfg` is Grandstream's prefix — and since a valid 12-hex MAC can never begin with
 /// the literal `cfg` (`g` is not a hex digit), stripping it is unambiguous. Returns `None` for
