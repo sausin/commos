@@ -1,23 +1,61 @@
-# CommOS config-as-code — the declarative desired state (Volume 14 §10, CMOS-14-DEP-080).
+# CommOS runtime configuration — pbx.yaml  (config-as-code, Vol 14 §10; CMOS-14-DEP-080)
 #
-# Git-reviewable and diff-friendly. NEVER put secrets here (CMOS-14-DEP-083): reference
-# them from an external secret manager and commosd rejects an inline DSN with credentials.
-
-api_version: commos.dev/v0.4
-
-# Address the API Gateway binds. 0.0.0.0:8080 suits a single box on the LAN — e.g. a
-# Raspberry Pi 4 — or a host-networked container.
-listen: "0.0.0.0:8080"
-
-# PostgreSQL system of record (CMOS-14-DEP-020). Omit entirely to run the zero-dependency
-# in-process store (single-binary dev/edge mode). When set, it MUST be a *reference*:
+# Copy to your host, edit, and run:   commosd --config /etc/commos/pbx.yaml
+# With no --config, commosd reads ./pbx.yaml from the working directory; if none is found it
+# boots on built-in defaults (loopback — no phones).
 #
-# database_url:
-#   ref_uri: "vault://commos/db#dsn"     # resolved from Vault/KMS/1Password at boot
+# Secrets are NEVER inlined (CMOS-14-DEP-083): sip_tls_key / database_url / jwt_secret /
+# admin_password take a reference — { ref_uri: "env://VAR" } or { ref_uri: "file:///path" } —
+# resolved at boot. An inline secret (e.g. a DSN with a password) is rejected.
 #
-# Rejected (secret in YAML):
-#   database_url: postgres://user:password@db:5432/commos
+# As shipped, this file runs anywhere for a LOCAL test (binds all interfaces, loopback media,
+# SQLite in the working directory). For real phones you MUST set media_ip — see the note below.
 
+# ── Network ──────────────────────────────────────────────────────────────────
+listen:      "0.0.0.0:8080"     # HTTP API + phone auto-provisioning (/provision)
+sip_listen:  "0.0.0.0:5060"     # SIP/UDP ingress (null disables the SIP plane)
+media_ip:    "127.0.0.1"        # RTP address advertised to phones. 127.0.0.1 = LOCAL TEST ONLY:
+                                # real phones will connect with NO AUDIO. Set it to THIS host's
+                                # LAN IP. It is also written into provisioned phone configs as the
+                                # SIP registrar, so phones both send RTP and REGISTER here.
+#
+# Multi-homed host? Pin SIP + media to the phone-facing interface, and leave the HTTP API on all
+# interfaces so you can still administer it from a management network:
+#     listen:     "0.0.0.0:8080"
+#     sip_listen: "192.168.10.1:5060"     # phone-facing NIC → deterministic SIP reply source
+#     media_ip:   "192.168.10.1"          # same interface — phones send RTP to it
+# Find the right IP with:   ip -o -4 addr show   /   ip route get <a-phone-ip>
+
+# Optional SIP-over-TLS (SIPS) — requires a build with `--features tls`.
+# sips_listen:  "0.0.0.0:5061"
+# sip_tls_cert: "/etc/commos/tls/fullchain.pem"                 # public cert chain (plain path)
+# sip_tls_key:  { ref_uri: "file:///etc/commos/tls/key.pem" }   # private key by reference
+
+# ── Media / security ─────────────────────────────────────────────────────────
+srtp:              true    # encrypt RTP (SRTP/SDES) when a phone offers RTP/SAVP. Plain callers unaffected.
+trunk_srtp:        false   # also offer SRTP to a carrier trunk. Off keeps the carrier leg plaintext so trunk calls never break.
+record_calls:      false   # capture call audio as stored objects on hangup.
+voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+require_sip_auth: false     # true → phones must present SIP digest credentials. Enable before exposing SIP.
+sip_realm:        "commos"  # digest realm presented in the auth challenge.
+dev_tokens:       true      # accept the `tenant:<uuid>` dev bearer for /v1. Set false in production once jwt_secret is set.
+# jwt_secret:     { ref_uri: "env://COMMOS_JWT_SECRET" }            # HS256 signing key for /v1 bearer tokens.
+# admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # gate privileged admin routes.
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+data_dir: "."   # SQLite DB (commos.db) + local object store live here. Use an absolute path in production.
+# database_url:   { ref_uri: "env://DATABASE_URL" }   # unset → embedded SQLite (durable, zero-dep). postgres:// for HA; memory:// for tests.
+#   Rejected (secret inline):  database_url: postgres://user:password@db:5432/commos
+# object_storage: "s3://my-bucket"                    # unset → filesystem under {data_dir}/objects. S3 needs a `--features s3` build.
+
+# ── Dialplan ─────────────────────────────────────────────────────────────────
+default_country_code: "1"    # digits, no '+'. National vs international classification for trunk routing / E.164.
+allow_international:   false  # permit dialing outside default_country_code.
+# max_concurrent_calls: 100  # per-tenant in-progress-call cap. Unset → no cap.
+
+# ── Logging ──────────────────────────────────────────────────────────────────
 log:
-  format: json   # json (structured, systemd/observability) | text (human, dev)
-  level: info
+  format: json   # json (structured) | text (human)
+  level:  info   # trace|debug|info|warn|error  (RUST_LOG env overrides)
