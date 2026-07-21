@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bus::EventBus;
+use crate::control::agents::AgentRegistry;
 use crate::control::messaging::MessagingService;
 use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
@@ -23,6 +24,8 @@ pub struct AppState {
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
     pub queues: QueueService,
+    /// Ephemeral in-memory contact-centre agent states (like registrations, not durable).
+    pub agents: AgentRegistry,
     /// Ephemeral in-memory device registrations (deliberately NOT the durable store —
     /// keeps write volume near zero for SD-card longevity; CMOS-14-DEP-021).
     pub registrations: RegistrationRegistry,
@@ -41,6 +44,7 @@ impl AppState {
         messaging: MessagingService,
         realtime: RealtimeService,
         queues: QueueService,
+        agents: AgentRegistry,
         registrations: RegistrationRegistry,
         bus: EventBus,
         recent: RecentEvents,
@@ -51,6 +55,7 @@ impl AppState {
             messaging,
             realtime,
             queues,
+            agents,
             registrations,
             bus,
             recent,

@@ -4,6 +4,7 @@
 //! (`https://{host}/v1`). Operational signals and non-normative introspection live
 //! outside `/v1` so they can never be confused for the versioned contract.
 
+pub mod agents;
 pub mod auth;
 pub mod calls;
 pub mod cdrs;
@@ -57,9 +58,12 @@ pub fn router(state: AppState) -> Router {
         // Billing — CDRs are produced by the platform on call end (read-only).
         .route("/cdrs", get(cdrs::list_cdrs))
         .route("/cdrs/:id", get(cdrs::get_cdr))
-        // Contact-centre — call queues.
+        // Contact-centre — call queues, agents, and enqueue (ACD).
         .route("/queues", get(queues::list_queues).post(queues::create_queue))
-        .route("/queues/:id", get(queues::get_queue));
+        .route("/queues/:id", get(queues::get_queue))
+        .route("/queues/:id/enqueue", post(queues::enqueue_call))
+        .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
+        .route("/agents/:id", get(agents::get_agent));
 
     Router::new()
         .nest("/v1", v1)

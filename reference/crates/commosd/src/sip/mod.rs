@@ -14,6 +14,7 @@
 //! reach across that boundary yet (see the TODO in [`server`]).
 
 pub mod message;
+pub mod rtp;
 pub mod server;
 
 pub use server::SipServer;

@@ -140,17 +140,23 @@ async fn run(cfg: Config) -> i32 {
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
+    let agents = control::agents::AgentRegistry::new(store.clone(), signal.clone());
     let registrations = control::registrations::RegistrationRegistry::new();
 
-    // SIP signalling ingress (Volume 7): a real softphone can REGISTER and appear in
-    // /v1/registrations and the dashboard. The ingress maps to a single tenant for now
-    // (SIP-domain→tenant mapping is Volume 9). INVITE→Call + RTP land next.
+    // SIP signalling ingress (Volume 7): a real softphone can REGISTER, and an INVITE creates
+    // an inbound Call, reports ring/answer as media facts, sets up an RTP echo path, and is
+    // answered with SDP. The ingress maps to a single tenant for now (Volume 9).
     if let Some(sip_addr) = cfg.sip_listen {
-        let regs = registrations.clone();
         let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
             .expect("valid default SIP tenant");
+        let server = sip::SipServer::new(
+            registrations.clone(),
+            routing.clone(),
+            cfg.media_ip,
+            default_tenant,
+        );
         tokio::spawn(async move {
-            if let Err(e) = sip::SipServer::new(regs, default_tenant).run(sip_addr).await {
+            if let Err(e) = server.run(sip_addr).await {
                 tracing::error!("SIP ingress stopped: {e}");
             }
         });
@@ -178,6 +184,7 @@ async fn run(cfg: Config) -> i32 {
         messaging,
         realtime,
         queues,
+        agents,
         registrations,
         bus.clone(),
         recent,

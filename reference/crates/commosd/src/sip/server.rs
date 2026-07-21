@@ -1,54 +1,73 @@
 //! The UDP SIP signalling ingress (Volume 7) — the front door a real softphone talks to.
 //!
-//! It binds a [`UdpSocket`], parses each datagram with [`super::message`], and dispatches by
-//! method. REGISTER is fully handled: the AoR→contact binding is driven into the
-//! [`RegistrationRegistry`], so a phone that sends REGISTER actually appears in the platform
-//! (`GET /registrations`). OPTIONS, BYE and CANCEL get a `200 OK`; INVITE gets `100 Trying`
-//! then `200 OK` with media negotiation still to come (see the TODO in [`Self::handle`]);
-//! ACK, per SIP, gets no response.
+//! Parses each datagram with [`super::message`] and dispatches by method:
+//! - **REGISTER** binds the AoR→contact in the [`RegistrationRegistry`] (a phone appears in
+//!   the platform).
+//! - **INVITE** creates an inbound [`Call`](commos_core::entities::call::Call) in the control
+//!   plane, reports ring+answer as media facts, sets up an RTP echo path, and answers
+//!   `200 OK` with an SDP answer — a caller can place a call and hear themselves.
+//! - **BYE/CANCEL** hangs the Call up (which produces the CDR), aborts its RTP, and `200`s.
+//! - **OPTIONS** `200`s; **ACK** is silent; anything else `501`s.
 //!
 //! Robustness is a hard requirement: a malformed datagram is logged at debug and dropped —
 //! it must never break the receive loop.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 
-use commos_core::common::Uuid;
+use commos_core::common::{Timestamp, Uuid};
 
 use crate::control::registrations::RegistrationRegistry;
+use crate::control::routing::Routing;
+use crate::media::MediaFact;
 
 use super::message::{self, SipMessage};
+use super::rtp;
 
-/// Largest UDP SIP datagram we accept. RFC 3261 keeps unreliable-transport messages well
-/// under the path MTU; 64 KiB is the UDP ceiling and leaves ample headroom for INVITE+SDP.
+/// Largest UDP SIP datagram we accept (the UDP ceiling; ample for INVITE+SDP).
 const MAX_DATAGRAM: usize = 65_535;
 
-/// The UDP SIP server. Cheap to construct; [`Self::run`] takes ownership and drives the
-/// receive loop until the socket errors fatally.
+/// Per-INVITE state, keyed by the SIP `Call-ID`, so BYE/CANCEL can find the Call and its RTP.
+struct Dialog {
+    call_id: Uuid,
+    rtp: JoinHandle<()>,
+}
+
+/// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
 pub struct SipServer {
     registrations: RegistrationRegistry,
-    /// The tenant every registration on this ingress is attributed to.
-    ///
-    /// **Single-tenant simplification.** The SIP plane here binds one UDP port to one
-    /// tenant. A real deployment maps the inbound SIP domain / trunk (or an authenticated
-    /// identity) to a tenant — multi-tenant SIP routing is Volume 9 work. Until then every
-    /// REGISTER on this socket lands in `default_tenant`.
+    routing: Routing,
+    /// IP advertised in SDP `c=`/`o=` lines. Set to the server's reachable address for real
+    /// phones; `127.0.0.1` suffices for a loopback echo test.
+    media_ip: IpAddr,
+    /// The tenant every request on this ingress is attributed to (single-tenant
+    /// simplification; SIP-domain→tenant mapping is Volume 9).
     default_tenant: Uuid,
+    /// Active dialogs by SIP `Call-ID`.
+    dialogs: Arc<Mutex<HashMap<String, Dialog>>>,
 }
 
 impl SipServer {
-    /// Create a server bound (logically) to one tenant, sharing the hub's registration
-    /// registry so registrations are visible through the control plane / API.
-    pub fn new(registrations: RegistrationRegistry, default_tenant: Uuid) -> Self {
+    pub fn new(
+        registrations: RegistrationRegistry,
+        routing: Routing,
+        media_ip: IpAddr,
+        default_tenant: Uuid,
+    ) -> Self {
         SipServer {
             registrations,
+            routing,
+            media_ip,
             default_tenant,
+            dialogs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error;
-    /// per-datagram errors are contained and logged.
+    /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error.
     pub async fn run(self, bind: SocketAddr) -> std::io::Result<()> {
         let socket = UdpSocket::bind(bind).await?;
         let local = socket.local_addr().unwrap_or(bind);
@@ -59,22 +78,16 @@ impl SipServer {
             let (len, src) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
                 Err(e) => {
-                    // A recv error is transient on UDP (e.g. ICMP port-unreachable surfaced
-                    // as an error on some platforms); log and keep serving.
                     tracing::debug!(error = %e, "SIP recv_from error; continuing");
                     continue;
                 }
             };
-
-            // Isolate handling so a panic-free error path never breaks the loop.
             if let Err(e) = self.handle(&socket, &buf[..len], src).await {
                 tracing::debug!(error = %e, %src, "dropping SIP datagram");
             }
         }
     }
 
-    /// Parse and dispatch a single datagram. Any parse failure or send error is returned so
-    /// the caller can log-and-drop it.
     async fn handle(
         &self,
         socket: &UdpSocket,
@@ -89,7 +102,6 @@ impl SipServer {
             }
         };
 
-        // Responses arriving at an ingress socket are not something we act on here.
         let method = match msg.method() {
             Some(m) => m.to_string(),
             None => {
@@ -106,14 +118,10 @@ impl SipServer {
             }
             "INVITE" => self.on_invite(socket, &msg, src).await,
             "ACK" => {
-                // ACK is hop-by-hop and never answered (RFC 3261 §17). Nothing to send.
                 tracing::info!(method = %method, %src, "SIP ACK");
                 Ok(())
             }
-            "BYE" | "CANCEL" => {
-                tracing::info!(method = %method, %src, "SIP {method}");
-                self.reply(socket, &msg, 200, "OK", src).await
-            }
+            "BYE" | "CANCEL" => self.on_bye(socket, &msg, src).await,
             other => {
                 tracing::info!(method = %other, %src, "SIP method not implemented");
                 self.reply(socket, &msg, 501, "Not Implemented", src).await
@@ -121,8 +129,7 @@ impl SipServer {
         }
     }
 
-    /// Handle REGISTER: bind the AoR to its contact in the registry and confirm with a
-    /// `200 OK` that echoes the accepted Contact and Expires (RFC 3261 §10.3).
+    /// REGISTER: bind the AoR to its contact and confirm with a `200 OK`.
     async fn on_register(
         &self,
         socket: &UdpSocket,
@@ -136,18 +143,10 @@ impl SipServer {
                 return self.reply(socket, msg, 400, "Bad Request", src).await;
             }
         };
-
         let expires = msg.expires();
-        // Fall back to the transport source if the phone sent no Contact (or a wildcard),
-        // so the binding still points somewhere reachable.
-        let contact = msg
-            .contact_uri()
-            .unwrap_or_else(|| format!("sip:{}", src));
+        let contact = msg.contact_uri().unwrap_or_else(|| format!("sip:{}", src));
         let user_agent = msg.user_agent().map(str::to_string);
 
-        // Drive the shared registry. Expires == 0 is a de-registration: register with a
-        // zero lifetime (immediate expiry) as a best-effort unbind, then still 200 — a full
-        // remove-by-AoR path is a later refinement, but the binding lapses either way.
         let reg = self.registrations.register(
             self.default_tenant,
             aor.clone(),
@@ -155,61 +154,176 @@ impl SipServer {
             user_agent.clone(),
             expires,
         );
-
         if expires == 0 {
             tracing::info!(method = "REGISTER", %aor, %src, "SIP de-register (expires=0)");
         } else {
-            tracing::info!(
-                method = "REGISTER",
-                %aor,
-                contact = %contact,
-                expires,
-                registration_id = %reg.id,
-                user_agent = user_agent.as_deref().unwrap_or("-"),
-                "SIP REGISTER"
-            );
+            tracing::info!(method = "REGISTER", %aor, contact = %contact, expires,
+                registration_id = %reg.id, "SIP REGISTER");
         }
 
-        // Echo the Contact (with the granted expiry) and the Expires header the client asked
-        // for, so the phone knows its binding was accepted and when to refresh.
         let contact_header = format!("<{contact}>;expires={expires}");
-        let extra = [
-            ("Contact", contact_header),
-            ("Expires", expires.to_string()),
-        ];
+        let extra = [("Contact", contact_header), ("Expires", expires.to_string())];
         let resp = message::response_with(msg, 200, "OK", &extra);
         self.send(socket, resp.as_bytes(), src).await
     }
 
-    /// Handle INVITE: provisionally accept with `100 Trying`, then `200 OK`.
+    /// INVITE: create an inbound Call, report ring+answer facts, set up RTP echo, answer
+    /// `200 OK` with an SDP answer.
     async fn on_invite(
         &self,
         socket: &UdpSocket,
         msg: &SipMessage,
         src: SocketAddr,
     ) -> std::io::Result<()> {
-        tracing::info!(
-            method = "INVITE",
-            request_uri = msg.request_uri().unwrap_or("-"),
-            %src,
-            "SIP INVITE"
-        );
+        let call_id_hdr = msg.call_id().unwrap_or("").to_string();
+        let to_ref = msg
+            .request_uri()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "sip:unknown".to_string());
+        let from_ref = msg
+            .header("From")
+            .and_then(extract_uri)
+            .unwrap_or_else(|| format!("sip:{}", src));
 
-        // Provisional: tell the caller we got it and are working on it (RFC 3261 §21.1.2).
+        tracing::info!(method = "INVITE", from = %from_ref, to = %to_ref, %src, "SIP INVITE");
+
+        // Provisional response.
         let trying = message::response(msg, 100, "Trying");
         self.send(socket, trying.as_bytes(), src).await?;
 
-        // TODO(Volume 7 media): a real INVITE must negotiate SDP against the MediaPlane
-        // boundary and create a Call in the control plane (the hub wires routing→media).
-        // Here we only ack signalling so a softphone's dial attempt completes at the SIP
-        // layer; no RTP is set up and no Call entity is created yet. Answering 200 without
-        // an SDP answer body is intentionally incomplete and will be replaced when the
-        // media plane is connected.
-        let ok = message::response(msg, 200, "OK");
+        // Create the inbound Call in the control plane.
+        let call = match self
+            .routing
+            .create_inbound_call(self.default_tenant, from_ref, to_ref)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "INVITE could not create Call");
+                return self.reply(socket, msg, 500, "Server Internal Error", src).await;
+            }
+        };
+        let call_id = call.base.id;
+
+        // SIP is the media plane here: report ring then answer as facts. Applied
+        // synchronously (we hold the Routing handle) so the Call is ANSWERED before we send
+        // 200 OK — a fast BYE then always finds an answered Call to hang up.
+        for fact in [
+            MediaFact::Rang { tenant_id: self.default_tenant, call_id },
+            MediaFact::Answered {
+                tenant_id: self.default_tenant,
+                call_id,
+                answered_at: Timestamp::now(),
+            },
+        ] {
+            if let Err(e) = self.routing.apply_fact(fact).await {
+                tracing::warn!(error = %e, %call_id, "applying SIP media fact failed");
+            }
+        }
+
+        // Set up the RTP echo path and remember the dialog for BYE.
+        let rtp_port = match rtp::bind_echo().await {
+            Ok((port, task)) => {
+                if !call_id_hdr.is_empty() {
+                    self.dialogs
+                        .lock()
+                        .expect("dialogs mutex")
+                        .insert(call_id_hdr, Dialog { call_id, rtp: task });
+                } else {
+                    task.abort();
+                }
+                port
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind RTP; answering without media");
+                0
+            }
+        };
+
+        // Answer with SDP.
+        let sdp = self.build_sdp(rtp_port);
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        tracing::info!(%call_id, rtp_port, "SIP INVITE answered (RTP echo)");
         self.send(socket, ok.as_bytes(), src).await
     }
 
-    /// Build a plain (bodyless) response for `msg` and send it.
+    /// BYE/CANCEL: hang the Call up (produces the CDR), abort its RTP, and `200 OK`.
+    async fn on_bye(
+        &self,
+        socket: &UdpSocket,
+        msg: &SipMessage,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
+        let method = msg.method().unwrap_or("BYE").to_string();
+        if let Some(call_id_hdr) = msg.call_id() {
+            let dialog = self.dialogs.lock().expect("dialogs mutex").remove(call_id_hdr);
+            if let Some(d) = dialog {
+                d.rtp.abort();
+                if let Err(e) = self
+                    .routing
+                    .hangup(self.default_tenant, d.call_id, Some(method.clone()))
+                    .await
+                {
+                    tracing::warn!(error = %e, call_id = %d.call_id, "SIP {method} hangup failed");
+                } else {
+                    tracing::info!(method = %method, call_id = %d.call_id, "SIP {method} → hangup");
+                }
+            }
+        }
+        self.reply(socket, msg, 200, "OK", src).await
+    }
+
+    /// Build the SDP answer advertising the RTP echo port (PCMU/8000, sendrecv).
+    fn build_sdp(&self, rtp_port: u16) -> String {
+        format!(
+            "v=0\r\n\
+             o=commos 0 0 IN IP4 {ip}\r\n\
+             s=CommOS\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=sendrecv\r\n",
+            ip = self.media_ip,
+            port = rtp_port
+        )
+    }
+
+    /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
+    /// bodyless [`message::response`] builder can't carry SDP, so INVITE answers are built
+    /// here.)
+    fn build_invite_ok(&self, msg: &SipMessage, sdp: &str, call_id: Uuid) -> String {
+        let mut out = String::with_capacity(512);
+        out.push_str("SIP/2.0 200 OK\r\n");
+        for via in msg.header_all("Via") {
+            out.push_str(&format!("Via: {via}\r\n"));
+        }
+        if let Some(from) = msg.header("From") {
+            out.push_str(&format!("From: {from}\r\n"));
+        }
+        if let Some(to) = msg.header("To") {
+            if msg.to_tag().is_some() {
+                out.push_str(&format!("To: {to}\r\n"));
+            } else {
+                // Our (callee) dialog tag, derived from the Call it created.
+                let tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
+                out.push_str(&format!("To: {to};tag={tag}\r\n"));
+            }
+        }
+        if let Some(cid) = msg.call_id() {
+            out.push_str(&format!("Call-ID: {cid}\r\n"));
+        }
+        if let Some(cseq) = msg.header("CSeq") {
+            out.push_str(&format!("CSeq: {cseq}\r\n"));
+        }
+        out.push_str(&format!("Contact: <sip:commos@{}>\r\n", self.media_ip));
+        out.push_str("Server: commosd\r\n");
+        out.push_str("Content-Type: application/sdp\r\n");
+        out.push_str(&format!("Content-Length: {}\r\n\r\n", sdp.len()));
+        out.push_str(sdp);
+        out
+    }
+
     async fn reply(
         &self,
         socket: &UdpSocket,
@@ -226,4 +340,25 @@ impl SipServer {
         socket.send_to(bytes, dst).await?;
         Ok(())
     }
+}
+
+/// Extract the first `sip:`/`sips:`/`tel:` URI from a header value (prefer the
+/// angle-bracketed `<...>` form).
+fn extract_uri(value: &str) -> Option<String> {
+    if let (Some(a), Some(b)) = (value.find('<'), value.find('>')) {
+        if a < b {
+            return Some(value[a + 1..b].trim().to_string());
+        }
+    }
+    let v = value.trim();
+    for scheme in ["sips:", "sip:", "tel:"] {
+        if let Some(i) = v.find(scheme) {
+            let rest = &v[i..];
+            let end = rest
+                .find(|c: char| c == ';' || c == '>' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
 }

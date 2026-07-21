@@ -128,6 +128,46 @@ impl Routing {
         Ok(call)
     }
 
+    /// Create an **inbound** Call from a SIP INVITE and emit `CallStarted`. Unlike
+    /// [`Self::originate`], this does NOT dispatch to the loopback media plane — the SIP/RTP
+    /// plane *is* the media here, and it reports ring/answer as media facts
+    /// ([`Self::apply_fact`]) itself. Returns the created Call (state `INITIATED`).
+    pub async fn create_inbound_call(
+        &self,
+        tenant: Uuid,
+        from_ref: impl Into<String>,
+        to_ref: impl Into<String>,
+    ) -> Result<Call, RoutingError> {
+        let call = Call::originate(tenant, Direction::Inbound, from_ref, to_ref);
+        let ctx = Correlation {
+            tenant_id: tenant,
+            correlation_id: call.correlation_id,
+            causation_id: None,
+            sequence: Some(0),
+            traceparent: None,
+        };
+        let envelope = Envelope::new(
+            CallStarted {
+                call_id: call.base.id,
+                direction: call.direction,
+                from_ref: call.from_ref.clone(),
+                to_ref: call.to_ref.clone(),
+                device_id: None,
+            },
+            &ctx,
+            format!("{}:CallStarted", call.base.id),
+        );
+        self.store
+            .commit(Tx {
+                calls: vec![call.clone()],
+                events: vec![envelope.to_json()],
+                ..Default::default()
+            })
+            .await?;
+        self.signal.wake();
+        Ok(call)
+    }
+
     /// Apply a media fact to Call state and emit the corresponding event
     /// (media→control, CMOS-03-ARCH-003). Driven by the fact loop wired in `main`; a real
     /// media node reports these from actual signalling.

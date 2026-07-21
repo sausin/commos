@@ -4,7 +4,7 @@
 //! Git-reviewable (deterministic, diff-friendly) and MUST NOT embed secrets
 //! (CMOS-14-DEP-083): secrets are *referenced*, resolved from an external manager.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,11 @@ pub struct Config {
     /// (the IANA SIP port); `null` disables the SIP plane.
     #[serde(default = "default_sip_listen")]
     pub sip_listen: Option<SocketAddr>,
+
+    /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
+    /// echo test); set to the server's LAN/public address for real phones.
+    #[serde(default = "default_media_ip")]
+    pub media_ip: IpAddr,
 
     /// Database DSN — the system of record. A **reference**, never an inline credential
     /// (CMOS-14-DEP-083). `None` (the default) means use the embedded SQLite store at
@@ -114,11 +119,16 @@ impl Default for Config {
             api_version: default_api_version(),
             listen: default_listen(),
             sip_listen: default_sip_listen(),
+            media_ip: default_media_ip(),
             database_url: None,
             data_dir: default_data_dir(),
             log: LogConfig::default(),
         }
     }
+}
+
+fn default_media_ip() -> IpAddr {
+    IpAddr::from([127, 0, 0, 1])
 }
 
 fn default_data_dir() -> String {

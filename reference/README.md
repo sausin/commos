@@ -128,26 +128,27 @@ ephemeral in-process store (tests), set `database_url` to `memory://`.
   re-REGISTER storm never touches disk — SD cards last (CMOS-14-DEP-021). A real softphone
   can also register over **SIP/UDP** (see below).
 - **Billing** — `GET /v1/cdrs`, `GET /v1/cdrs/{id}`. A CDR + `BillingGenerated` event are
-  produced atomically when a Call ends (Volume 10).
-- **Contact-centre** — `GET|POST /v1/queues`, `GET /v1/queues/{id}` (strategy + members).
+  produced atomically when a Call ends; cost comes from a destination-aware **rating engine**
+  (E.164 longest-prefix table, per-minute rounding — Volume 10, the `Rating` interface).
+- **Contact-centre** — `GET|POST /v1/queues`, `GET /v1/queues/{id}`; `GET|POST /v1/agents`
+  (agent state), and `POST /v1/queues/{id}/enqueue` which assigns a Call to an available
+  agent (basic ACD) and emits `AgentStateChanged`.
 - `GET /_introspect/events[/stream]` — **non-normative** view of the event bus for bring-up; not part of the contract.
 
 ### SIP signalling (Volume 7)
 
-`commosd` also listens for **SIP over UDP** (default `0.0.0.0:5060`, set `sip_listen: null` to
-disable). REGISTER is fully handled — a real softphone (Linphone, a desk phone) registers and
-appears in `/v1/registrations` and the dashboard:
+`commosd` listens for **SIP over UDP** (default `0.0.0.0:5060`, `sip_listen: null` disables;
+`media_ip` sets the address advertised in SDP). A real softphone can **register and place a
+call** end-to-end:
 
-```bash
-# from a SIP client, or a quick smoke test:
-printf 'REGISTER sip:commos.local SIP/2.0\r\nVia: SIP/2.0/UDP host;branch=z9hG4bK1\r\n'\
-'From: <sip:200@commos.local>;tag=a\r\nTo: <sip:200@commos.local>\r\nCall-ID: c1\r\n'\
-'CSeq: 1 REGISTER\r\nContact: <sip:200@host:5060>\r\nExpires: 3600\r\n\r\n' \
-  | nc -u -w1 localhost 5060           # -> SIP/2.0 200 OK
-```
+- **REGISTER** binds the AoR → appears in `/v1/registrations` and the dashboard.
+- **INVITE** creates an inbound `Call`, drives it to `ANSWERED`, sets up an **RTP echo** path,
+  and answers `200 OK` with an SDP body — the caller hears themselves (classic echo test).
+- **BYE/CANCEL** hangs the Call up (producing its **CDR**) and tears down the RTP.
 
-OPTIONS/BYE/CANCEL are answered; INVITE is acknowledged at the signalling layer. INVITE→Call
-creation and RTP media negotiation are the next step behind the existing `MediaPlane` boundary.
+Verified end-to-end: `INVITE → 100 Trying → 200 OK (SDP)`, an RTP packet to the advertised
+port is echoed back, then `BYE → 200 OK` and the Call reaches `ENDED` with a CDR. RTP is an
+echo relay today; leg-to-leg bridging, transcoding, and conferencing are the next media steps.
 
 All `/v1` routes are bearer-authenticated and tenant-scoped.
 
@@ -169,11 +170,10 @@ All `/v1` routes are bearer-authenticated and tenant-scoped.
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. **SIP INVITE→Call + RTP media** — the SIP ingress handles REGISTER today; the next step is
-   INVITE creating a Call and RTP/SDP negotiation behind the existing `MediaPlane` boundary
-   (the control→media command path and media→control fact channel are already in place).
-2. Contact-centre depth: enqueue Calls into a Queue and route to Agents (`AgentStateChanged`
-   exists), and a real rating engine behind the CDR (the `Rating` interface is contracted).
+1. **RTP media depth** — leg-to-leg bridging (softphone↔softphone), transcoding, and
+   conferencing; and outbound INVITE (the `MediaPlane` command path is already in place).
+2. Contact-centre depth: strategy-aware distribution (skills/round-robin state), wrap-up, and
+   number normalisation so SIP-URI destinations rate like E.164.
 3. Richer queries / update / soft-delete across the workloads.
 4. Multi-node relay: switch the PostgreSQL relay to `SELECT … FOR UPDATE SKIP LOCKED` for
    concurrent control-plane nodes (split-media topology).
