@@ -1,176 +1,298 @@
+<div align="center">
+
 # CommOS
 
-**A specification-first blueprint for a modern communications operating system.**
+**A modern Communications Operating System for the AI era.**
 
-CommOS is not (yet) a program. It is a **contract**. The legacy PBX world —
-Asterisk, FreeSWITCH, and their descendants — encodes its behaviour in XML
-dialplans, Lua scripts, and tribal knowledge. CommOS inverts that: the durable
-asset is a precise, versioned, implementation-independent **specification suite**
-plus a set of **machine-readable contracts** and an **executable conformance
-harness**. Code is replaceable; the contract is the standard.
+API-first · Identity-first · Event-driven · Rust-powered · One binary.
+From 5 users to 500,000.
 
-The guiding reframe: **voice is one workload.** A PBX is one application running
-on a general communications substrate. The same substrate — Identity, Routing,
-Presence, Media, Object Storage, Event Bus, Billing, Policy, AI Integration —
-extends to messaging, video, intercom, contact centre, AI agents, and IoT
-endpoints without a redesign.
+*Not another PBX — a platform for building modern business communications.*
 
-## Why specification-first
+</div>
 
-For a system that is, in effect, a distributed real-time operating system,
-implementation quality depends far more on **architecture and contracts** than on
-feature lists. Freezing the contracts first lets independent teams — human or AI —
-implement compatible components in parallel, and keeps alternative implementations
-(a different media engine, a different provisioning engine) viable without breaking
-compatibility. The intent is a vendor-neutral platform standard, in the spirit of
-what OCI did for containers and Kubernetes did for orchestration.
+---
 
-## Repository layout
+CommOS starts from a single reframe: **voice is just another workload.** A PBX is one
+application running on a general communications substrate — the same Identity, Routing,
+Media, Events, Billing, and Storage spine also carries messaging, video, presence, IVR,
+contact-centre, and AI agents, with no redesign.
 
-| Path | What it is |
-|------|-----------|
-| [`spec/`](spec/) | The specification suite — 20 volumes (0–19). The normative prose. |
-| [`spec/CONVENTIONS.md`](spec/CONVENTIONS.md) | Normative language (RFC 2119), requirement IDs, contract versioning, conformance levels. Read this first. |
-| [`spec/GLOSSARY.md`](spec/GLOSSARY.md) | Canonical terms. One word, one meaning. |
-| [`contracts/`](contracts/) | Machine-readable contracts: JSON Schema for the domain model and events, OpenAPI for the API. **Normative.** |
-| [`conformance/`](conformance/) | The executable conformance harness. Validates that the contracts are self-consistent and that any implementation conforms. |
-| [`reference/`](reference/) | The **reference implementation** — the `commosd` single binary (Rust). First vertical slice of the frozen spine; builds for Raspberry Pi 4 (arm64) and amd64. |
+Instead of exposing SIP internals and XML dialplans, CommOS exposes **business concepts** —
+people, extensions, numbers, call flows, policies, events — and decides for itself how to
+translate that intent into signalling. It ships as **one self-contained binary** that runs on
+a Raspberry Pi or a fleet of servers, is driven entirely by a **REST API**, and emits a
+**structured event for every observable thing that happens**.
 
-## The specification suite
-
-Read [`spec/README.md`](spec/README.md) for the full index and the **freeze-status
-matrix**. In brief:
-
-- **0 Philosophy** — the constitution: invariants and non-goals every other volume obeys.
-- **1 PRD** — personas, epics, acceptance criteria.
-- **2 Domain Model** — the keystone: every entity, its lifecycle and relationships.
-- **3 Architecture** — subsystems and the control-plane / media-plane split.
-- **4 API** — REST/WebSocket conventions and the endpoint catalogue (OpenAPI).
-- **5 Events** — the canonical event model, envelope, and delivery guarantees.
-- **6–18** — Database, Communications, Provisioning, Security, Billing, AI, Plugin
-  SDK, UI/UX, Deployment, Observability, Testing, Performance, Engineering Standards.
-- **19 ADRs** — why each significant decision was made, and what would reopen it.
-
-## Specification-first development process
-
-1. Freeze the **domain model** (Volume 2 + `contracts/json-schema/entities`).
-2. Freeze the **event model** (Volume 5 + `contracts/json-schema/events`).
-3. Freeze the **APIs** (Volume 4 + `contracts/openapi`).
-4. Freeze the **UX flows** (Volume 13).
-5. Build **executable conformance tests** from the specifications (`conformance/`).
-6. **Implement** against those tests.
-
-A contract is *frozen* only when it has a machine-readable form under `contracts/`
-and the conformance harness passes against it. Prose without a contract is a draft.
-
-## Running the conformance harness
-
-```bash
-python3 -m pip install jsonschema        # one dependency
-python3 conformance/run.py               # validates contracts + spec consistency
-```
-
-The harness is the arbiter of "does this conform." See [`conformance/README.md`](conformance/README.md).
-
-## Stand up a test PBX (real phones, ~5 minutes)
-
-The installer gets a box to a working state and avoids the usual setup traps (chiefly a
-loopback `media_ip`, which makes calls connect with no audio):
+## Quickstart — a working phone system in ~5 minutes
 
 ```bash
 cd reference
-sudo scripts/install.sh --build --systemd            # detects LAN IP, writes pbx.yaml, installs a service
-# or, no root / no systemd:
-scripts/install.sh --build --data-dir ./commos-data  # prints the exact command to start it
+sudo scripts/install.sh --build --systemd     # detects your LAN IP, writes pbx.yaml, installs a service
+#   no root / no systemd?
+scripts/install.sh --build --data-dir ./data  # prints the exact command to run it
 ```
 
-Then, from any machine on the LAN: open `http://<box-ip>:8080/onboarding` to add extensions,
-point each phone's SIP account at `<box-ip>:5060` (username = its extension), and place a call.
-Dialling your own number is an **echo test** (you hear yourself); dialling another phone's
-extension is a **two-way call**. Live state is at `/dashboard`, metrics at `/metrics`.
+The binary boots on an **embedded SQLite** database — durable, with **no server to install**.
+Then:
 
-This is a LAN test bed — SIP/RTP are unencrypted and REGISTER is not yet authenticated, so keep
-UDP 5060 off the public internet. PSTN/carrier trunking, recording, and voicemail are not built
-yet; internal calling and the echo test are.
-
-## Building & releases
-
-The reference binary is deliberately pure-Rust in its cross-compilation-hostile
-dependencies (no OpenSSL, native-tls, or C codec libraries), so it builds for every
-target with a stock cross toolchain:
+1. Open **`http://<box-ip>:8080/onboarding`** — answer two questions (what kind of place, how
+   many phones) and CommOS proposes an extension plan, a network layout, discovered phones, and
+   the exact DNS/DHCP lines so phones provision themselves. One click applies it.
+2. Point each phone's SIP account at **`<box-ip>:5060`** (username = its extension) and place a
+   call. Dial another extension for a two-way call; dial your own number for an echo test.
+3. Watch it live at **`/dashboard`**, scrape **`/metrics`**, or drive everything over the API:
 
 ```bash
-cd reference
-cargo build --release --bin commosd                                  # host
-cargo build --release --target aarch64-unknown-linux-gnu --bin commosd   # Raspberry Pi 4/5
+TENANT=01920000-0000-7000-8000-000000000001
+AUTH="Authorization: Bearer tenant:$TENANT"       # dev token; HS256 JWT verification is opt-in
+
+# Place a call
+curl -s -X POST localhost:8080/v1/calls -H "$AUTH" -H 'content-type: application/json' \
+     -d '{"direction":"OUTBOUND","from_ref":"sip:100","to_ref":"sip:200"}'
+
+# Publish a versioned IVR call flow, list voicemails, watch the event stream
+curl -s localhost:8080/v1/call-flows -H "$AUTH"
+curl -s localhost:8080/v1/voicemails -H "$AUTH"
+curl -s localhost:8080/_introspect/events
 ```
 
-**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push and PR:
-build + test + `clippy -D warnings` on amd64, a compile-check for every published
-architecture, and the full test suite for arm64 under QEMU — the two-architecture
-conformance evidence the deployment contract requires (CMOS-14-DEP-060). Contract
-conformance runs separately in [`conformance.yml`](.github/workflows/conformance.yml).
+> A LAN test bed today: SIP/RTP are unencrypted and SIP auth is optional, so keep UDP 5060 off
+> the public internet until TLS/SRTP and full auth land.
 
-**Releases** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) are cut by
-pushing a `v*` tag. Every supported architecture is built, packaged, checksummed, signed
-with a keyless [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations),
-and attached to a GitHub Release (CMOS-14-DEP-004: amd64 + arm64 parity, signed verifiable
-checksums):
+## Why
+
+Business telephony hasn't fundamentally changed in two decades. Today's platforms still expose
+legacy machinery — XML dialplans, SIP contexts, manual provisioning, device-centric billing,
+vendor lock-in. CommOS starts from first principles instead:
+
+- **Voice is one workload**, not the whole system.
+- **People and identities** are first-class — not extensions and MAC addresses.
+- **Every action is an event** — observable, auditable, and consumable by anything.
+- **Intent over configuration** — you declare *what*; the system decides *how*.
+
+## Design principles
+
+```
+✓ Rust-first          ✓ API-first           ✓ Event-driven
+✓ Identity-centric    ✓ Zero-touch setup    ✓ Multi-tenant
+✓ Cloud-neutral       ✓ S3-compatible       ✓ Observable
+✓ One binary          ✓ Horizontally scalable   ✓ Contract-defined
+```
+
+## What works today
+
+CommOS is a maturing reference implementation. This is real, running functionality — not a wish
+list:
+
+- **Telephony** — SIP/UDP registration; inbound and API-originated calls; the full Call
+  lifecycle (`INITIATED → RINGING → ANSWERED → …`); hold / resume / transfer / hangup; a two-leg
+  RTP bridge between registered phones (symmetric-RTP latching).
+- **Voicemail** — record-on-no-answer for internal extensions, message-waiting indication (MWI)
+  pushed over SIP `NOTIFY`, and a retrieval API with audio playback.
+- **IVR & Call Flows** — a versioned `CallFlow` entity with **publish / rollback** over
+  immutable, append-only revision history, and a **media runtime** that plays prompts and
+  collects **DTMF** (RFC 4733 telephone-events *and* SIP INFO) to route a caller — e.g. to
+  voicemail.
+- **Recording** — call audio captured as-is and stored as an object, with a retrieval API.
+- **Zero-touch provisioning** — an onboarding wizard that discovers phones from the ARP table,
+  proposes an extension/network plan, and generates DNS + DHCP-option-66 config so phones
+  provision themselves from `GET /provision/{mac}.cfg`.
+- **Billing** — a CDR and a `BillingGenerated` event produced atomically when a call ends, priced
+  by a destination-aware rating engine (E.164 longest-prefix, per-minute rounding).
+- **Contact-centre** — call queues with basic ACD (assign a call to an available agent) and agent
+  state.
+- **Directory** — people, extensions, phones, and routes, with lifecycle and config-as-code
+  export/import (`GET|POST /v1/config`).
+- **Platform** — a REST API (bearer auth, tenant isolation, Problem Details, idempotency,
+  cursor pagination), a **transactional outbox → event bus** (no state change without its event),
+  outbound **webhooks**, pluggable **object storage** (local or any S3-compatible service),
+  Prometheus **metrics**, and readiness-gated graceful drain.
+- **Multi-workload substrate** — messaging (channels/threads/messages), presence, and video-room
+  entities ride the same store, outbox, and API — proving voice is one workload of many.
+
+Everything is **multi-tenant** and runs from a **single binary** on either embedded SQLite
+(default, zero dependencies) or PostgreSQL (multi-node / HA).
+
+## Capabilities
+
+Shipped ✓ · Partial ◐ · Planned ○
+
+| Identity                | Communications            | Platform                     |
+| ----------------------- | ------------------------- | ---------------------------- |
+| Users ✓                 | SIP / RTP ✓               | REST API ✓                   |
+| Multi-tenancy ✓         | Calls & bridging ✓        | Event bus + outbox ✓         |
+| Bearer / HS256 JWT ✓    | Voicemail + MWI ✓         | Webhooks ✓                   |
+| Directory & lifecycle ✓ | IVR / Call Flows ✓        | Object storage (local/S3) ✓  |
+| Attribution chain ✓     | Recording ✓               | Billing / CDR + rating ✓     |
+| Capabilities / RBAC ◐   | Queues / ACD ✓            | Config-as-code ✓             |
+| OIDC / SSO ○            | Messaging · Presence ◐    | Metrics / observability ✓    |
+| WebAuthn / MFA ○        | Video / WebRTC ○          | Event streaming ◐            |
+| Device identity ○       | Conferences ○             | Automation ○                 |
+| PIN / RFID / Bluetooth ○| PSTN / SIP trunking ○     | WASM plugins ○               |
+
+## Architecture
+
+```
+              REST API   ·   Event Stream   ·   Webhooks
+            ┌───────────────────────────────────────────┐
+            │                API Gateway                 │  bearer auth · tenant scope · Problem Details
+            └───────────────────────────────────────────┘
+  ── Control plane ─────────────────────────────────────────────────
+     Identity · Provisioning · Routing · Call Flows / IVR
+     Policy · Billing / Rating · Queues (ACD) · Webhooks
+  ── Media plane ─── typed boundary, never shared memory ────────────
+     SIP (UDP) · RTP · DTMF · Prompt playout · Recording · Voicemail
+  ── Transactional outbox  ─────────────────────────────▶  Event Bus
+  ── Storage ────────────────────────────────────────────────────────
+     SQLite (default)  /  PostgreSQL        Object Storage (local / S3)
+```
+
+Two design invariants make this hold together:
+
+- **Control decides, media acts.** The control and media planes talk only over a **typed
+  interface, never shared memory** — even compiled into one binary — so the media plane can later
+  split onto its own node with no control-plane change.
+- **No state change without its event.** Every mutation and the event it produces are written in
+  the **same transaction** to an outbox, then relayed at-least-once. That is what makes the event
+  stream a faithful, replayable record of the platform.
+
+## Intent, not dialplans
+
+CommOS does not ask administrators to manage SIP contexts or XML. They manage **people, phones,
+numbers, and call flows**; the system translates that into signalling. The whole directory is
+**config-as-code** — export it as a Git-reviewable `pbx.yaml`, review the diff, re-import it:
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+curl -s localhost:8080/v1/config -H "$AUTH" > pbx.yaml     # export the live directory
+git diff pbx.yaml                                          # review the change
+curl -s -X POST localhost:8080/v1/config -H "$AUTH" \
+     -H 'content-type: text/yaml' --data-binary @pbx.yaml         # apply it
 ```
 
-| Architecture | libc | Target triple | Typical hardware |
-|---|---|---|---|
-| amd64 | glibc  | `x86_64-unknown-linux-gnu`      | servers, desktops |
-| amd64 | static | `x86_64-unknown-linux-musl`     | containers, portable |
-| arm64 | glibc  | `aarch64-unknown-linux-gnu`     | Raspberry Pi 4/5, ARM servers |
-| arm64 | static | `aarch64-unknown-linux-musl`    | containers, portable |
-| armv7 | glibc  | `armv7-unknown-linux-gnueabihf` | Raspberry Pi 2/3, Zero 2 W |
-
-The `musl` builds are fully static — no glibc dependency, run on any Linux of that
-architecture out of the box, which is the single-self-contained-binary mandate
-(CMOS-14-DEP-001) at its strongest.
-
-### Object storage (local or S3-compatible)
-
-Blobs (recordings, voicemail, exports, diagnostics) are stored behind a pluggable
-`ObjectStore`. By default they live on the **local filesystem** under `{data_dir}/objects`.
-The default binary is also built with the **`s3`** feature, so pointing `pbx.yaml` at any
-**S3-compatible** service (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi, Ceph) is just
-configuration — credentials come from the environment, never the file (CMOS-14-DEP-083):
+Runtime configuration is a separate, declarative `pbx.yaml`. Secrets are **references, never
+inlined** (an inline secret is rejected at boot):
 
 ```yaml
 # pbx.yaml
-object_storage: "s3://my-bucket"
-s3_endpoint: "https://s3.example.com"   # omit for AWS S3
-s3_region: "us-east-1"
-s3_path_style: true                      # safe default for S3-compatible servers
-```
-```sh
-export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…
+media_ip: "192.168.1.10"          # the address advertised to phones for RTP
+sip_listen: "0.0.0.0:5060"        # SIP/UDP ingress (null disables it)
+record_calls: true                # capture call audio as objects
+voicemail_enabled: true           # record-on-no-answer + MWI
+object_storage: "s3://my-bucket"  # local filesystem by default; any S3-compatible service
+database_url: { ref_uri: "env://DATABASE_URL" }   # embedded SQLite if unset
 ```
 
-For the leanest, purest-Rust binary (local storage only, no TLS stack), opt out with
-`cargo build --no-default-features`. The S3 backend uses **rustls** (never OpenSSL/native-tls),
-so an `s3`-enabled build still cross-compiles cleanly to every published architecture.
+## Provisioning, done right
+
+```
+Plug in a phone.  CommOS detects it.  Approve.  Done.
+```
+
+No XML. No per-vendor templates to hand-edit. No MAC-address spreadsheets. The onboarding wizard
+reads the network, flags likely IP phones by MAC vendor, and generates the DNS + DHCP lines to
+paste; each phone then fetches its own config and registers itself.
+
+## Billing that attributes to people
+
+Extensions don't make calls — **people do.** Every billable action is attributed along the chain
+
+```
+Device → Identity → Department → Cost Centre → Organisation
+```
+
+so a CDR carries *who*, not just *which port* — enabling internal recharge, department reporting,
+and real accountability. Off-net destinations are normalised to E.164 and priced by a
+longest-prefix rating table; the record is produced atomically with the call's `CallEnded` event.
+
+## AI wasn't bolted on
+
+CommOS doesn't ship a model — it ships **structure**. Every call becomes typed data, every
+recording an addressable object, every action an event on the bus. That makes CommOS a clean
+integration surface for any AI platform — OpenAI, Claude, Gemini, Ollama, vLLM, LangGraph, n8n,
+anything — consuming events (or webhooks) and acting through the same API a human would. AI is a
+first-class **consumer**, not a dependency baked into the core.
+
+## Scale
+
+The architecture is the same at every size. The control plane is **stateless** — all state lives
+in the store — so you scale out by adding nodes behind a load balancer and pointing them at one
+PostgreSQL. Start on a single Raspberry Pi with embedded SQLite; grow to a multi-node cluster
+without changing a line of application code.
+
+```
+5  →  50  →  500  →  5,000  →  50,000  →  500,000 users
+```
+
+## Built on frozen contracts
+
+CommOS's durable asset is not any one codebase — it's a precise, versioned, implementation-
+independent **contract**: the domain model and events as JSON Schema, the API as OpenAPI, and an
+**executable conformance harness** that proves an implementation conforms. Code is replaceable;
+the contract is the standard — in the spirit of what OCI did for containers.
+
+```bash
+python3 -m pip install jsonschema
+python3 conformance/run.py          # validates the contracts + spec consistency (500+ checks)
+```
+
+| Path | What it is |
+|------|-----------|
+| [`reference/`](reference/) | The **`commosd`** single binary (Rust) — the reference implementation. |
+| [`contracts/`](contracts/) | Machine-readable contracts: JSON Schema (entities + events), OpenAPI (the API). |
+| [`conformance/`](conformance/) | The executable conformance harness — the arbiter of "does this conform". |
+| [`spec/`](spec/) | The specification suite (20 volumes): the normative prose behind the contracts. |
+
+## Build & run
+
+Pure-Rust in its cross-compilation-hostile dependencies (no OpenSSL, native-tls, or C codec
+libraries), so the binary builds for every target with a stock toolchain:
+
+```bash
+cd reference
+cargo build --release --bin commosd                                    # host
+cargo build --release --target aarch64-unknown-linux-gnu --bin commosd # Raspberry Pi 4/5
+./target/release/commosd                                               # boots on :8080 (SQLite)
+```
+
+Releases are cut by pushing a `v*` tag; every architecture is built, checksummed, and signed with
+a keyless build-provenance attestation, then attached to a GitHub Release:
+
+| Architecture | libc | Target triple | Typical hardware |
+|---|---|---|---|
+| amd64 | glibc / musl | `x86_64-unknown-linux-{gnu,musl}` | servers, desktops, containers |
+| arm64 | glibc / musl | `aarch64-unknown-linux-{gnu,musl}` | Raspberry Pi 4/5, ARM servers, containers |
+| armv7 | glibc | `armv7-unknown-linux-gnueabihf` | Raspberry Pi 2/3, Zero 2 W |
+
+The `musl` builds are fully static — no glibc dependency, run on any Linux of that architecture
+out of the box. See [`reference/README.md`](reference/README.md) for the full operator guide
+(PostgreSQL, S3 storage, systemd, cross-builds).
 
 ## Status
 
-This is **v0.4** — **contract-complete**. The foundational spine (Philosophy, Domain,
-Events, API, Architecture) is `FROZEN`; the remaining volumes are at `REVIEW`. Every
-domain entity (36) and canonical event (74) has a JSON Schema and validated example,
-the OpenAPI covers the full API surface (91 paths), the subsystem interfaces are
-typed (8), and a second workload (messaging/video/presence/contact-centre) is modelled
-alongside voice — proving the substrate is workload-general. The executable
-conformance harness runs 500+ checks (green). See the freeze-status matrix in
-[`spec/README.md`](spec/README.md).
+An actively developed reference implementation on a frozen contract spine. The foundational
+volumes (Philosophy, Domain Model, Events, API, Architecture) are `FROZEN`; the platform surface
+above is real and growing. Production hardening — TLS/SRTP, full OIDC/RBAC, PSTN trunking,
+conferencing, WebRTC — is on the roadmap, tracked against the same contracts.
+
+```
+Phase 1 — Core Communications   ✓ Identity  ✓ SIP/RTP  ✓ Provisioning  ✓ Recording  ✓ Voicemail  ✓ IVR
+Phase 2 — Platform              ✓ Billing   ✓ Event Bus  ✓ Webhooks  ○ Plugins  ○ AI automation
+Phase 3 — Communications OS     ◐ Messaging  ◐ Video  ◐ Contact Centre  ○ Mobile clients  ○ Federation
+```
 
 ## Licence
 
-This repository is licensed under the **[O'Saasy License](https://osaasy.dev/)** (see
-[`LICENSE`](LICENSE)) — a source-available licence: you may **self-host, use, modify, and
-redistribute** it freely, but you may **not** repackage it and offer it to third parties as a
-competing hosted / managed / SaaS product where the platform's own functionality is the primary
-value. See [ADR-0009](spec/019-adrs/README.md) for the rationale and the spec-vs-standard note.
+Source-available under the **[O'Saasy License](https://osaasy.dev/)** (see [`LICENSE`](LICENSE)):
+self-host, use, modify, and redistribute freely — but don't repackage it as a competing hosted /
+managed / SaaS product. See [ADR-0009](spec/019-adrs/README.md) for the rationale.
+
+---
+
+<div align="center">
+
+*We believe communication infrastructure should be simple to operate, secure by default,
+programmable through APIs, observable by design, and intelligent through integration — not
+complexity. CommOS exists to build that future.*
+
+</div>
