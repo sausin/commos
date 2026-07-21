@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use super::admin::AdminContext;
 use super::auth::TenantContext;
 use super::problem::Problem;
-use crate::control::onboarding::{self, Environment, EnvironmentProfile, OnboardingSuggestion};
+use crate::control::onboarding::{
+    self, Environment, EnvironmentProfile, MacBinding, OnboardingSuggestion,
+};
 use crate::state::AppState;
 use crate::store::Tx;
 
@@ -34,6 +36,14 @@ pub struct SuggestParams {
     pub http_port: Option<u16>,
     /// The SIP UDP port (for the DNS SRV record). Defaults to 5060.
     pub sip_port: Option<u16>,
+    /// Which host interface (by name, e.g. `eth0`) to align the phone plan on. When the host
+    /// has more than one NIC the wizard offers this so the right subnet is picked. Omit to use
+    /// the primary outbound interface.
+    pub interface: Option<String>,
+    /// Point phones at HTTPS/SIPS instead of plain HTTP/SIP-UDP. Defaults to `false` — a
+    /// self-signed cert is rejected by most LAN phones, so SSL is opt-in (see the guide's advice).
+    #[serde(default)]
+    pub tls: bool,
 }
 
 /// `GET /v1/onboarding/suggest` — the full auto-detected suggestion for one round-trip setup.
@@ -46,7 +56,15 @@ pub async fn suggest(
     let domain = p.domain.unwrap_or_else(|| "commos.local".to_string());
     let http_port = p.http_port.unwrap_or(8080);
     let sip_port = p.sip_port.unwrap_or(5060);
-    Ok(Json(onboarding::suggest(env, p.devices, &domain, http_port, sip_port)))
+    Ok(Json(onboarding::suggest(
+        env,
+        p.devices,
+        &domain,
+        http_port,
+        sip_port,
+        p.interface.as_deref(),
+        p.tls,
+    )))
 }
 
 /// Body for `POST /v1/onboarding/apply` — the operator's confirmed choice.
@@ -60,6 +78,11 @@ pub struct ApplyBody {
     /// SIP domain woven into each extension's route (`sip:<number>@<domain>`). Defaults to
     /// `commos.local`.
     pub domain: Option<String>,
+    /// Explicit phone↔extension alignment the operator confirmed in the wizard: each entry pins a
+    /// MAC to an extension number. When present these win over ARP-order guessing, so a phone
+    /// lands on exactly the number the operator chose. Omit to keep the auto-bind behaviour.
+    #[serde(default)]
+    pub bindings: Vec<MacBinding>,
 }
 
 /// What `apply` created.
@@ -90,7 +113,8 @@ pub async fn apply(
         .unwrap_or_else(|| onboarding::suggest_extension_plan(env, body.devices).recommended_series);
     let domain = body.domain.unwrap_or_else(|| "commos.local".to_string());
 
-    let built = onboarding::build_entities(admin.tenant_id, body.devices, &series, &domain);
+    let built =
+        onboarding::build_entities(admin.tenant_id, body.devices, &series, &domain, &body.bindings);
     let outcome = ApplyOutcome {
         users_created: built.users.len(),
         extensions_created: built.extensions.len(),
@@ -182,6 +206,14 @@ async function adminLogin(password){
   }catch(e){return false}
 }
 let env="office";
+// Which host interface to align on (null → primary). Persisted across re-renders.
+let iface=null;
+// Whether to point phones at HTTPS/SIPS. Default OFF — self-signed certs are rejected on a LAN.
+let useTls=false;
+// Explicit phone↔extension alignment: MAC (as displayed) → extension number. Survives re-render.
+const macNumber={};
+// Manual MAC↔number rows for phones not yet on the wire. Survives re-render.
+const manualBindings=[];
 async function loadEnvs(){
   const box=document.getElementById('envs');
   try{
@@ -200,13 +232,16 @@ async function loadEnvs(){
 function row(k,v){const d=el('div');d.appendChild(el('div','k',k));d.appendChild(el('div','v',v));return d}
 async function suggest(){
   const devices=document.getElementById('devices').value||20;
-  const q=new URLSearchParams({environment:env,devices,http_port:location.port||8080});
+  const qp={environment:env,devices,http_port:location.port||8080,tls:useTls};
+  if(iface)qp.interface=iface;
+  const q=new URLSearchParams(qp);
   const out=document.getElementById('out');out.innerHTML='';
   let s;try{
     const r=await fetch('/v1/onboarding/suggest?'+q,{headers:{Authorization:'Bearer '+TOKEN}});
     if(!r.ok){out.textContent='Error: '+r.status;return}
     s=await r.json();
   }catch(e){out.textContent='Request failed.';return}
+  if(iface==null&&s.selected_interface)iface=s.selected_interface;
 
   // Extensions
   const ext=el('div','card');ext.appendChild(el('h3',null,'Extensions'));
@@ -224,6 +259,20 @@ async function suggest(){
 
   // IP plan
   const ip=el('div','card');ip.appendChild(el('h3',null,'Network'));
+  // Interface picker — only meaningful when the host has more than one usable NIC. Choosing the
+  // wrong one aligns the whole plan on the wrong subnet, so ask which interface carries the phones.
+  if(s.interfaces&&s.interfaces.length>1){
+    const isel=el('div');isel.appendChild(el('div','k','This host has several interfaces — which one carries the phones?'));
+    const ims=el('select');
+    s.interfaces.forEach(it=>{
+      const label=it.name+' · '+it.ipv4+' ('+it.cidr+')'+(it.is_primary?' · default':'');
+      const op=el('option',null,label);op.value=it.name;if(it.name===s.selected_interface)op.selected=true;ims.appendChild(op);
+    });
+    ims.onchange=()=>{iface=ims.value;suggest();};
+    isel.appendChild(ims);ip.appendChild(isel);
+  }else if(s.interfaces&&s.interfaces.length===1){
+    ip.appendChild(el('p','k','Aligning on '+s.interfaces[0].name+' ('+s.interfaces[0].cidr+') — the only LAN interface.'));
+  }
   const ig=el('div','grid');
   ig.appendChild(row('Detected host IP',s.ip_plan.detected_host_ip||'—'));
   ig.appendChild(row('LAN subnet',s.ip_plan.detected_subnet||'—'));
@@ -233,17 +282,63 @@ async function suggest(){
   const fit=el('p',s.ip_plan.fits?'ok':'warn',s.ip_plan.fits?'✓ The fleet fits this subnet.':('⚠ '+(s.ip_plan.recommendation||'')));
   ip.appendChild(fit);out.appendChild(ip);
 
-  // Discovered devices
-  const dv=el('div','card');dv.appendChild(el('h3',null,'Phones found on the network ('+s.discovered_devices.length+')'));
+  // Discovered devices — with an editable "Extension #" so the operator lines up each handset
+  // (by MAC) with the number it should own. Likely phones are pre-filled with a sequential
+  // extension from the chosen series; every field is editable and blank means "don't bind".
+  const dv=el('div','card');dv.appendChild(el('h3',null,'Align phones to extensions'));
+  dv.appendChild(el('p','k','Each phone found on the network, with the extension it will become. Edit any number; clear it to skip. Phones bind by MAC, so they keep their number even if their IP changes.'));
+  const base=parseInt(sel.value||s.extension_plan.recommended_series||'100')||100;
+  let seq=0; // running offset for pre-filling likely phones
   if(s.discovered_devices.length){
-    const t=el('table');const hr=el('tr');['IP','MAC','Vendor','Likely phone'].forEach(h=>hr.appendChild(el('th',null,h)));t.appendChild(hr);
-    s.discovered_devices.forEach(d=>{const tr=el('tr');tr.appendChild(el('td','mono',d.ip));tr.appendChild(el('td','mono',d.mac));tr.appendChild(el('td',null,d.vendor||'—'));tr.appendChild(el('td',null,d.likely_phone?'yes':''));t.appendChild(tr)});
+    const t=el('table');const hr=el('tr');['IP','MAC','Vendor','Phone?','Extension #'].forEach(h=>hr.appendChild(el('th',null,h)));t.appendChild(hr);
+    s.discovered_devices.forEach(d=>{
+      const tr=el('tr');
+      tr.appendChild(el('td','mono',d.ip));
+      tr.appendChild(el('td','mono',d.mac));
+      tr.appendChild(el('td',null,d.vendor||'—'));
+      tr.appendChild(el('td',null,d.likely_phone?'yes':''));
+      // Pre-fill an extension for likely phones the first time we see them this session.
+      if(!(d.mac in macNumber)&&d.likely_phone){macNumber[d.mac]=String(base+(seq++));}
+      const inp=el('input');inp.type='number';inp.min='0';inp.style.width='110px';
+      inp.value=macNumber[d.mac]||'';inp.placeholder='(skip)';
+      inp.oninput=()=>{macNumber[d.mac]=inp.value;};
+      const td=el('td');td.appendChild(inp);tr.appendChild(td);
+      t.appendChild(tr);
+    });
     dv.appendChild(t);
-  }else dv.appendChild(el('p','k','None yet — power on the phones, then re-run. (ARP table.)'));
+  }else dv.appendChild(el('p','k','No phones on the wire yet — power them on and re-run, or add them by MAC below. (ARP table.)'));
+
+  // Manual alignment — add a phone that hasn't appeared on the network yet, by MAC.
+  const man=el('div');man.appendChild(el('div','k','Add a phone by MAC (for handsets not yet powered on)'));
+  const mtbl=el('table');
+  const renderManual=()=>{
+    mtbl.innerHTML='';
+    const hr=el('tr');['MAC','Extension #',''].forEach(h=>hr.appendChild(el('th',null,h)));mtbl.appendChild(hr);
+    manualBindings.forEach((b,i)=>{
+      const tr=el('tr');
+      const mi=el('input');mi.type='text';mi.placeholder='00:15:65:aa:bb:cc';mi.value=b.mac;mi.oninput=()=>{b.mac=mi.value;};
+      const ni=el('input');ni.type='number';ni.min='0';ni.placeholder='101';ni.style.width='110px';ni.value=b.number;ni.oninput=()=>{b.number=ni.value;};
+      const rm=el('button',null,'Remove');rm.style.margin='0';rm.style.background='transparent';rm.style.color='var(--warn)';rm.onclick=()=>{manualBindings.splice(i,1);renderManual();};
+      [mi,ni,rm].forEach(x=>{const td=el('td');td.appendChild(x);tr.appendChild(td);});
+      mtbl.appendChild(tr);
+    });
+  };
+  renderManual();man.appendChild(mtbl);
+  const addBtn=el('button',null,'+ Add phone');addBtn.style.background='transparent';addBtn.style.color='var(--acc)';addBtn.style.border='1px solid var(--acc)';
+  addBtn.onclick=()=>{manualBindings.push({mac:'',number:''});renderManual();};
+  man.appendChild(addBtn);dv.appendChild(man);
   out.appendChild(dv);
 
   // Provisioning
   const pv=el('div','card');pv.appendChild(el('h3',null,'Auto-provisioning — paste these into your DNS / DHCP'));
+  // SSL toggle — optional, and off by default. A self-signed cert on a LAN is rejected by most
+  // phones, so plain HTTP/UDP is the pragmatic default; media is still SRTP-encrypted regardless.
+  const tl=el('label');tl.style.fontWeight='600';
+  const tc=el('input');tc.type='checkbox';tc.checked=useTls;tc.style.marginRight='8px';
+  tc.onchange=()=>{useTls=tc.checked;suggest();};
+  tl.appendChild(tc);tl.appendChild(document.createTextNode('Use SSL/TLS (HTTPS + SIPS) — only with a CA-signed certificate'));
+  pv.appendChild(tl);
+  pv.appendChild(el('p',s.provisioning.tls?'warn':'k',s.provisioning.tls_advice));
   pv.appendChild(el('div','k','DHCP (dnsmasq)'));
   pv.appendChild(Object.assign(el('pre'),{textContent:s.provisioning.dhcp_dnsmasq.join('\n')}));
   pv.appendChild(el('div','k','DNS (BIND zone)'));
@@ -253,11 +348,18 @@ async function suggest(){
 
   // Apply — one click to create the people + extensions (+ bind discovered phones).
   const ap=el('div','card');ap.appendChild(el('h3',null,'Create it'));
-  ap.appendChild(el('p','k','Creates '+document.getElementById('devices').value+' extensions and people, using the selected series. Phones found above are bound so they auto-provision.'));
+  ap.appendChild(el('p','k','Creates '+document.getElementById('devices').value+' extensions and people, using the selected series. Phones aligned above are bound to their number by MAC so they auto-provision.'));
   const btn=el('button',null,'Create extensions & people →');
   const res=el('p','k');
+  // Collect the operator's phone↔number alignment (discovered + manual), dropping blanks.
+  const collectBindings=()=>{
+    const out=[];
+    Object.keys(macNumber).forEach(mac=>{const n=(macNumber[mac]||'').trim();if(n)out.push({mac,number:n});});
+    manualBindings.forEach(b=>{const m=(b.mac||'').trim(),n=(b.number||'').trim();if(m&&n)out.push({mac:m,number:n});});
+    return out;
+  };
   const doApply=async()=>{
-    const body=JSON.stringify({environment:env,devices:parseInt(document.getElementById('devices').value||'0'),series_start:sel.value});
+    const body=JSON.stringify({environment:env,devices:parseInt(document.getElementById('devices').value||'0'),series_start:sel.value,bindings:collectBindings()});
     return fetch('/v1/onboarding/apply',{method:'POST',headers:{Authorization:'Bearer '+adminBearer(),'content-type':'application/json'},body});
   };
   btn.onclick=async()=>{
