@@ -4,14 +4,16 @@
 //! defaults so the operator confirms rather than fills in forms. Everything here is comms
 //! *management*, not SIP mechanics.
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::auth::TenantContext;
 use super::problem::Problem;
 use crate::control::onboarding::{self, Environment, EnvironmentProfile, OnboardingSuggestion};
+use crate::state::AppState;
+use crate::store::Tx;
 
 /// `GET /v1/onboarding/environments` — the deployment kinds and their default profiles.
 pub async fn list_environments(_tenant: TenantContext) -> Json<Vec<EnvironmentProfile>> {
@@ -44,6 +46,61 @@ pub async fn suggest(
     let http_port = p.http_port.unwrap_or(8080);
     let sip_port = p.sip_port.unwrap_or(5060);
     Ok(Json(onboarding::suggest(env, p.devices, &domain, http_port, sip_port)))
+}
+
+/// Body for `POST /v1/onboarding/apply` — the operator's confirmed choice.
+#[derive(Deserialize)]
+pub struct ApplyBody {
+    pub environment: String,
+    #[serde(default)]
+    pub devices: u32,
+    /// The chosen starting series (defaults to the suggested one for the environment/fleet).
+    pub series_start: Option<String>,
+}
+
+/// What `apply` created.
+#[derive(Serialize)]
+pub struct ApplyOutcome {
+    pub users_created: usize,
+    pub extensions_created: usize,
+    pub devices_created: usize,
+    pub extensions: Vec<String>,
+}
+
+/// `POST /v1/onboarding/apply` — mint the people, extensions, and phones the operator
+/// confirmed, in one transaction. Discovered phones are bound to extensions so they can
+/// auto-provision (`/provision/{mac}.cfg`).
+pub async fn apply(
+    State(st): State<AppState>,
+    tenant: TenantContext,
+    Json(body): Json<ApplyBody>,
+) -> Result<Json<ApplyOutcome>, Problem> {
+    let env = Environment::parse(&body.environment)
+        .ok_or_else(|| Problem::bad_request("unknown environment"))?;
+    if body.devices == 0 || body.devices > 10_000 {
+        return Err(Problem::bad_request("devices must be between 1 and 10000"));
+    }
+    let series = body
+        .series_start
+        .unwrap_or_else(|| onboarding::suggest_extension_plan(env, body.devices).recommended_series);
+
+    let built = onboarding::build_entities(tenant.tenant_id, body.devices, &series);
+    let outcome = ApplyOutcome {
+        users_created: built.users.len(),
+        extensions_created: built.extensions.len(),
+        devices_created: built.devices.len(),
+        extensions: built.extensions.iter().map(|e| e.number.clone()).collect(),
+    };
+    st.store
+        .commit(Tx {
+            users: built.users,
+            extensions: built.extensions,
+            devices: built.devices,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| Problem::internal(e.to_string()))?;
+    Ok(Json(outcome))
 }
 
 /// `GET /onboarding` — a self-contained setup wizard page (unauthenticated, like the
@@ -164,6 +221,24 @@ async function suggest(){
   pv.appendChild(Object.assign(el('pre'),{textContent:s.provisioning.dns_bind_zone.join('\n')}));
   pv.appendChild(el('p','k',s.provisioning.note));
   out.appendChild(pv);
+
+  // Apply — one click to create the people + extensions (+ bind discovered phones).
+  const ap=el('div','card');ap.appendChild(el('h3',null,'Create it'));
+  ap.appendChild(el('p','k','Creates '+document.getElementById('devices').value+' extensions and people, using the selected series. Phones found above are bound so they auto-provision.'));
+  const btn=el('button',null,'Create extensions & people →');
+  const res=el('p','k');
+  btn.onclick=async()=>{
+    btn.disabled=true;res.textContent='Applying…';
+    try{
+      const r=await fetch('/v1/onboarding/apply',{method:'POST',headers:{Authorization:'Bearer '+TOKEN,'content-type':'application/json'},
+        body:JSON.stringify({environment:env,devices:parseInt(document.getElementById('devices').value||'0'),series_start:sel.value})});
+      const o=await r.json();
+      if(!r.ok){res.className='warn';res.textContent='Error: '+(o.detail||r.status);}
+      else{res.className='ok';res.textContent='✓ Created '+o.extensions_created+' extensions ('+o.extensions.slice(0,5).join(', ')+(o.extensions.length>5?'…':'')+'), '+o.users_created+' people, '+o.devices_created+' phones bound.';}
+    }catch(e){res.className='warn';res.textContent='Request failed.';}
+    btn.disabled=false;
+  };
+  ap.appendChild(btn);ap.appendChild(res);out.appendChild(ap);
 }
 document.getElementById('go').onclick=suggest;
 loadEnvs();

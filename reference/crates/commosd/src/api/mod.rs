@@ -9,13 +9,16 @@ pub mod auth;
 pub mod calls;
 pub mod cdrs;
 pub mod channels;
+pub mod config;
 pub mod dashboard;
+pub mod directory;
 pub mod health;
 pub mod introspect;
 pub mod messages;
 pub mod onboarding;
 pub mod presence;
 pub mod problem;
+pub mod provision;
 pub mod queues;
 pub mod registrations;
 pub mod threads;
@@ -65,9 +68,19 @@ pub fn router(state: AppState) -> Router {
         .route("/queues/:id/enqueue", post(queues::enqueue_call))
         .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
         .route("/agents/:id", get(agents::get_agent))
-        // Admin onboarding wizard — auto-detected suggestions for rapid setup.
+        // Admin onboarding wizard — auto-detected suggestions + one-click apply.
         .route("/onboarding/environments", get(onboarding::list_environments))
-        .route("/onboarding/suggest", get(onboarding::suggest));
+        .route("/onboarding/suggest", get(onboarding::suggest))
+        .route("/onboarding/apply", post(onboarding::apply))
+        // Config-as-code (pbx.yaml) export/import — CMOS-14-DEP-080/082.
+        .route("/config", get(config::export_config).post(config::import_config))
+        // Provisioning directory — people, extensions, phones (read).
+        .route("/users", get(directory::list_users))
+        .route("/users/:id", get(directory::get_user))
+        .route("/extensions", get(directory::list_extensions))
+        .route("/extensions/:id", get(directory::get_extension))
+        .route("/devices", get(directory::list_devices))
+        .route("/devices/:id", get(directory::get_device));
 
     Router::new()
         .nest("/v1", v1)
@@ -78,6 +91,8 @@ pub fn router(state: AppState) -> Router {
         // Live operations dashboard + setup wizard (self-contained HTML, unauthenticated).
         .route("/dashboard", get(dashboard::dashboard))
         .route("/onboarding", get(onboarding::wizard))
+        // Phone auto-provisioning (DHCP option 66 target; unauthenticated).
+        .route("/provision/:file", get(provision::provision))
         // Non-normative introspection for bring-up/testing.
         .route("/_introspect/events", get(introspect::recent_events))
         .route("/_introspect/events/stream", get(introspect::stream_events))

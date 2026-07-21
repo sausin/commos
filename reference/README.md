@@ -89,8 +89,13 @@ hotel / hospital / home) and *how many phones* — and CommOS auto-detects and p
 - **Auto-provisioning** — generates the exact **DNS (BIND A + SRV)** and **DHCP (option 66/67)**
   lines to paste, so phones provision themselves.
 
-It's all served by the same binary (`GET /v1/onboarding/suggest` is the JSON behind it). The
-philosophy: **good defaults everywhere; the operator confirms rather than fills in forms.**
+One **"Create it"** button then applies the choice: `POST /v1/onboarding/apply` mints the people
+and extensions in a single transaction (and binds any discovered phones so they auto-provision).
+The created directory is browsable at `/v1/{users,extensions,devices}`, exportable as a
+Git-reviewable `pbx.yaml` (`GET /v1/config`), and re-importable (`POST /v1/config`). A phone then
+fetches its own config from **`GET /provision/{mac}.cfg`** (the DHCP-option-66 target) and registers.
+
+The philosophy: **good defaults everywhere; the operator confirms rather than fills in forms.**
 
 ### Default — embedded SQLite (durable, zero external dependency)
 
@@ -131,7 +136,9 @@ ephemeral in-process store (tests), set `database_url` to `memory://`.
 
 - `GET /livez`, `GET /readyz`, `GET /info` — operational signals (unauthenticated).
 - `GET /dashboard` — live operations dashboard; `GET /onboarding` — setup wizard (both unauthenticated, self-contained HTML).
-- `GET /v1/onboarding/environments`, `GET /v1/onboarding/suggest` — the wizard's auto-detection API.
+- `GET /v1/onboarding/environments`, `GET /v1/onboarding/suggest`, `POST /v1/onboarding/apply` — the wizard's detect-and-apply API.
+- `GET|POST /v1/config` — export/import the `pbx.yaml`; `GET /provision/{mac}.cfg` — phone auto-provisioning (unauthenticated).
+- `GET /v1/{users,extensions,devices}[/{id}]` — the provisioning directory.
 - **Voice workload** — `GET|POST /v1/calls`, `GET|PATCH /v1/calls/{id}` (`PATCH` is an
   RFC 7386 merge-patch with `If-Match` optimistic concurrency), and actions
   `POST /v1/calls/{id}/{hold,resume,hangup,transfer}`. A Call starts `INITIATED`; ring and
@@ -193,8 +200,8 @@ All `/v1` routes are bearer-authenticated and tenant-scoped. Auth verifies **HS2
 ## What's next
 
 Extend the same shapes, not the architecture:
-1. **Onboarding "apply"** — persist the wizard's suggestion (create the Extensions/Devices/Users
-   and the `pbx.yaml`) so setup is one click, not copy-paste.
+1. **Onboarding depth** — reconciling import (update existing rather than create), route wiring so
+   an extension actually rings its device, and vendor-specific provisioning templates.
 2. **RTP/B2BUA depth** — full mid-dialog correctness (client transactions, re-INVITE/hold),
    transcoding, and conferencing.
 3. **Contact-centre depth** — skills-based and least-recent distribution, wrap-up, and a real

@@ -7,9 +7,12 @@
 pub mod call;
 pub mod cdr;
 pub mod channel;
+pub mod device;
+pub mod extension;
 pub mod message;
 pub mod participant;
 pub mod presence_state;
 pub mod queue;
 pub mod thread;
+pub mod user;
 pub mod video_room;

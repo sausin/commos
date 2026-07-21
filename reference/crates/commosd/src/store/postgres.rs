@@ -11,14 +11,17 @@ use axum::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
-use commos_core::common::Uuid;
+use commos_core::common::{EntityBase, Uuid};
 use commos_core::entities::call::Call;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
+use commos_core::entities::device::Device;
+use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -114,6 +117,24 @@ CREATE TABLE IF NOT EXISTS queues (
 );
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
 
+CREATE TABLE IF NOT EXISTS users (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS extensions (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS extensions_tenant_id_idx ON extensions (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS devices (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id, id);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
     key         text NOT NULL,
@@ -131,6 +152,34 @@ CREATE TABLE IF NOT EXISTS outbox (
 /// Turn any sqlx/serde error into a backend `StoreError`.
 fn be<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
+}
+
+/// Insert a v0 entity into `table`; an id collision is a version conflict.
+async fn insert_v0(
+    conn: &mut sqlx::PgConnection,
+    table: &str,
+    base: &EntityBase,
+    data: &serde_json::Value,
+    entity: &'static str,
+) -> Result<(), StoreError> {
+    let sql = format!(
+        "INSERT INTO {table} (id, tenant_id, version, created_at, updated_at, data) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING"
+    );
+    let res = sqlx::query(&sql)
+        .bind(base.id.as_uuid())
+        .bind(base.tenant_id.as_uuid())
+        .bind(base.version as i64)
+        .bind(base.created_at.into_offset())
+        .bind(base.updated_at.into_offset())
+        .bind(data)
+        .execute(conn)
+        .await
+        .map_err(be)?;
+    if res.rows_affected() == 0 {
+        return Err(StoreError::VersionConflict { entity, id: base.id.to_string(), expected: 0 });
+    }
+    Ok(())
 }
 
 pub struct PgStore {
@@ -426,6 +475,16 @@ impl Store for PgStore {
             }
         }
 
+        for u in &tx.users {
+            insert_v0(&mut dbtx, "users", &u.base, &serde_json::to_value(u).map_err(be)?, "User").await?;
+        }
+        for e in &tx.extensions {
+            insert_v0(&mut dbtx, "extensions", &e.base, &serde_json::to_value(e).map_err(be)?, "Extension").await?;
+        }
+        for d in &tx.devices {
+            insert_v0(&mut dbtx, "devices", &d.base, &serde_json::to_value(d).map_err(be)?, "Device").await?;
+        }
+
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
                 "INSERT INTO idempotency_keys (tenant_id, key, call_id) \
@@ -687,6 +746,42 @@ impl Store for PgStore {
         } else {
             None
         };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {
+        let row = sqlx::query("SELECT data FROM users WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_users(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<User>, StoreError> {
+        let items = self.list_entities::<User>("users", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|u| u.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_extension(&self, tenant: Uuid, id: Uuid) -> Result<Option<Extension>, StoreError> {
+        let row = sqlx::query("SELECT data FROM extensions WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_extensions(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Extension>, StoreError> {
+        let items = self.list_entities::<Extension>("extensions", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|e| e.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_device(&self, tenant: Uuid, id: Uuid) -> Result<Option<Device>, StoreError> {
+        let row = sqlx::query("SELECT data FROM devices WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
+        let items = self.list_entities::<Device>("devices", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|d| d.base.id.to_string()) } else { None };
         Ok(Page { items, next_cursor })
     }
 

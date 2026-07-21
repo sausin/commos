@@ -11,10 +11,13 @@ use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
+use commos_core::entities::device::Device;
+use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -94,6 +97,13 @@ struct Inner {
     cdr_order: Vec<(Uuid, Uuid)>,
     queues: HashMap<(Uuid, Uuid), Queue>,
     queue_order: Vec<(Uuid, Uuid)>,
+    /// Provisioning (user/extension/device) tables.
+    users: HashMap<(Uuid, Uuid), User>,
+    user_order: Vec<(Uuid, Uuid)>,
+    extensions: HashMap<(Uuid, Uuid), Extension>,
+    extension_order: Vec<(Uuid, Uuid)>,
+    devices: HashMap<(Uuid, Uuid), Device>,
+    device_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -211,6 +221,24 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
             }
         }
+        for u in &tx.users {
+            let key = (u.base.tenant_id, u.base.id);
+            if g.users.contains_key(&key) || u.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "User", id: u.base.id.to_string(), expected: 0 });
+            }
+        }
+        for e in &tx.extensions {
+            let key = (e.base.tenant_id, e.base.id);
+            if g.extensions.contains_key(&key) || e.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Extension", id: e.base.id.to_string(), expected: 0 });
+            }
+        }
+        for d in &tx.devices {
+            let key = (d.base.tenant_id, d.base.id);
+            if g.devices.contains_key(&key) || d.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Device", id: d.base.id.to_string(), expected: 0 });
+            }
+        }
 
         // 2) Apply. From here nothing can fail, so state + outbox land together.
         for call in tx.calls {
@@ -254,6 +282,21 @@ impl Store for MemStore {
             let key = (q.base.tenant_id, q.base.id);
             g.queue_order.push(key);
             g.queues.insert(key, q);
+        }
+        for u in tx.users {
+            let key = (u.base.tenant_id, u.base.id);
+            g.user_order.push(key);
+            g.users.insert(key, u);
+        }
+        for e in tx.extensions {
+            let key = (e.base.tenant_id, e.base.id);
+            g.extension_order.push(key);
+            g.extensions.insert(key, e);
+        }
+        for d in tx.devices {
+            let key = (d.base.tenant_id, d.base.id);
+            g.device_order.push(key);
+            g.devices.insert(key, d);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -447,6 +490,33 @@ impl Store for MemStore {
     async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
         Ok(page_from(&g.queue_order, |k| g.queues.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.users.get(&(tenant, id)).cloned())
+    }
+    async fn list_users(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<User>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.user_order, |k| g.users.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_extension(&self, tenant: Uuid, id: Uuid) -> Result<Option<Extension>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.extensions.get(&(tenant, id)).cloned())
+    }
+    async fn list_extensions(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Extension>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.extension_order, |k| g.extensions.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_device(&self, tenant: Uuid, id: Uuid) -> Result<Option<Device>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.devices.get(&(tenant, id)).cloned())
+    }
+    async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.device_order, |k| g.devices.get(k).cloned(), tenant, limit, cursor))
     }
 
     async fn call_for_idempotency_key(

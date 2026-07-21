@@ -32,6 +32,9 @@ pub struct AppState {
     pub registrations: RegistrationRegistry,
     /// Bearer-auth verifier config (JWT secret + dev-token flag).
     pub auth: AuthConfig,
+    /// SIP registrar address advertised to phones (for auto-provisioning configs).
+    pub media_ip: std::net::IpAddr,
+    pub sip_port: u16,
     pub bus: EventBus,
     pub recent: RecentEvents,
     /// Readiness flag — a node reports not-ready before it can serve and again while
@@ -50,6 +53,8 @@ impl AppState {
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
         auth: AuthConfig,
+        media_ip: std::net::IpAddr,
+        sip_port: u16,
         bus: EventBus,
         recent: RecentEvents,
     ) -> Self {
@@ -62,6 +67,8 @@ impl AppState {
             agents,
             registrations,
             auth,
+            media_ip,
+            sip_port,
             bus,
             recent,
             ready: Arc::new(AtomicBool::new(false)),

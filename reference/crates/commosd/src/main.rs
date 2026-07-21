@@ -203,6 +203,8 @@ async fn run(cfg: Config) -> i32 {
         agents,
         registrations,
         auth,
+        cfg.media_ip,
+        cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
         bus.clone(),
         recent,
     );

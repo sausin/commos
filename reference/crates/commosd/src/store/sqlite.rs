@@ -25,10 +25,13 @@ use commos_core::common::{EntityBase, Uuid};
 use commos_core::entities::call::Call;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
+use commos_core::entities::device::Device;
+use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
 
 use super::{OutboxRecord, Page, Store, StoreError, Tx};
@@ -52,6 +55,12 @@ CREATE TABLE IF NOT EXISTS cdrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS cdrs_tenant_id_idx ON cdrs (tenant_id, id);
 CREATE TABLE IF NOT EXISTS queues       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
+CREATE TABLE IF NOT EXISTS users        (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS users_tenant_id_idx ON users (tenant_id, id);
+CREATE TABLE IF NOT EXISTS extensions   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS extensions_tenant_id_idx ON extensions (tenant_id, id);
+CREATE TABLE IF NOT EXISTS devices      (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id, id);
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 "#;
@@ -261,6 +270,24 @@ impl Store for SqliteStore {
                 return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
             }
         }
+        for u in &tx.users {
+            let data = serde_json::to_string(u).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "users", &u.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "User", id: u.base.id.to_string(), expected: 0 });
+            }
+        }
+        for e in &tx.extensions {
+            let data = serde_json::to_string(e).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "extensions", &e.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "Extension", id: e.base.id.to_string(), expected: 0 });
+            }
+        }
+        for d in &tx.devices {
+            let data = serde_json::to_string(d).map_err(be)?;
+            if Self::insert_v0(&mut dbtx, "devices", &d.base, &data).await? == 0 {
+                return Err(StoreError::VersionConflict { entity: "Device", id: d.base.id.to_string(), expected: 0 });
+            }
+        }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
             sqlx::query(
@@ -342,6 +369,27 @@ impl Store for SqliteStore {
     }
     async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
         self.list("queues", tenant, limit, cursor).await
+    }
+
+    async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError> {
+        self.get_one("users", tenant, id).await
+    }
+    async fn list_users(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<User>, StoreError> {
+        self.list("users", tenant, limit, cursor).await
+    }
+
+    async fn get_extension(&self, tenant: Uuid, id: Uuid) -> Result<Option<Extension>, StoreError> {
+        self.get_one("extensions", tenant, id).await
+    }
+    async fn list_extensions(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Extension>, StoreError> {
+        self.list("extensions", tenant, limit, cursor).await
+    }
+
+    async fn get_device(&self, tenant: Uuid, id: Uuid) -> Result<Option<Device>, StoreError> {
+        self.get_one("devices", tenant, id).await
+    }
+    async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
+        self.list("devices", tenant, limit, cursor).await
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

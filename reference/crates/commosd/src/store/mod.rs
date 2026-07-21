@@ -25,10 +25,13 @@ use commos_core::common::Uuid;
 use commos_core::entities::call::Call;
 use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
+use commos_core::entities::device::Device;
+use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::thread::Thread;
+use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
 
 pub use mem::MemStore;
@@ -49,6 +52,10 @@ pub struct Tx {
     /// Billing (CDR) and contact-centre (Queue) entities.
     pub cdrs: Vec<Cdr>,
     pub queues: Vec<Queue>,
+    /// Provisioning entities — people, extensions, and phones (onboarding).
+    pub users: Vec<User>,
+    pub extensions: Vec<Extension>,
+    pub devices: Vec<Device>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -164,6 +171,31 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Queue>, StoreError>;
+
+    // Provisioning (user/extension/device) reads — tenant-scoped.
+    async fn get_user(&self, tenant: Uuid, id: Uuid) -> Result<Option<User>, StoreError>;
+    async fn list_users(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<User>, StoreError>;
+
+    async fn get_extension(&self, tenant: Uuid, id: Uuid) -> Result<Option<Extension>, StoreError>;
+    async fn list_extensions(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Extension>, StoreError>;
+
+    async fn get_device(&self, tenant: Uuid, id: Uuid) -> Result<Option<Device>, StoreError>;
+    async fn list_devices(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Device>, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

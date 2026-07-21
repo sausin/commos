@@ -14,6 +14,11 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
 use serde::{Deserialize, Serialize};
 
+use commos_core::common::Uuid;
+use commos_core::entities::device::{Device, DeviceNetwork};
+use commos_core::entities::extension::Extension;
+use commos_core::entities::user::User;
+
 /// The kind of place CommOS is being deployed. Drives the default suggestions — the one
 /// early question worth asking, because it changes almost every good default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +391,62 @@ pub fn provisioning_guide(domain: &str, host_ip: &str, http_port: u16, sip_port:
              others can be pointed at {provisioning_url} manually."
         ),
     }
+}
+
+// --- Apply: turn the suggestion into real entities ----------------------------------------
+
+/// The entities an "apply" would create — built in memory, then committed in one transaction.
+pub struct BuiltEntities {
+    pub users: Vec<User>,
+    pub extensions: Vec<Extension>,
+    pub devices: Vec<Device>,
+}
+
+/// Normalise a MAC to 12 lowercase hex chars (`00:15:65:AA:BB:CC` → `001565aabbcc`), or `None`.
+fn mac_hex(s: &str) -> Option<String> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_ascii_lowercase();
+    (hex.len() == 12).then_some(hex)
+}
+
+/// Build the people, extensions, and phones for a confirmed onboarding choice. Each extension
+/// gets a person and a placeholder route; discovered phones (from ARP) are bound to the first
+/// extensions by writing the device MAC into the extension `label` — which is exactly what the
+/// provisioning endpoint keys on, so a phone that fetches its config gets that account.
+pub fn build_entities(tenant: Uuid, device_count: u32, series_start: &str) -> BuiltEntities {
+    let start: u32 = series_start.parse().unwrap_or(100);
+    let phones: Vec<DiscoveredDevice> =
+        discovered_devices().into_iter().filter(|d| d.likely_phone).collect();
+
+    let mut users = Vec::new();
+    let mut extensions = Vec::new();
+    let mut devices = Vec::new();
+
+    for i in 0..device_count {
+        let number = (start + i).to_string();
+        let user = User::new(tenant, format!("Extension {number}"));
+        let mut ext = Extension::new(tenant, number.clone(), Uuid::now_v7());
+
+        // Bind a discovered phone to this extension when one is available.
+        if let Some(phone) = phones.get(i as usize) {
+            if let Some(mac) = mac_hex(&phone.mac) {
+                ext.label = Some(mac.clone());
+                let vendor = phone
+                    .vendor
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+                    .to_ascii_lowercase();
+                let mut dev = Device::new(tenant, vendor, "unknown");
+                dev.mac = Some(mac);
+                dev.assigned_user_id = Some(user.base.id);
+                dev.network = Some(DeviceNetwork { ip: Some(phone.ip.clone()), ..Default::default() });
+                devices.push(dev);
+            }
+        }
+        extensions.push(ext);
+        users.push(user);
+    }
+
+    BuiltEntities { users, extensions, devices }
 }
 
 // --- The full suggestion ------------------------------------------------------------------
