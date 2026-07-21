@@ -20,6 +20,7 @@ use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
@@ -135,6 +136,12 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id, id);
 
+CREATE TABLE IF NOT EXISTS routes (
+    id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
+    created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, data jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routes_tenant_id_idx ON routes (tenant_id, id);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id   uuid NOT NULL,
     key         text NOT NULL,
@@ -178,6 +185,40 @@ async fn insert_v0(
         .map_err(be)?;
     if res.rows_affected() == 0 {
         return Err(StoreError::VersionConflict { entity, id: base.id.to_string(), expected: 0 });
+    }
+    Ok(())
+}
+
+/// Version-aware upsert for entities that support in-place update (config re-import
+/// reconciles by natural key and bumps the version). A v0 create inserts; a v>0 update
+/// rewrites the row only if the stored version is exactly one behind — the same
+/// optimistic-concurrency guard `Call` uses.
+async fn upsert(
+    conn: &mut sqlx::PgConnection,
+    table: &str,
+    entity: &'static str,
+    base: &EntityBase,
+    data: &serde_json::Value,
+) -> Result<(), StoreError> {
+    if base.version == 0 {
+        return insert_v0(conn, table, base, data, entity).await;
+    }
+    let sql = format!(
+        "UPDATE {table} SET version = $1, updated_at = $2, data = $3 \
+         WHERE id = $4 AND tenant_id = $5 AND version = $6"
+    );
+    let res = sqlx::query(&sql)
+        .bind(base.version as i64)
+        .bind(base.updated_at.into_offset())
+        .bind(data)
+        .bind(base.id.as_uuid())
+        .bind(base.tenant_id.as_uuid())
+        .bind((base.version - 1) as i64)
+        .execute(conn)
+        .await
+        .map_err(be)?;
+    if res.rows_affected() == 0 {
+        return Err(StoreError::VersionConflict { entity, id: base.id.to_string(), expected: base.version });
     }
     Ok(())
 }
@@ -455,34 +496,22 @@ impl Store for PgStore {
             }
         }
 
+        // Provisioning entities support version-aware update (config re-import reconciles
+        // by natural key and bumps the version).
         for q in &tx.queues {
-            let data = serde_json::to_value(q).map_err(be)?;
-            let res = sqlx::query(
-                "INSERT INTO queues (id, tenant_id, version, created_at, updated_at, data) \
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(q.base.id.as_uuid())
-            .bind(q.base.tenant_id.as_uuid())
-            .bind(q.base.version as i64)
-            .bind(q.base.created_at.into_offset())
-            .bind(q.base.updated_at.into_offset())
-            .bind(&data)
-            .execute(&mut *dbtx)
-            .await
-            .map_err(be)?;
-            if res.rows_affected() == 0 {
-                return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
-            }
+            upsert(&mut dbtx, "queues", "Queue", &q.base, &serde_json::to_value(q).map_err(be)?).await?;
         }
-
         for u in &tx.users {
-            insert_v0(&mut dbtx, "users", &u.base, &serde_json::to_value(u).map_err(be)?, "User").await?;
+            upsert(&mut dbtx, "users", "User", &u.base, &serde_json::to_value(u).map_err(be)?).await?;
         }
         for e in &tx.extensions {
-            insert_v0(&mut dbtx, "extensions", &e.base, &serde_json::to_value(e).map_err(be)?, "Extension").await?;
+            upsert(&mut dbtx, "extensions", "Extension", &e.base, &serde_json::to_value(e).map_err(be)?).await?;
         }
         for d in &tx.devices {
-            insert_v0(&mut dbtx, "devices", &d.base, &serde_json::to_value(d).map_err(be)?, "Device").await?;
+            upsert(&mut dbtx, "devices", "Device", &d.base, &serde_json::to_value(d).map_err(be)?).await?;
+        }
+        for r in &tx.routes {
+            upsert(&mut dbtx, "routes", "Route", &r.base, &serde_json::to_value(r).map_err(be)?).await?;
         }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
@@ -782,6 +811,18 @@ impl Store for PgStore {
     async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
         let items = self.list_entities::<Device>("devices", tenant, limit, cursor).await?;
         let next_cursor = if items.len() == limit { items.last().map(|d| d.base.id.to_string()) } else { None };
+        Ok(Page { items, next_cursor })
+    }
+
+    async fn get_route(&self, tenant: Uuid, id: Uuid) -> Result<Option<Route>, StoreError> {
+        let row = sqlx::query("SELECT data FROM routes WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_routes(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Route>, StoreError> {
+        let items = self.list_entities::<Route>("routes", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit { items.last().map(|r| r.base.id.to_string()) } else { None };
         Ok(Page { items, next_cursor })
     }
 

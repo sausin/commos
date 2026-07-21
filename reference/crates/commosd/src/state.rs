@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::api::admin::{AdminAuth, HasAdminAuth};
 use crate::api::auth::{AuthConfig, HasAuthConfig};
 use crate::bus::EventBus;
 use crate::control::agents::AgentRegistry;
@@ -32,6 +33,9 @@ pub struct AppState {
     pub registrations: RegistrationRegistry,
     /// Bearer-auth verifier config (JWT secret + dev-token flag).
     pub auth: AuthConfig,
+    /// Admin authentication — gates privileged setup/config operations. Dev mode (no admin
+    /// password) falls back to tenant-bearer auth so local setup needs zero config.
+    pub admin: AdminAuth,
     /// SIP registrar address advertised to phones (for auto-provisioning configs).
     pub media_ip: std::net::IpAddr,
     pub sip_port: u16,
@@ -53,6 +57,7 @@ impl AppState {
         agents: AgentRegistry,
         registrations: RegistrationRegistry,
         auth: AuthConfig,
+        admin: AdminAuth,
         media_ip: std::net::IpAddr,
         sip_port: u16,
         bus: EventBus,
@@ -67,6 +72,7 @@ impl AppState {
             agents,
             registrations,
             auth,
+            admin,
             media_ip,
             sip_port,
             bus,
@@ -90,5 +96,13 @@ impl AppState {
 impl HasAuthConfig for AppState {
     fn auth_config(&self) -> &AuthConfig {
         &self.auth
+    }
+}
+
+/// Lets the `AdminContext` extractor and the admin handlers reach the admin-auth state
+/// without `api::admin` depending on the concrete state type.
+impl HasAdminAuth for AppState {
+    fn admin_auth(&self) -> &AdminAuth {
+        &self.admin
     }
 }

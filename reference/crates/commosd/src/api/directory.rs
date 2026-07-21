@@ -7,7 +7,7 @@ use axum::Json;
 use serde::Serialize;
 
 use commos_core::common::Uuid;
-use commos_core::entities::{device::Device, extension::Extension, user::User};
+use commos_core::entities::{device::Device, extension::Extension, route::Route, user::User};
 
 use super::auth::TenantContext;
 use super::calls::ListParams;
@@ -90,5 +90,26 @@ pub async fn get_device(
     match st.store.get_device(t.tenant_id, id(&i)?).await.map_err(internal)? {
         Some(d) => Ok(Json(d)),
         None => Err(Problem::not_found("no such device")),
+    }
+}
+
+/// `GET /v1/routes` — the routing rules that resolve dialled numbers to destinations.
+pub async fn list_routes(
+    State(st): State<AppState>,
+    t: TenantContext,
+    Query(p): Query<ListParams>,
+) -> Result<Json<Page<Route>>, Problem> {
+    let page = st.store.list_routes(t.tenant_id, limit(&p), p.cursor).await.map_err(internal)?;
+    Ok(Json(Page { items: page.items, next_cursor: page.next_cursor }))
+}
+/// `GET /v1/routes/{id}`
+pub async fn get_route(
+    State(st): State<AppState>,
+    t: TenantContext,
+    Path(i): Path<String>,
+) -> Result<Json<Route>, Problem> {
+    match st.store.get_route(t.tenant_id, id(&i)?).await.map_err(internal)? {
+        Some(r) => Ok(Json(r)),
+        None => Err(Problem::not_found("no such route")),
     }
 }

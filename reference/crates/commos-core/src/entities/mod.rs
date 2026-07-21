@@ -13,6 +13,7 @@ pub mod message;
 pub mod participant;
 pub mod presence_state;
 pub mod queue;
+pub mod route;
 pub mod thread;
 pub mod user;
 pub mod video_room;

@@ -4,6 +4,7 @@
 //! (`https://{host}/v1`). Operational signals and non-normative introspection live
 //! outside `/v1` so they can never be confused for the versioned contract.
 
+pub mod admin;
 pub mod agents;
 pub mod auth;
 pub mod calls;
@@ -80,10 +81,17 @@ pub fn router(state: AppState) -> Router {
         .route("/extensions", get(directory::list_extensions))
         .route("/extensions/:id", get(directory::get_extension))
         .route("/devices", get(directory::list_devices))
-        .route("/devices/:id", get(directory::get_device));
+        .route("/devices/:id", get(directory::get_device))
+        .route("/routes", get(directory::list_routes))
+        .route("/routes/:id", get(directory::get_route));
 
     Router::new()
         .nest("/v1", v1)
+        // Admin authentication — login/logout/whoami gate the privileged setup operations
+        // (onboarding apply, config import). Unauthenticated login; the rest need an admin.
+        .route("/admin/login", post(admin::login::<AppState>))
+        .route("/admin/logout", post(admin::logout::<AppState>))
+        .route("/admin/whoami", get(admin::whoami))
         // Operational signals (Volume 15) — unauthenticated, outside the contract surface.
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))

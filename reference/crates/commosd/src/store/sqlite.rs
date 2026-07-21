@@ -30,6 +30,7 @@ use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS extensions   (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS extensions_tenant_id_idx ON extensions (tenant_id, id);
 CREATE TABLE IF NOT EXISTS devices      (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS devices_tenant_id_idx ON devices (tenant_id, id);
+CREATE TABLE IF NOT EXISTS routes       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS routes_tenant_id_idx ON routes (tenant_id, id);
 CREATE TABLE IF NOT EXISTS idempotency_keys (tenant_id TEXT NOT NULL, key TEXT NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (tenant_id, key));
 CREATE TABLE IF NOT EXISTS outbox        (seq INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
 "#;
@@ -117,6 +120,51 @@ impl SqliteStore {
             .await
             .map_err(be)?;
         Ok(res.rows_affected())
+    }
+
+    /// Version-aware upsert for entities that support in-place update (config re-import
+    /// reconciles by natural key and bumps the version). A v0 create inserts; a v>0 update
+    /// rewrites the row only if the stored version is exactly one behind — the same
+    /// optimistic-concurrency guard `Call` uses.
+    async fn upsert(
+        conn: &mut sqlx::SqliteConnection,
+        table: &str,
+        entity: &'static str,
+        base: &EntityBase,
+        data: &str,
+    ) -> Result<(), StoreError> {
+        if base.version == 0 {
+            if Self::insert_v0(conn, table, base, data).await? == 0 {
+                return Err(StoreError::VersionConflict {
+                    entity,
+                    id: base.id.to_string(),
+                    expected: 0,
+                });
+            }
+            return Ok(());
+        }
+        let sql = format!(
+            "UPDATE {table} SET version = ?1, updated_at = ?2, data = ?3 \
+             WHERE id = ?4 AND tenant_id = ?5 AND version = ?6"
+        );
+        let res = sqlx::query(&sql)
+            .bind(base.version as i64)
+            .bind(base.updated_at.to_string())
+            .bind(data)
+            .bind(base.id.to_string())
+            .bind(base.tenant_id.to_string())
+            .bind((base.version - 1) as i64)
+            .execute(conn)
+            .await
+            .map_err(be)?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::VersionConflict {
+                entity,
+                id: base.id.to_string(),
+                expected: base.version,
+            });
+        }
+        Ok(())
     }
 
     async fn get_one<T: serde::de::DeserializeOwned>(
@@ -264,29 +312,26 @@ impl Store for SqliteStore {
                 return Err(StoreError::VersionConflict { entity: "CDR", id: c.base.id.to_string(), expected: 0 });
             }
         }
+        // Provisioning entities support version-aware update (config re-import).
         for q in &tx.queues {
             let data = serde_json::to_string(q).map_err(be)?;
-            if Self::insert_v0(&mut dbtx, "queues", &q.base, &data).await? == 0 {
-                return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
-            }
+            Self::upsert(&mut dbtx, "queues", "Queue", &q.base, &data).await?;
         }
         for u in &tx.users {
             let data = serde_json::to_string(u).map_err(be)?;
-            if Self::insert_v0(&mut dbtx, "users", &u.base, &data).await? == 0 {
-                return Err(StoreError::VersionConflict { entity: "User", id: u.base.id.to_string(), expected: 0 });
-            }
+            Self::upsert(&mut dbtx, "users", "User", &u.base, &data).await?;
         }
         for e in &tx.extensions {
             let data = serde_json::to_string(e).map_err(be)?;
-            if Self::insert_v0(&mut dbtx, "extensions", &e.base, &data).await? == 0 {
-                return Err(StoreError::VersionConflict { entity: "Extension", id: e.base.id.to_string(), expected: 0 });
-            }
+            Self::upsert(&mut dbtx, "extensions", "Extension", &e.base, &data).await?;
         }
         for d in &tx.devices {
             let data = serde_json::to_string(d).map_err(be)?;
-            if Self::insert_v0(&mut dbtx, "devices", &d.base, &data).await? == 0 {
-                return Err(StoreError::VersionConflict { entity: "Device", id: d.base.id.to_string(), expected: 0 });
-            }
+            Self::upsert(&mut dbtx, "devices", "Device", &d.base, &data).await?;
+        }
+        for r in &tx.routes {
+            let data = serde_json::to_string(r).map_err(be)?;
+            Self::upsert(&mut dbtx, "routes", "Route", &r.base, &data).await?;
         }
 
         if let Some((tenant, key, call_id)) = &tx.idempotency {
@@ -390,6 +435,13 @@ impl Store for SqliteStore {
     }
     async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
         self.list("devices", tenant, limit, cursor).await
+    }
+
+    async fn get_route(&self, tenant: Uuid, id: Uuid) -> Result<Option<Route>, StoreError> {
+        self.get_one("routes", tenant, id).await
+    }
+    async fn list_routes(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Route>, StoreError> {
+        self.list("routes", tenant, limit, cursor).await
     }
 
     async fn call_for_idempotency_key(&self, tenant: Uuid, key: &str) -> Result<Option<Uuid>, StoreError> {

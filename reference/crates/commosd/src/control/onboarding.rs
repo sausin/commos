@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use commos_core::common::Uuid;
 use commos_core::entities::device::{Device, DeviceNetwork};
 use commos_core::entities::extension::Extension;
+use commos_core::entities::route::Route;
 use commos_core::entities::user::User;
 
 /// The kind of place CommOS is being deployed. Drives the default suggestions — the one
@@ -400,6 +401,9 @@ pub struct BuiltEntities {
     pub users: Vec<User>,
     pub extensions: Vec<Extension>,
     pub devices: Vec<Device>,
+    /// One Route per extension: the dialable number's destination (`sip:<number>@<domain>`),
+    /// which the control plane resolves when a call comes in (Volume 3 Routing).
+    pub routes: Vec<Route>,
 }
 
 /// Normalise a MAC to 12 lowercase hex chars (`00:15:65:AA:BB:CC` → `001565aabbcc`), or `None`.
@@ -408,11 +412,18 @@ fn mac_hex(s: &str) -> Option<String> {
     (hex.len() == 12).then_some(hex)
 }
 
-/// Build the people, extensions, and phones for a confirmed onboarding choice. Each extension
-/// gets a person and a placeholder route; discovered phones (from ARP) are bound to the first
-/// extensions by writing the device MAC into the extension `label` — which is exactly what the
-/// provisioning endpoint keys on, so a phone that fetches its config gets that account.
-pub fn build_entities(tenant: Uuid, device_count: u32, series_start: &str) -> BuiltEntities {
+/// Build the people, extensions, routes, and phones for a confirmed onboarding choice. Each
+/// extension gets a person and a **real Route** (`sip:<number>@<domain>`) that the control
+/// plane resolves on an inbound call; the extension's `route_id` points at it. Discovered
+/// phones (from ARP) are bound to the first extensions by writing the device MAC into the
+/// extension `label` — exactly what the provisioning endpoint keys on, so a phone that fetches
+/// its config gets that account.
+pub fn build_entities(
+    tenant: Uuid,
+    device_count: u32,
+    series_start: &str,
+    domain: &str,
+) -> BuiltEntities {
     let start: u32 = series_start.parse().unwrap_or(100);
     let phones: Vec<DiscoveredDevice> =
         discovered_devices().into_iter().filter(|d| d.likely_phone).collect();
@@ -420,11 +431,15 @@ pub fn build_entities(tenant: Uuid, device_count: u32, series_start: &str) -> Bu
     let mut users = Vec::new();
     let mut extensions = Vec::new();
     let mut devices = Vec::new();
+    let mut routes = Vec::new();
 
     for i in 0..device_count {
         let number = (start + i).to_string();
         let user = User::new(tenant, format!("Extension {number}"));
-        let mut ext = Extension::new(tenant, number.clone(), Uuid::now_v7());
+
+        // A real route: dialing this number reaches the SIP endpoint that registers as it.
+        let route = Route::new(tenant, format!("sip:{number}@{domain}"));
+        let mut ext = Extension::new(tenant, number.clone(), route.base.id);
 
         // Bind a discovered phone to this extension when one is available.
         if let Some(phone) = phones.get(i as usize) {
@@ -442,11 +457,12 @@ pub fn build_entities(tenant: Uuid, device_count: u32, series_start: &str) -> Bu
                 devices.push(dev);
             }
         }
+        routes.push(route);
         extensions.push(ext);
         users.push(user);
     }
 
-    BuiltEntities { users, extensions, devices }
+    BuiltEntities { users, extensions, devices, routes }
 }
 
 // --- The full suggestion ------------------------------------------------------------------

@@ -196,6 +196,27 @@ impl Routing {
         }
     }
 
+    /// Resolve a dialled `number` to its route's `destination_ref` via the Extension→Route
+    /// mapping (Volume 3: an Extension maps a short number onto a routing target). Returns
+    /// `None` when no extension carries that number or its route is missing.
+    ///
+    /// The fleet of extensions is small configuration, so a paged scan is fine here (there is
+    /// no per-number index in this reference store).
+    pub async fn resolve_extension(&self, tenant: Uuid, number: &str) -> Option<String> {
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_extensions(tenant, 200, cursor).await.ok()?;
+            if let Some(ext) = page.items.iter().find(|e| e.number == number) {
+                let route = self.store.get_route(tenant, ext.route_id).await.ok()??;
+                return Some(route.destination_ref);
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return None,
+            }
+        }
+    }
+
     /// Load a Call for this tenant or report it missing (tenant-scoped, CMOS-03-ARCH-050).
     async fn load(&self, tenant: Uuid, call_id: Uuid) -> Result<Call, RoutingError> {
         self.store

@@ -30,6 +30,7 @@ use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
@@ -52,10 +53,11 @@ pub struct Tx {
     /// Billing (CDR) and contact-centre (Queue) entities.
     pub cdrs: Vec<Cdr>,
     pub queues: Vec<Queue>,
-    /// Provisioning entities — people, extensions, and phones (onboarding).
+    /// Provisioning entities — people, extensions, phones, and routes (onboarding).
     pub users: Vec<User>,
     pub extensions: Vec<Extension>,
     pub devices: Vec<Device>,
+    pub routes: Vec<Route>,
     pub events: Vec<serde_json::Value>,
     /// Optional idempotency key to record for a create (CMOS-04-API: `Idempotency-Key`).
     pub idempotency: Option<(Uuid, String, Uuid)>, // (tenant, key, call_id)
@@ -196,6 +198,14 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Device>, StoreError>;
+
+    async fn get_route(&self, tenant: Uuid, id: Uuid) -> Result<Option<Route>, StoreError>;
+    async fn list_routes(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Route>, StoreError>;
 
     /// Return the call id previously created under this idempotency key, if any.
     async fn call_for_idempotency_key(

@@ -9,6 +9,7 @@ use axum::response::Html;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use super::admin::AdminContext;
 use super::auth::TenantContext;
 use super::problem::Problem;
 use crate::control::onboarding::{self, Environment, EnvironmentProfile, OnboardingSuggestion};
@@ -56,6 +57,9 @@ pub struct ApplyBody {
     pub devices: u32,
     /// The chosen starting series (defaults to the suggested one for the environment/fleet).
     pub series_start: Option<String>,
+    /// SIP domain woven into each extension's route (`sip:<number>@<domain>`). Defaults to
+    /// `commos.local`.
+    pub domain: Option<String>,
 }
 
 /// What `apply` created.
@@ -64,15 +68,16 @@ pub struct ApplyOutcome {
     pub users_created: usize,
     pub extensions_created: usize,
     pub devices_created: usize,
+    pub routes_created: usize,
     pub extensions: Vec<String>,
 }
 
-/// `POST /v1/onboarding/apply` — mint the people, extensions, and phones the operator
+/// `POST /v1/onboarding/apply` — mint the people, extensions, routes, and phones the operator
 /// confirmed, in one transaction. Discovered phones are bound to extensions so they can
-/// auto-provision (`/provision/{mac}.cfg`).
+/// auto-provision (`/provision/{mac}.cfg`). Privileged: requires an admin (see [`AdminContext`]).
 pub async fn apply(
     State(st): State<AppState>,
-    tenant: TenantContext,
+    admin: AdminContext,
     Json(body): Json<ApplyBody>,
 ) -> Result<Json<ApplyOutcome>, Problem> {
     let env = Environment::parse(&body.environment)
@@ -83,12 +88,14 @@ pub async fn apply(
     let series = body
         .series_start
         .unwrap_or_else(|| onboarding::suggest_extension_plan(env, body.devices).recommended_series);
+    let domain = body.domain.unwrap_or_else(|| "commos.local".to_string());
 
-    let built = onboarding::build_entities(tenant.tenant_id, body.devices, &series);
+    let built = onboarding::build_entities(admin.tenant_id, body.devices, &series, &domain);
     let outcome = ApplyOutcome {
         users_created: built.users.len(),
         extensions_created: built.extensions.len(),
         devices_created: built.devices.len(),
+        routes_created: built.routes.len(),
         extensions: built.extensions.iter().map(|e| e.number.clone()).collect(),
     };
     st.store
@@ -96,6 +103,7 @@ pub async fn apply(
             users: built.users,
             extensions: built.extensions,
             devices: built.devices,
+            routes: built.routes,
             ..Default::default()
         })
         .await
@@ -151,7 +159,20 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 </div>
 <script>
 const TOKEN="tenant:01920000-0000-7000-8000-000000000001";
+// Admin session token, set after a successful /admin/login (configured deployments only).
+let ADMIN=null;
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
+// The bearer to use for a privileged call: an admin session if we have one, else the dev
+// token (which acts as admin when no admin password is configured).
+const adminBearer=()=>ADMIN?('admin:'+ADMIN):TOKEN;
+// Exchange an admin password for a session token; returns true on success.
+async function adminLogin(password){
+  try{
+    const r=await fetch('/admin/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password})});
+    if(!r.ok)return false;
+    const o=await r.json();ADMIN=o.token;return true;
+  }catch(e){return false}
+}
 let env="office";
 async function loadEnvs(){
   const box=document.getElementById('envs');
@@ -227,14 +248,24 @@ async function suggest(){
   ap.appendChild(el('p','k','Creates '+document.getElementById('devices').value+' extensions and people, using the selected series. Phones found above are bound so they auto-provision.'));
   const btn=el('button',null,'Create extensions & people →');
   const res=el('p','k');
+  const doApply=async()=>{
+    const body=JSON.stringify({environment:env,devices:parseInt(document.getElementById('devices').value||'0'),series_start:sel.value});
+    return fetch('/v1/onboarding/apply',{method:'POST',headers:{Authorization:'Bearer '+adminBearer(),'content-type':'application/json'},body});
+  };
   btn.onclick=async()=>{
-    btn.disabled=true;res.textContent='Applying…';
+    btn.disabled=true;res.className='k';res.textContent='Applying…';
     try{
-      const r=await fetch('/v1/onboarding/apply',{method:'POST',headers:{Authorization:'Bearer '+TOKEN,'content-type':'application/json'},
-        body:JSON.stringify({environment:env,devices:parseInt(document.getElementById('devices').value||'0'),series_start:sel.value})});
+      let r=await doApply();
+      // A configured deployment rejects the dev token: prompt for the admin password, log in,
+      // and retry once with the admin session.
+      if(r.status===401&&!ADMIN){
+        const pw=prompt('Admin password required to apply setup:');
+        if(pw&&await adminLogin(pw)){r=await doApply();}
+        else{res.className='warn';res.textContent='Admin login required.';btn.disabled=false;return;}
+      }
       const o=await r.json();
       if(!r.ok){res.className='warn';res.textContent='Error: '+(o.detail||r.status);}
-      else{res.className='ok';res.textContent='✓ Created '+o.extensions_created+' extensions ('+o.extensions.slice(0,5).join(', ')+(o.extensions.length>5?'…':'')+'), '+o.users_created+' people, '+o.devices_created+' phones bound.';}
+      else{res.className='ok';res.textContent='✓ Created '+o.extensions_created+' extensions ('+o.extensions.slice(0,5).join(', ')+(o.extensions.length>5?'…':'')+'), '+o.users_created+' people, '+o.routes_created+' routes, '+o.devices_created+' phones bound.';}
     }catch(e){res.className='warn';res.textContent='Request failed.';}
     btn.disabled=false;
   };

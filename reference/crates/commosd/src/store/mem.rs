@@ -16,6 +16,7 @@ use commos_core::entities::extension::Extension;
 use commos_core::entities::message::Message;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
+use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
 use commos_core::entities::video_room::VideoRoom;
@@ -104,6 +105,8 @@ struct Inner {
     extension_order: Vec<(Uuid, Uuid)>,
     devices: HashMap<(Uuid, Uuid), Device>,
     device_order: Vec<(Uuid, Uuid)>,
+    routes: HashMap<(Uuid, Uuid), Route>,
+    route_order: Vec<(Uuid, Uuid)>,
     /// Idempotency ledger: (tenant, key) -> call id.
     idempotency: HashMap<(Uuid, String), Uuid>,
     /// The outbox, in commit order.
@@ -215,28 +218,57 @@ impl Store for MemStore {
                 return Err(StoreError::VersionConflict { entity: "CDR", id: c.base.id.to_string(), expected: 0 });
             }
         }
+        // Provisioning entities support in-place update (config re-import reconciles by
+        // natural key and bumps the version): a create is v0, an update carries the next
+        // version and the stored row must be exactly one behind — mirroring Call.
         for q in &tx.queues {
             let key = (q.base.tenant_id, q.base.id);
-            if g.queues.contains_key(&key) || q.base.version != 0 {
+            if let Some(existing) = g.queues.get(&key) {
+                if q.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if q.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
             }
         }
         for u in &tx.users {
             let key = (u.base.tenant_id, u.base.id);
-            if g.users.contains_key(&key) || u.base.version != 0 {
+            if let Some(existing) = g.users.get(&key) {
+                if u.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "User", id: u.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if u.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "User", id: u.base.id.to_string(), expected: 0 });
             }
         }
         for e in &tx.extensions {
             let key = (e.base.tenant_id, e.base.id);
-            if g.extensions.contains_key(&key) || e.base.version != 0 {
+            if let Some(existing) = g.extensions.get(&key) {
+                if e.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Extension", id: e.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if e.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "Extension", id: e.base.id.to_string(), expected: 0 });
             }
         }
         for d in &tx.devices {
             let key = (d.base.tenant_id, d.base.id);
-            if g.devices.contains_key(&key) || d.base.version != 0 {
+            if let Some(existing) = g.devices.get(&key) {
+                if d.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Device", id: d.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if d.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "Device", id: d.base.id.to_string(), expected: 0 });
+            }
+        }
+        for r in &tx.routes {
+            let key = (r.base.tenant_id, r.base.id);
+            if let Some(existing) = g.routes.get(&key) {
+                if r.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Route", id: r.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if r.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Route", id: r.base.id.to_string(), expected: 0 });
             }
         }
 
@@ -280,23 +312,38 @@ impl Store for MemStore {
         }
         for q in tx.queues {
             let key = (q.base.tenant_id, q.base.id);
-            g.queue_order.push(key);
+            if !g.queues.contains_key(&key) {
+                g.queue_order.push(key);
+            }
             g.queues.insert(key, q);
         }
         for u in tx.users {
             let key = (u.base.tenant_id, u.base.id);
-            g.user_order.push(key);
+            if !g.users.contains_key(&key) {
+                g.user_order.push(key);
+            }
             g.users.insert(key, u);
         }
         for e in tx.extensions {
             let key = (e.base.tenant_id, e.base.id);
-            g.extension_order.push(key);
+            if !g.extensions.contains_key(&key) {
+                g.extension_order.push(key);
+            }
             g.extensions.insert(key, e);
         }
         for d in tx.devices {
             let key = (d.base.tenant_id, d.base.id);
-            g.device_order.push(key);
+            if !g.devices.contains_key(&key) {
+                g.device_order.push(key);
+            }
             g.devices.insert(key, d);
+        }
+        for r in tx.routes {
+            let key = (r.base.tenant_id, r.base.id);
+            if !g.routes.contains_key(&key) {
+                g.route_order.push(key);
+            }
+            g.routes.insert(key, r);
         }
         if let Some((tenant, key, call_id)) = tx.idempotency {
             g.idempotency.insert((tenant, key), call_id);
@@ -517,6 +564,15 @@ impl Store for MemStore {
     async fn list_devices(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Device>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
         Ok(page_from(&g.device_order, |k| g.devices.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_route(&self, tenant: Uuid, id: Uuid) -> Result<Option<Route>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.routes.get(&(tenant, id)).cloned())
+    }
+    async fn list_routes(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Route>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.route_order, |k| g.routes.get(k).cloned(), tenant, limit, cursor))
     }
 
     async fn call_for_idempotency_key(

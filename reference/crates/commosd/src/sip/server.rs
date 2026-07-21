@@ -273,12 +273,19 @@ impl SipServer {
             }
         }
 
-        // If the request-URI names a REGISTERED endpoint, try to bridge the two legs: bind a
-        // two-leg RTP relay, INVITE the callee (offering leg B), and on its 200 OK answer the
-        // caller (offering leg A). Any failure (no registered match, callee did not answer)
-        // falls through to the echo path so the dial still completes.
+        // Route the dialled number through the Extension→Route table (control-plane routing,
+        // Volume 3). A route to a SIP endpoint rewrites the effective target so the registered
+        // callee is found by the route's user-part, not just a bare request-URI match; a
+        // queue/external destination has no registered endpoint and falls through to echo.
         let request_uri = msg.request_uri().unwrap_or("");
-        if let Some(callee_reg) = self.find_registered_callee(request_uri) {
+        let routed_uri = self.resolve_route(request_uri).await;
+        let effective_uri = routed_uri.as_deref().unwrap_or(request_uri);
+
+        // If the (routed) request-URI names a REGISTERED endpoint, try to bridge the two legs:
+        // bind a two-leg RTP relay, INVITE the callee (offering leg B), and on its 200 OK
+        // answer the caller (offering leg A). Any failure (no registered match, callee did not
+        // answer) falls through to the echo path so the dial still completes.
+        if let Some(callee_reg) = self.find_registered_callee(effective_uri) {
             match self.try_bridge(&callee_reg, call_id).await {
                 Some((bridge, callee_leg)) => {
                     let leg_a_port = bridge.leg_a_port;
@@ -342,6 +349,24 @@ impl SipServer {
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, rtp_port, "SIP INVITE answered (RTP echo)");
         self.send(socket, ok.as_bytes(), src).await
+    }
+
+    /// Resolve the request-URI through the Extension→Route table. When the dialled number
+    /// routes to a SIP endpoint (`sip:<user>@<host>`), returns that destination so the callee
+    /// is found by the *route's* target; a queue/external (or unrouted) destination returns
+    /// `None`, leaving the raw request-URI to be matched (or the echo path to take over).
+    async fn resolve_route(&self, request_uri: &str) -> Option<String> {
+        let number = user_part(request_uri)?;
+        let dest = self
+            .routing
+            .resolve_extension(self.default_tenant, number)
+            .await?;
+        if dest.starts_with("sip:") || dest.starts_with("sips:") {
+            Some(dest)
+        } else {
+            tracing::info!(%dest, number, "extension routes to a non-SIP destination; using echo path");
+            None
+        }
     }
 
     /// Find a registered callee whose AoR user-part matches the request-URI's user-part

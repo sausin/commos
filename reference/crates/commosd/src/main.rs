@@ -159,6 +159,26 @@ async fn run(cfg: Config) -> i32 {
         tracing::info!(dev_tokens = cfg.dev_tokens, "bearer auth: HS256 JWT verification enabled");
     }
 
+    // Admin auth: resolve the admin password (if referenced). When set, the privileged setup
+    // routes require an admin session; when unset, admin auth stays in dev mode (any tenant
+    // bearer acts as admin) so zero-config local setup keeps working (CMOS-14-DEP-083).
+    let admin_password = match &cfg.admin_password {
+        Some(secret) => match secret.resolve() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("{e}");
+                return exit::CONFIG;
+            }
+        },
+        None => None,
+    };
+    let admin = api::admin::AdminAuth::new(admin_password);
+    if admin.is_dev_mode() {
+        tracing::warn!("admin auth: DEV MODE (no admin_password set) — any tenant bearer acts as admin");
+    } else {
+        tracing::info!("admin auth: enabled — privileged setup requires POST /admin/login");
+    }
+
     // SIP signalling ingress (Volume 7): a real softphone can REGISTER, and an INVITE creates
     // an inbound Call, reports ring/answer as media facts, sets up an RTP echo path, and is
     // answered with SDP. The ingress maps to a single tenant for now (Volume 9).
@@ -203,6 +223,7 @@ async fn run(cfg: Config) -> i32 {
         agents,
         registrations,
         auth,
+        admin,
         cfg.media_ip,
         cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
         bus.clone(),

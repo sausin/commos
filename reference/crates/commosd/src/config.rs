@@ -56,6 +56,13 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
+    /// Admin password — a **reference**, never inline (CMOS-14-DEP-083). When set, the
+    /// privileged setup routes (onboarding apply, config import) require an admin session
+    /// obtained via `POST /admin/login`. When unset (the default), admin auth is in dev mode:
+    /// any valid tenant/dev bearer acts as admin, keeping zero-config local setup working.
+    #[serde(default)]
+    pub admin_password: Option<SecretRef>,
+
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -135,6 +142,7 @@ impl Default for Config {
             dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
+            admin_password: None,
             log: LogConfig::default(),
         }
     }

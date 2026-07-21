@@ -21,6 +21,7 @@ use axum::Json;
 use crate::control::configexport::{self, ImportSummary, PbxConfig};
 use crate::state::AppState;
 
+use super::admin::AdminContext;
 use super::auth::TenantContext;
 use super::problem::Problem;
 
@@ -43,15 +44,16 @@ pub async fn export_config(
 ///
 /// The raw request body is the YAML document. A parse failure is a client error
 /// (`400 Problem`); a valid document is applied transactionally and the count of created
-/// rows is returned.
+/// rows is returned. Privileged: importing config rewrites the tenant's provisioning
+/// directory, so it requires an admin (see [`AdminContext`]).
 pub async fn import_config(
     State(st): State<AppState>,
-    tenant: TenantContext,
+    admin: AdminContext,
     body: String,
 ) -> Result<Json<ImportSummary>, Problem> {
     let cfg: PbxConfig = serde_yaml::from_str(&body)
         .map_err(|e| Problem::bad_request(format!("invalid pbx.yaml: {e}")))?;
-    let summary = configexport::import(&st.store, tenant.tenant_id, &cfg)
+    let summary = configexport::import(&st.store, admin.tenant_id, &cfg)
         .await
         .map_err(|e| Problem::internal(e.to_string()))?;
     Ok(Json(summary))
