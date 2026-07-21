@@ -178,11 +178,14 @@ Verified: `INVITE → 100 Trying → 200 OK (SDP)`, RTP echoed back, `BYE → 20
 the two-leg bridge relays A↔B in a unit test. Full mid-dialog B2BUA correctness (transactions,
 re-INVITE/hold, transcoding, conferencing) are the next media steps.
 
-Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) on the endpoint paths
-CommOS terminates — the echo test and voicemail — whenever a phone offers the secure `RTP/SAVP`
-profile with an SDES key (`a=crypto`, RFC 4568); a plain-RTP caller is answered in the clear
-exactly as before. The crypto is pure-Rust (RustCrypto), validated against the RFC 3711 key-
-derivation vectors and cross-checked end-to-end by an independent SRTP implementation.
+Media is **encrypted with SRTP** (`AES_CM_128_HMAC_SHA1_80`, RFC 3711) whenever a phone offers the
+secure `RTP/SAVP` profile with an SDES key (`a=crypto`, RFC 4568): on the endpoint paths CommOS
+terminates (echo test, voicemail), and across the **two-leg bridge/trunk relay**, where SRTP is
+terminated independently per leg — CommOS decrypts the caller leg and re-encrypts for the callee
+leg, so the two legs never share key material and the media is only plaintext inside CommOS. A
+plain-RTP caller is answered in the clear exactly as before. The crypto is pure-Rust (RustCrypto),
+validated against the RFC 3711 key-derivation vectors and cross-checked end-to-end (endpoint *and*
+two-phone bridge) by an independent SRTP implementation.
 
 The signalling channel itself can run over **SIP-over-TLS** (SIPS) — build with `--features tls`,
 set `sips_listen` plus `sip_tls_cert`/`sip_tls_key`, and CommOS serves the same request handlers

@@ -495,6 +495,10 @@ impl SipServer {
         let reflect = offer.preferred_audio().unwrap_or_else(default_codec);
         tracing::info!(%call_id, endpoint_codec = %g711.sdp_name(), reflect_codec = %reflect.name, te_pt, "codecs negotiated");
 
+        // The caller's SDES key, if it offered SRTP — used to key the caller (leg A) side of a
+        // bridge/trunk and to answer the caller over RTP/SAVP.
+        let caller_crypto = self.caller_crypto(&body);
+
         // Inbound DID: an INVITE from a carrier to a provisioned external number is routed to its
         // `destination_ref`. The effective target is that DID destination if matched, else the
         // extension route, else the raw request-URI.
@@ -525,8 +529,8 @@ impl SipServer {
         // offline) diverts to voicemail.
         if voicemail_target.is_none() {
             if let Some(callee_reg) = find_registered(&self.registrations, self.default_tenant, &target) {
-                match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer).await {
-                    Some((bridge, callee_leg, sel_codec, sel_te)) => {
+                match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
+                    Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
                         if !call_id_hdr.is_empty() {
                             let callee_call_id = callee_leg.call_id.clone();
@@ -549,11 +553,12 @@ impl SipServer {
                         } else {
                             bridge.abort();
                         }
-                        // Answer the caller with the codec the callee selected (transparent relay).
-                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, None);
+                        // Answer the caller with the codec the callee selected (transparent relay),
+                        // plus our SRTP key when the caller leg is encrypted.
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
-                            codec = %sel_codec.name, "SIP INVITE bridged to registered callee");
+                            codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE bridged to registered callee");
                         return resp.send(ok.as_bytes()).await;
                     }
                     None if self.voicemail_enabled => {
@@ -585,7 +590,7 @@ impl SipServer {
         // dialling a real phone number reaches it. Falls through to echo if the trunk fails.
         if voicemail_target.is_none() {
             if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
-                if let Some((bridge, leg, sel_codec, sel_te)) = self.try_trunk(&gateway, &e164, call_id, capture.clone(), &offer).await {
+                if let Some((bridge, leg, sel_codec, sel_te, leg_a_crypto)) = self.try_trunk(&gateway, &e164, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
                     let leg_a_port = bridge.leg_a_port;
                     if !call_id_hdr.is_empty() {
                         let callee_call_id = leg.call_id.clone();
@@ -604,10 +609,11 @@ impl SipServer {
                     } else {
                         bridge.abort();
                     }
-                    // Answer the caller with the carrier's selected codec (transparent relay).
-                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, None);
+                    // Answer the caller with the carrier's selected codec (transparent relay),
+                    // plus our SRTP key when the caller leg is encrypted.
+                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
-                    tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, "SIP INVITE routed outbound via trunk");
+                    tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE routed outbound via trunk");
                     return resp.send(ok.as_bytes()).await;
                 }
                 tracing::warn!(%call_id, %e164, "outbound trunk failed; falling back to echo");
@@ -991,8 +997,9 @@ impl SipServer {
         call_id: Uuid,
         capture: Option<rtp::Capture>,
         offer: &codec::AudioMedia,
-    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8)> {
-        let bridge = match rtp::bind_bridge(capture).await {
+        caller_crypto: Option<&sdes::CryptoAttr>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+        let pending = match rtp::bind_bridge_sockets().await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind RTP bridge");
@@ -1000,11 +1007,23 @@ impl SipServer {
             }
         };
 
+        // Leg A (caller): when the caller offered SRTP, key our side of it and remember the
+        // `a=crypto` to answer the caller with. When the caller leg is encrypted, extend SRTP to
+        // the callee (leg B) too by offering it a fresh key — end-to-end, both legs encrypted.
+        let (leg_a_crypto, srtp_a) = match caller_crypto {
+            Some(c) => {
+                let (attr, session) = srtp_answer(c);
+                (Some(attr), Some(session))
+            }
+            None => (None, None),
+        };
+        let legb_offer = leg_a_crypto.as_ref().map(|_| srtp::random_key_salt());
+        let legb_crypto = legb_offer.map(|ks| sdes::CryptoAttr { tag: 1, key_salt: ks });
+
         let addr = match resolve_contact_addr(&callee.contact).await {
             Some(a) => a,
             None => {
                 tracing::warn!(contact = %callee.contact, "callee contact is unresolvable");
-                bridge.abort();
                 return None;
             }
         };
@@ -1013,7 +1032,6 @@ impl SipServer {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind outbound SIP socket");
-                bridge.abort();
                 return None;
             }
         };
@@ -1026,8 +1044,9 @@ impl SipServer {
         let cseq_num: u32 = 1;
 
         // Offer the caller's full codec list to the callee on leg B, so the two ends converge on
-        // a shared codec CommOS relays untouched (transparent pass-through, no transcoding).
-        let sdp = reoffer_sdp(self.media_ip, bridge.leg_b_port, offer);
+        // a shared codec CommOS relays untouched (transparent pass-through, no transcoding), plus
+        // an SDES key when the caller leg is encrypted.
+        let sdp = reoffer_sdp(self.media_ip, pending.leg_b_port, offer, legb_crypto.as_ref());
         let invite = message::request(
             "INVITE",
             &callee.contact,
@@ -1043,7 +1062,6 @@ impl SipServer {
 
         if let Err(e) = sock.send_to(invite.as_bytes(), addr).await {
             tracing::warn!(error = %e, %addr, "sending outbound INVITE failed");
-            bridge.abort();
             return None;
         }
 
@@ -1068,10 +1086,7 @@ impl SipServer {
 
         let resp = match answer {
             Ok(Some(r)) => r,
-            _ => {
-                bridge.abort();
-                return None;
-            }
+            _ => return None,
         };
 
         // Capture the callee's To (with its tag) and Contact for the mid-dialog ACK/BYE.
@@ -1101,7 +1116,8 @@ impl SipServer {
         // The callee's chosen codec (from its 200 SDP) is what we answer the *caller* with, so
         // both legs use it and the relay is byte-transparent. Fall back to the caller's preferred
         // codec if the callee's answer is unparseable.
-        let callee_answer = codec::AudioMedia::parse(&String::from_utf8_lossy(resp.body()));
+        let callee_body = String::from_utf8_lossy(resp.body());
+        let callee_answer = codec::AudioMedia::parse(&callee_body);
         let sel_codec = callee_answer
             .preferred_audio()
             .or_else(|| offer.preferred_audio())
@@ -1111,6 +1127,18 @@ impl SipServer {
             .or_else(|| offer.telephone_event_pt())
             .unwrap_or(dtmf::TELEPHONE_EVENT_PT);
 
+        // Leg B (callee): if we offered SRTP and the callee answered with its own SDES key, key the
+        // callee side too. Otherwise leg B is plaintext (a callee that declined SRTP).
+        let srtp_b = legb_offer
+            .as_ref()
+            .and_then(|offered| sdes::CryptoAttr::from_sdp(&callee_body).map(|k| srtp_offered(offered, &k)));
+        if leg_a_crypto.is_some() {
+            tracing::info!(%call_id, leg_b_encrypted = srtp_b.is_some(),
+                "SRTP bridge: caller leg encrypted; callee leg {}",
+                if srtp_b.is_some() { "encrypted" } else { "plaintext (callee declined)" });
+        }
+        let bridge = pending.start(capture, srtp_a, srtp_b);
+
         let leg = CalleeLeg {
             addr,
             request_uri: callee_target,
@@ -1119,7 +1147,7 @@ impl SipServer {
             call_id: leg_call_id,
             cseq: cseq_num,
         };
-        Some((bridge, leg, sel_codec, sel_te))
+        Some((bridge, leg, sel_codec, sel_te, leg_a_crypto))
     }
 
     /// Place an **outbound** call to the PSTN/SIP carrier via `gateway`, bridged to the caller.
@@ -1139,7 +1167,8 @@ impl SipServer {
         call_id: Uuid,
         capture: Option<rtp::Capture>,
         offer: &codec::AudioMedia,
-    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8)> {
+        caller_crypto: Option<&sdes::CryptoAttr>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         let gw_address = gateway.address.as_deref()?;
         let addr = match resolve_contact_addr(gw_address).await {
             Some(a) => a,
@@ -1148,12 +1177,24 @@ impl SipServer {
                 return None;
             }
         };
-        let bridge = rtp::bind_bridge(capture).await.ok()?;
+        let pending = rtp::bind_bridge_sockets().await.ok()?;
+
+        // Leg A (caller) SRTP, and — when the caller leg is encrypted — an SRTP offer to the
+        // carrier on leg B, so the trunk leg is encrypted too where the carrier supports it.
+        let (leg_a_crypto, srtp_a) = match caller_crypto {
+            Some(c) => {
+                let (attr, session) = srtp_answer(c);
+                (Some(attr), Some(session))
+            }
+            None => (None, None),
+        };
+        let legb_offer = leg_a_crypto.as_ref().map(|_| srtp::random_key_salt());
+        let legb_crypto = legb_offer.map(|ks| sdes::CryptoAttr { tag: 1, key_salt: ks });
+
         let sock = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "outbound trunk: could not bind SIP socket");
-                bridge.abort();
                 return None;
             }
         };
@@ -1165,8 +1206,9 @@ impl SipServer {
         let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cnonce = from_tag.clone();
-        // Offer the caller's codec list to the carrier (transparent pass-through).
-        let sdp = reoffer_sdp(self.media_ip, bridge.leg_b_port, offer);
+        // Offer the caller's codec list to the carrier (transparent pass-through), plus an SDES
+        // key when the caller leg is encrypted.
+        let sdp = reoffer_sdp(self.media_ip, pending.leg_b_port, offer, legb_crypto.as_ref());
         let creds = self.trunk_credentials(gateway.carrier_id).await;
 
         // Send the INVITE, retrying once with digest auth if the carrier challenges.
@@ -1186,7 +1228,6 @@ impl SipServer {
             }
             let invite = message::request("INVITE", &request_uri, &headers, Some(("application/sdp", &sdp)));
             if sock.send_to(invite.as_bytes(), addr).await.is_err() {
-                bridge.abort();
                 return None;
             }
             let answer = timeout(CALLEE_ANSWER_TIMEOUT, async {
@@ -1206,10 +1247,7 @@ impl SipServer {
             .await;
             let (status, msg) = match answer {
                 Ok(Some(v)) => v,
-                _ => {
-                    bridge.abort();
-                    return None;
-                }
+                _ => return None,
             };
             if (200..300).contains(&status) {
                 resp = Some(msg);
@@ -1230,22 +1268,14 @@ impl SipServer {
                     }
                     _ => {
                         tracing::warn!(gateway = %gw_address, status, "outbound trunk: auth required but no usable trunk credentials");
-                        bridge.abort();
                         return None;
                     }
                 }
             }
             tracing::info!(gateway = %gw_address, status, "outbound trunk: carrier rejected the call");
-            bridge.abort();
             return None;
         }
-        let resp = match resp {
-            Some(r) => r,
-            None => {
-                bridge.abort();
-                return None;
-            }
-        };
+        let resp = resp?;
 
         let callee_to = resp.header("To").map(str::to_string).unwrap_or_else(|| format!("<{request_uri}>"));
         let callee_target = resp.header("Contact").and_then(extract_uri).unwrap_or_else(|| request_uri.clone());
@@ -1262,7 +1292,8 @@ impl SipServer {
         let ack = message::request("ACK", &callee_target, &ack_headers, None);
         let _ = sock.send_to(ack.as_bytes(), addr).await;
         // The carrier's chosen codec is what we answer the caller with (transparent relay).
-        let carrier_answer = codec::AudioMedia::parse(&String::from_utf8_lossy(resp.body()));
+        let carrier_body = String::from_utf8_lossy(resp.body());
+        let carrier_answer = codec::AudioMedia::parse(&carrier_body);
         let sel_codec = carrier_answer
             .preferred_audio()
             .or_else(|| offer.preferred_audio())
@@ -1271,8 +1302,15 @@ impl SipServer {
             .telephone_event_pt()
             .or_else(|| offer.telephone_event_pt())
             .unwrap_or(dtmf::TELEPHONE_EVENT_PT);
-        tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = bridge.leg_b_port,
-            codec = %sel_codec.name, "outbound trunk: call placed to carrier");
+
+        // Leg B (carrier) SRTP, if offered and the carrier answered with its own SDES key.
+        let srtp_b = legb_offer
+            .as_ref()
+            .and_then(|offered| sdes::CryptoAttr::from_sdp(&carrier_body).map(|k| srtp_offered(offered, &k)));
+        tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = pending.leg_b_port,
+            codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), carrier_srtp = srtp_b.is_some(),
+            "outbound trunk: call placed to carrier");
+        let bridge = pending.start(capture, srtp_a, srtp_b);
 
         let leg = CalleeLeg {
             addr,
@@ -1282,7 +1320,7 @@ impl SipServer {
             call_id: leg_call_id,
             cseq: ack_cseq,
         };
-        Some((bridge, leg, sel_codec, sel_te))
+        Some((bridge, leg, sel_codec, sel_te, leg_a_crypto))
     }
 
     /// Best-effort mid-dialog BYE toward the callee leg of a bridged call, sent
@@ -1455,19 +1493,16 @@ impl SipServer {
     /// keys the media task — `inbound` from the caller's key, `outbound` from ours. `None` when
     /// SRTP is off or the caller offered plain RTP (which is then answered in the clear).
     fn negotiate_srtp(&self, body: &str) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
-        if !self.srtp_enabled || !sdes::offers_savp(body) {
-            return None;
-        }
-        let theirs = sdes::CryptoAttr::from_sdp(body)?;
-        let (their_key, their_salt) = srtp::split_key_salt(&theirs.key_salt);
-        let ours = srtp::random_key_salt();
-        let (our_key, our_salt) = srtp::split_key_salt(&ours);
-        let session = srtp::SrtpSession {
-            inbound: srtp::SrtpContext::new(&their_key, &their_salt),
-            outbound: srtp::SrtpContext::new(&our_key, &our_salt),
-        };
-        // Echo the caller's crypto tag so the peer correlates our answer with its offer.
-        Some((sdes::CryptoAttr { tag: theirs.tag, key_salt: ours }, session))
+        Some(srtp_answer(&self.caller_crypto(body)?))
+    }
+
+    /// The caller's SDES key from its SDP `body`, when SRTP is enabled and the caller offered the
+    /// secure profile — the basis for keying the caller (leg A) side of a bridge/trunk or an
+    /// endpoint path. `None` for a plain-RTP caller (answered in the clear).
+    fn caller_crypto(&self, body: &str) -> Option<sdes::CryptoAttr> {
+        (self.srtp_enabled && sdes::offers_savp(body))
+            .then(|| sdes::CryptoAttr::from_sdp(body))
+            .flatten()
     }
 
     /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
@@ -1538,6 +1573,35 @@ fn default_codec() -> codec::Codec {
     codec::Codec { pt: 0, name: "PCMU".to_string(), clock: 8000 }
 }
 
+/// Answer a peer's SDES key: generate CommOS's own fresh key and the [`srtp::SrtpSession`] for
+/// that leg — `inbound` decrypts what the peer sends (its key), `outbound` encrypts what CommOS
+/// sends (our key). Returns the `a=crypto` attribute to advertise back (echoing the peer's tag).
+fn srtp_answer(theirs: &sdes::CryptoAttr) -> (sdes::CryptoAttr, srtp::SrtpSession) {
+    let (their_key, their_salt) = srtp::split_key_salt(&theirs.key_salt);
+    let ours = srtp::random_key_salt();
+    let (our_key, our_salt) = srtp::split_key_salt(&ours);
+    let session = srtp::SrtpSession {
+        inbound: srtp::SrtpContext::new(&their_key, &their_salt),
+        outbound: srtp::SrtpContext::new(&our_key, &our_salt),
+    };
+    (sdes::CryptoAttr { tag: theirs.tag, key_salt: ours }, session)
+}
+
+/// Pair a peer's SDES key (from its SDP answer) with the key CommOS **offered** it, into the
+/// [`srtp::SrtpSession`] for that leg: `inbound` decrypts the peer's key, `outbound` encrypts with
+/// the offered key. Used for the callee/carrier leg, where CommOS is the offerer.
+fn srtp_offered(
+    offered: &[u8; srtp::KEY_SALT_LEN],
+    theirs: &sdes::CryptoAttr,
+) -> srtp::SrtpSession {
+    let (their_key, their_salt) = srtp::split_key_salt(&theirs.key_salt);
+    let (our_key, our_salt) = srtp::split_key_salt(offered);
+    srtp::SrtpSession {
+        inbound: srtp::SrtpContext::new(&their_key, &their_salt),
+        outbound: srtp::SrtpContext::new(&our_key, &our_salt),
+    }
+}
+
 /// The SDP body advertising `port` at `media_ip` for a single negotiated `audio` codec plus RFC
 /// 4733 `telephone-event/8000` at `te_pt` (for in-band DTMF). Used for the answer CommOS sends
 /// the caller and for the single-codec offer on the IVR-transfer leg. When `crypto` is `Some`, the
@@ -1570,8 +1634,9 @@ fn media_sdp(media_ip: IpAddr, port: u16, audio: &codec::Codec, te_pt: u8, crypt
 /// The SDP body **re-offering** the caller's full codec list at `port` (plus a telephone-event
 /// line) to the far end of a bridge/trunk — so caller and callee converge on a shared codec that
 /// CommOS relays untouched (transparent pass-through, no transcoding). Falls back to a PCMU offer
-/// when the caller advertised no audio codecs.
-fn reoffer_sdp(media_ip: IpAddr, port: u16, offer: &codec::AudioMedia) -> String {
+/// when the caller advertised no audio codecs. When `crypto` is `Some`, the far leg is offered the
+/// secure `RTP/SAVP` profile with an SDES key, extending SRTP to the callee/carrier leg.
+fn reoffer_sdp(media_ip: IpAddr, port: u16, offer: &codec::AudioMedia, crypto: Option<&sdes::CryptoAttr>) -> String {
     let te = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
     let (pts, rtpmaps) = offer.reoffer_lines();
     let (pts, rtpmaps) = if pts.trim().is_empty() {
@@ -1579,14 +1644,19 @@ fn reoffer_sdp(media_ip: IpAddr, port: u16, offer: &codec::AudioMedia) -> String
     } else {
         (pts, rtpmaps)
     };
+    let (proto, crypto_line) = match crypto {
+        Some(c) => ("RTP/SAVP", format!("{}\r\n", c.to_line())),
+        None => ("RTP/AVP", String::new()),
+    };
     format!(
         "v=0\r\n\
          o=commos 0 0 IN IP4 {ip}\r\n\
          s=CommOS\r\n\
          c=IN IP4 {ip}\r\n\
          t=0 0\r\n\
-         m=audio {port} RTP/AVP {pts}\r\n\
+         m=audio {port} {proto} {pts}\r\n\
          {rtpmaps}\
+         {crypto_line}\
          a=sendrecv\r\n",
         ip = media_ip,
         port = port,

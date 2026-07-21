@@ -11,16 +11,17 @@
 //! bridge to a registered callee), and answers `200 OK` with SDP. OPTIONS/BYE/CANCEL are
 //! answered; BYE produces the CDR.
 //!
-//! Media is encrypted with **SRTP** ([`srtp`], RFC 3711 `AES_CM_128_HMAC_SHA1_80`) on the
-//! endpoint paths CommOS terminates (echo/voicemail) when a caller offers the secure `RTP/SAVP`
-//! profile with an SDES key ([`sdes`], RFC 4568); plain-RTP callers are unaffected. The signalling
-//! channel can itself be encrypted with **SIP-over-TLS** ([`tls`], a `--features tls` build) — a
-//! stream transport, so [`transport`] re-frames messages by `Content-Length` and answers back on
-//! the same connection through a transport-agnostic [`transport::Responder`].
+//! Media is encrypted with **SRTP** ([`srtp`], RFC 3711 `AES_CM_128_HMAC_SHA1_80`) when a caller
+//! offers the secure `RTP/SAVP` profile with an SDES key ([`sdes`], RFC 4568): on the endpoint
+//! paths CommOS terminates (echo/voicemail), and across the two-leg **bridge/trunk relay**, where
+//! SRTP is terminated independently per leg — CommOS decrypts the caller leg and re-encrypts for
+//! the callee/carrier leg, extending encryption end to end without the legs sharing keys. Plain-RTP
+//! callers are unaffected. The signalling channel can itself be encrypted with **SIP-over-TLS**
+//! ([`tls`], a `--features tls` build) — a stream transport, so [`transport`] re-frames messages by
+//! `Content-Length` and answers back on the same connection through a [`transport::Responder`].
 //!
 //! **What comes next:** the B2BUA bridge is best-effort (see the `TODO(B2BUA)` in [`server`]);
-//! full mid-dialog correctness, SRTP for the two-leg bridge/trunk relay, and *outbound* TLS on
-//! UAC/trunk legs are the remaining media-plane work.
+//! full mid-dialog correctness and *outbound* TLS on UAC/trunk legs are the remaining media work.
 
 pub mod codec;
 pub mod digest;
