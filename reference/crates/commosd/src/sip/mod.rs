@@ -14,6 +14,7 @@
 //! **What comes next:** the B2BUA bridge is best-effort (see the `TODO(B2BUA)` in [`server`]);
 //! full mid-dialog correctness, PSTN trunking, and SRTP are the remaining media-plane work.
 
+pub mod codec;
 pub mod digest;
 pub mod dtmf;
 pub mod g711;

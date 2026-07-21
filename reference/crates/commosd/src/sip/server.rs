@@ -40,7 +40,7 @@ fn now_unix() -> i64 {
 }
 
 use super::message::{self, SipMessage};
-use super::{dtmf, g711, ivr, rtp};
+use super::{codec, dtmf, g711, ivr, rtp};
 
 /// Largest UDP SIP datagram we accept (the UDP ceiling; ample for INVITE+SDP).
 const MAX_DATAGRAM: usize = 65_535;
@@ -492,6 +492,20 @@ impl SipServer {
         let routed_uri = self.resolve_route(request_uri).await;
         let effective_uri = routed_uri.as_deref().unwrap_or(request_uri);
 
+        // Negotiate codecs from the caller's SDP offer (CMOS-07-SIP-041). `te_pt` is the DTMF
+        // payload type; `g711` is the G.711 variant CommOS synthesises where it is itself the
+        // endpoint (IVR/voicemail); `reflect` is the caller's preferred codec, answered verbatim
+        // on the echo path (byte-transparent). Bridge/trunk pass the whole offer through.
+        let offer = codec::AudioMedia::parse(&String::from_utf8_lossy(msg.body()));
+        let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
+        let g711 = offer
+            .select_g711()
+            .and_then(|c| g711::G711::from_name(&c.name))
+            .unwrap_or(g711::G711::Ulaw);
+        let g711_codec = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+        let reflect = offer.preferred_audio().unwrap_or_else(default_codec);
+        tracing::info!(%call_id, endpoint_codec = %g711.sdp_name(), reflect_codec = %reflect.name, te_pt, "codecs negotiated");
+
         // Inbound DID: an INVITE from a carrier to a provisioned external number is routed to its
         // `destination_ref`. The effective target is that DID destination if matched, else the
         // extension route, else the raw request-URI.
@@ -507,7 +521,7 @@ impl SipServer {
             Some(id) => Some(id),
             None => self.resolve_ivr_target(request_uri).await,
         } {
-            return self.answer_with_ivr(socket, msg, src, call_id, &call_id_hdr, ivr_id).await;
+            return self.answer_with_ivr(socket, msg, src, call_id, &call_id_hdr, ivr_id, g711, te_pt).await;
         }
 
         let mut voicemail_target: Option<VoicemailBox> = None;
@@ -522,8 +536,8 @@ impl SipServer {
         // offline) diverts to voicemail.
         if voicemail_target.is_none() {
             if let Some(callee_reg) = find_registered(&self.registrations, self.default_tenant, &target) {
-                match self.try_bridge(&callee_reg, call_id, capture.clone()).await {
-                    Some((bridge, callee_leg)) => {
+                match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer).await {
+                    Some((bridge, callee_leg, sel_codec, sel_te)) => {
                         let leg_a_port = bridge.leg_a_port;
                         if !call_id_hdr.is_empty() {
                             let callee_call_id = callee_leg.call_id.clone();
@@ -546,10 +560,11 @@ impl SipServer {
                         } else {
                             bridge.abort();
                         }
-                        let sdp = self.build_sdp(leg_a_port);
+                        // Answer the caller with the codec the callee selected (transparent relay).
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te);
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
-                            "SIP INVITE bridged to registered callee");
+                            codec = %sel_codec.name, "SIP INVITE bridged to registered callee");
                         return self.send(socket, ok.as_bytes(), src).await;
                     }
                     None if self.voicemail_enabled => {
@@ -581,7 +596,7 @@ impl SipServer {
         // dialling a real phone number reaches it. Falls through to echo if the trunk fails.
         if voicemail_target.is_none() {
             if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
-                if let Some((bridge, leg)) = self.try_trunk(&gateway, &e164, call_id, capture.clone()).await {
+                if let Some((bridge, leg, sel_codec, sel_te)) = self.try_trunk(&gateway, &e164, call_id, capture.clone(), &offer).await {
                     let leg_a_port = bridge.leg_a_port;
                     if !call_id_hdr.is_empty() {
                         let callee_call_id = leg.call_id.clone();
@@ -600,9 +615,10 @@ impl SipServer {
                     } else {
                         bridge.abort();
                     }
-                    let sdp = self.build_sdp(leg_a_port);
+                    // Answer the caller with the carrier's selected codec (transparent relay).
+                    let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te);
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
-                    tracing::info!(%call_id, %e164, gateway = ?gateway.address, "SIP INVITE routed outbound via trunk");
+                    tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, "SIP INVITE routed outbound via trunk");
                     return self.send(socket, ok.as_bytes(), src).await;
                 }
                 tracing::warn!(%call_id, %e164, "outbound trunk failed; falling back to echo");
@@ -639,9 +655,10 @@ impl SipServer {
                     0
                 }
             };
-            let sdp = self.build_sdp(rtp_port);
+            // Answer with G.711 so the captured voicemail is a storable/playable codec.
+            let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt);
             let ok = self.build_invite_ok(msg, &sdp, call_id);
-            tracing::info!(%call_id, rtp_port, "SIP INVITE answered (voicemail)");
+            tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, "SIP INVITE answered (voicemail)");
             return self.send(socket, ok.as_bytes(), src).await;
         }
 
@@ -672,10 +689,10 @@ impl SipServer {
             }
         };
 
-        // Answer with SDP.
-        let sdp = self.build_sdp(rtp_port);
+        // Answer with the caller's preferred codec — the echo path reflects it byte-for-byte.
+        let sdp = self.build_sdp(rtp_port, &reflect, te_pt);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
-        tracing::info!(%call_id, rtp_port, "SIP INVITE answered (RTP echo)");
+        tracing::info!(%call_id, rtp_port, codec = %reflect.name, "SIP INVITE answered (RTP echo)");
         self.send(socket, ok.as_bytes(), src).await
     }
 
@@ -760,21 +777,23 @@ impl SipServer {
         }
     }
 
-    /// Load an IVR's prompt audio: the recorded prompt Object (μ-law) when set, else a short
-    /// generated tone so the caller hears that the menu is live.
-    async fn load_ivr_prompt(&self, tenant: Uuid, ivr: &Ivr) -> Vec<u8> {
+    /// Load an IVR's prompt audio: the recorded prompt Object when set, else a short tone
+    /// synthesised in the negotiated `codec` so the caller hears that the menu is live. (A
+    /// recorded prompt Object is assumed to already be in the negotiated codec.)
+    async fn load_ivr_prompt(&self, tenant: Uuid, ivr: &Ivr, codec: g711::G711) -> Vec<u8> {
         if let Some(obj_id) = ivr.prompt_object_id {
             match self.objects.get_bytes(tenant, obj_id).await {
                 Ok((_obj, bytes)) => return bytes,
                 Err(e) => tracing::warn!(error = %e, %obj_id, "IVR prompt object missing; using a tone"),
             }
         }
-        g711::beep(400)
+        g711::beep(400, codec)
     }
 
     /// Answer an INVITE that routes to an IVR: bind an RTP socket, answer `200 OK` with SDP, and
     /// spawn the menu session (play prompt + collect DTMF → resolve destination). Falls back to
     /// the echo path if the IVR is missing or its media socket can't bind.
+    #[allow(clippy::too_many_arguments)]
     async fn answer_with_ivr(
         &self,
         socket: &UdpSocket,
@@ -783,6 +802,8 @@ impl SipServer {
         call_id: Uuid,
         call_id_hdr: &str,
         ivr_id: Uuid,
+        g711: g711::G711,
+        te_pt: u8,
     ) -> std::io::Result<()> {
         let tenant = self.default_tenant;
         let ivr = match self.ivrs.get(tenant, ivr_id).await {
@@ -792,10 +813,12 @@ impl SipServer {
                 return self.answer_with_echo(socket, msg, src, call_id, call_id_hdr).await;
             }
         };
-        let prompt = self.load_ivr_prompt(tenant, &ivr).await;
+        // The prompt is synthesised/served in the negotiated G.711 codec.
+        let prompt = self.load_ivr_prompt(tenant, &ivr, g711).await;
         let cfg = ivr::IvrConfig::from_ivr(
             prompt,
-            dtmf::TELEPHONE_EVENT_PT,
+            g711,
+            te_pt,
             &ivr.options,
             ivr.timeout_ms,
             ivr.invalid_action.as_deref(),
@@ -840,9 +863,10 @@ impl SipServer {
             let _ = stop_tx.send(true); // no dialog key to track it → stop the session
         }
 
-        let sdp = self.build_sdp(rtp_port);
+        let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
-        tracing::info!(%call_id, %ivr_id, rtp_port, "SIP INVITE answered (IVR menu)");
+        tracing::info!(%call_id, %ivr_id, rtp_port, codec = %g711.sdp_name(), "SIP INVITE answered (IVR menu)");
         self.send(socket, ok.as_bytes(), src).await
     }
 
@@ -874,7 +898,7 @@ impl SipServer {
         match result.outcome {
             ivr::IvrOutcome::Selected { destination, .. } if destination.starts_with("voicemail") => {
                 if let Some(peer) = result.peer {
-                    ivr::play(&sock, peer, &g711::beep(250)).await;
+                    ivr::play(&sock, peer, cfg.codec.payload_type(), &g711::beep(250, cfg.codec)).await;
                 }
                 let capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
                 ivr::record_until_stop(&sock, cfg.te_pt, &capture, &mut stop_rx, IVR_VOICEMAIL_MAX).await;
@@ -894,7 +918,7 @@ impl SipServer {
                 if let (Some(peer), Some(callee)) =
                     (result.peer, find_registered(&registrations, tenant, &destination))
                 {
-                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, &mut stop_rx).await {
+                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, cfg.codec, cfg.te_pt, &mut stop_rx).await {
                         return; // relayed until the caller hung up
                     }
                 } else {
@@ -944,7 +968,11 @@ impl SipServer {
                 0
             }
         };
-        let sdp = self.build_sdp(rtp_port);
+        // Reflect the caller's preferred codec (the echo path relays bytes verbatim).
+        let offer = codec::AudioMedia::parse(&String::from_utf8_lossy(msg.body()));
+        let audio = offer.preferred_audio().unwrap_or_else(default_codec);
+        let te_pt = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt);
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         self.send(socket, ok.as_bytes(), src).await
     }
@@ -964,7 +992,8 @@ impl SipServer {
         callee: &Registration,
         call_id: Uuid,
         capture: Option<rtp::Capture>,
-    ) -> Option<(rtp::Bridge, CalleeLeg)> {
+        offer: &codec::AudioMedia,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8)> {
         let bridge = match rtp::bind_bridge(capture).await {
             Ok(b) => b,
             Err(e) => {
@@ -998,8 +1027,9 @@ impl SipServer {
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cseq_num: u32 = 1;
 
-        // Offer leg B to the callee in SDP.
-        let sdp = self.build_sdp(bridge.leg_b_port);
+        // Offer the caller's full codec list to the callee on leg B, so the two ends converge on
+        // a shared codec CommOS relays untouched (transparent pass-through, no transcoding).
+        let sdp = reoffer_sdp(self.media_ip, bridge.leg_b_port, offer);
         let invite = message::request(
             "INVITE",
             &callee.contact,
@@ -1070,6 +1100,19 @@ impl SipServer {
         );
         let _ = sock.send_to(ack.as_bytes(), addr).await;
 
+        // The callee's chosen codec (from its 200 SDP) is what we answer the *caller* with, so
+        // both legs use it and the relay is byte-transparent. Fall back to the caller's preferred
+        // codec if the callee's answer is unparseable.
+        let callee_answer = codec::AudioMedia::parse(&String::from_utf8_lossy(resp.body()));
+        let sel_codec = callee_answer
+            .preferred_audio()
+            .or_else(|| offer.preferred_audio())
+            .unwrap_or_else(default_codec);
+        let sel_te = callee_answer
+            .telephone_event_pt()
+            .or_else(|| offer.telephone_event_pt())
+            .unwrap_or(dtmf::TELEPHONE_EVENT_PT);
+
         let leg = CalleeLeg {
             addr,
             request_uri: callee_target,
@@ -1078,7 +1121,7 @@ impl SipServer {
             call_id: leg_call_id,
             cseq: cseq_num,
         };
-        Some((bridge, leg))
+        Some((bridge, leg, sel_codec, sel_te))
     }
 
     /// Place an **outbound** call to the PSTN/SIP carrier via `gateway`, bridged to the caller.
@@ -1097,7 +1140,8 @@ impl SipServer {
         e164: &str,
         call_id: Uuid,
         capture: Option<rtp::Capture>,
-    ) -> Option<(rtp::Bridge, CalleeLeg)> {
+        offer: &codec::AudioMedia,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8)> {
         let gw_address = gateway.address.as_deref()?;
         let addr = match resolve_contact_addr(gw_address).await {
             Some(a) => a,
@@ -1123,7 +1167,8 @@ impl SipServer {
         let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cnonce = from_tag.clone();
-        let sdp = self.build_sdp(bridge.leg_b_port);
+        // Offer the caller's codec list to the carrier (transparent pass-through).
+        let sdp = reoffer_sdp(self.media_ip, bridge.leg_b_port, offer);
         let creds = self.trunk_credentials(gateway.carrier_id).await;
 
         // Send the INVITE, retrying once with digest auth if the carrier challenges.
@@ -1218,8 +1263,18 @@ impl SipServer {
         }
         let ack = message::request("ACK", &callee_target, &ack_headers, None);
         let _ = sock.send_to(ack.as_bytes(), addr).await;
+        // The carrier's chosen codec is what we answer the caller with (transparent relay).
+        let carrier_answer = codec::AudioMedia::parse(&String::from_utf8_lossy(resp.body()));
+        let sel_codec = carrier_answer
+            .preferred_audio()
+            .or_else(|| offer.preferred_audio())
+            .unwrap_or_else(default_codec);
+        let sel_te = carrier_answer
+            .telephone_event_pt()
+            .or_else(|| offer.telephone_event_pt())
+            .unwrap_or(dtmf::TELEPHONE_EVENT_PT);
         tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = bridge.leg_b_port,
-            "outbound trunk: call placed to carrier");
+            codec = %sel_codec.name, "outbound trunk: call placed to carrier");
 
         let leg = CalleeLeg {
             addr,
@@ -1229,7 +1284,7 @@ impl SipServer {
             call_id: leg_call_id,
             cseq: ack_cseq,
         };
-        Some((bridge, leg))
+        Some((bridge, leg, sel_codec, sel_te))
     }
 
     /// Best-effort mid-dialog BYE toward the callee leg of a bridged call, sent
@@ -1394,9 +1449,10 @@ impl SipServer {
         self.reply(socket, msg, 200, "OK", src).await
     }
 
-    /// Build the SDP answer advertising the RTP port (see [`media_sdp`]).
-    fn build_sdp(&self, rtp_port: u16) -> String {
-        media_sdp(self.media_ip, rtp_port)
+    /// Build the SDP answer advertising `rtp_port` for the negotiated `audio` codec + DTMF
+    /// payload type `te_pt` (see [`media_sdp`]).
+    fn build_sdp(&self, rtp_port: u16, audio: &codec::Codec, te_pt: u8) -> String {
+        media_sdp(self.media_ip, rtp_port, audio, te_pt)
     }
 
     /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
@@ -1469,24 +1525,57 @@ fn user_part(uri: &str) -> Option<&str> {
     }
 }
 
-/// The SDP body advertising `port` at `media_ip`: PCMU/8000 plus RFC 4733
-/// `telephone-event/8000` (dynamic PT [`dtmf::TELEPHONE_EVENT_PT`]) so phones send DTMF in-band
-/// for the IVR runtime; harmless on the echo/bridge paths (they relay it).
-fn media_sdp(media_ip: IpAddr, port: u16) -> String {
+/// A default codec (PCMU/8000) for when an offer carries no usable audio codec.
+fn default_codec() -> codec::Codec {
+    codec::Codec { pt: 0, name: "PCMU".to_string(), clock: 8000 }
+}
+
+/// The SDP body advertising `port` at `media_ip` for a single negotiated `audio` codec plus RFC
+/// 4733 `telephone-event/8000` at `te_pt` (for in-band DTMF). Used for the answer CommOS sends
+/// the caller and for the single-codec offer on the IVR-transfer leg.
+fn media_sdp(media_ip: IpAddr, port: u16, audio: &codec::Codec, te_pt: u8) -> String {
     format!(
         "v=0\r\n\
          o=commos 0 0 IN IP4 {ip}\r\n\
          s=CommOS\r\n\
          c=IN IP4 {ip}\r\n\
          t=0 0\r\n\
-         m=audio {port} RTP/AVP 0 {te}\r\n\
-         a=rtpmap:0 PCMU/8000\r\n\
+         m=audio {port} RTP/AVP {apt} {te}\r\n\
+         a=rtpmap:{apt} {rtpmap}\r\n\
          a=rtpmap:{te} telephone-event/8000\r\n\
          a=fmtp:{te} 0-16\r\n\
          a=sendrecv\r\n",
         ip = media_ip,
         port = port,
-        te = dtmf::TELEPHONE_EVENT_PT,
+        apt = audio.pt,
+        rtpmap = audio.rtpmap(),
+        te = te_pt,
+    )
+}
+
+/// The SDP body **re-offering** the caller's full codec list at `port` (plus a telephone-event
+/// line) to the far end of a bridge/trunk — so caller and callee converge on a shared codec that
+/// CommOS relays untouched (transparent pass-through, no transcoding). Falls back to a PCMU offer
+/// when the caller advertised no audio codecs.
+fn reoffer_sdp(media_ip: IpAddr, port: u16, offer: &codec::AudioMedia) -> String {
+    let te = offer.telephone_event_pt().unwrap_or(dtmf::TELEPHONE_EVENT_PT);
+    let (pts, rtpmaps) = offer.reoffer_lines();
+    let (pts, rtpmaps) = if pts.trim().is_empty() {
+        (format!("0 {te}"), format!("a=rtpmap:0 PCMU/8000\r\na=rtpmap:{te} telephone-event/8000\r\n"))
+    } else {
+        (pts, rtpmaps)
+    };
+    format!(
+        "v=0\r\n\
+         o=commos 0 0 IN IP4 {ip}\r\n\
+         s=CommOS\r\n\
+         c=IN IP4 {ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP {pts}\r\n\
+         {rtpmaps}\
+         a=sendrecv\r\n",
+        ip = media_ip,
+        port = port,
     )
 }
 
@@ -1537,12 +1626,15 @@ fn find_registered(
 ///
 /// TODO(B2BUA): the outbound leg is best-effort (as [`SipServer::try_bridge`]); full mid-dialog
 /// correctness (transactions, retransmission, ringback tone during setup) is future work.
+#[allow(clippy::too_many_arguments)]
 async fn ivr_transfer(
     sock_a: &UdpSocket,
     peer_a: SocketAddr,
     callee: &Registration,
     media_ip: IpAddr,
     call_id: Uuid,
+    g711: g711::G711,
+    te_pt: u8,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let addr = match resolve_contact_addr(&callee.contact).await {
@@ -1569,7 +1661,9 @@ async fn ivr_transfer(
     let leg_call_id = format!("{}@commos-ivr", call_id.to_string().replace('-', ""));
     let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
     let from_hdr = format!("<sip:commos@{media_ip}>;tag={from_tag}");
-    let sdp = media_sdp(media_ip, leg_b_port);
+    // Offer the callee the IVR caller's negotiated codec (the caller is already on it).
+    let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+    let sdp = media_sdp(media_ip, leg_b_port, &audio, te_pt);
     let invite = message::request(
         "INVITE",
         &callee.contact,
@@ -1590,7 +1684,7 @@ async fn ivr_transfer(
     // the caller** on leg A meanwhile so they hear audible ring instead of silence while the
     // callee's phone rings. Ring-back loops the standard 440+480 Hz / 2 s-on-4 s-off cadence.
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let ringback = g711::ringback();
+    let ringback = g711::ringback(g711);
     let mut rb_pos = 0usize;
     let mut rb_seq: u16 = 0;
     let mut rb_ts: u32 = 0;
@@ -1627,7 +1721,7 @@ async fn ivr_transfer(
                     *b = ringback[rb_pos % ringback.len()];
                     rb_pos += 1;
                 }
-                let pkt = ivr::pcmu_frame(rb_seq, rb_ts, &frame, rb_first);
+                let pkt = ivr::rtp_frame(g711.payload_type(), rb_seq, rb_ts, &frame, rb_first);
                 let _ = sock_a.send_to(&pkt, peer_a).await;
                 rb_seq = rb_seq.wrapping_add(1);
                 rb_ts = rb_ts.wrapping_add(160);

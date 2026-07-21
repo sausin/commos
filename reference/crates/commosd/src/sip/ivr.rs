@@ -33,8 +33,10 @@ const RTP_HEADER_LEN: usize = 12;
 /// What an IVR node needs to run: the prompt audio, the DTMF payload type, the digit→
 /// destination map, and the timeout / invalid-input behaviour.
 pub struct IvrConfig {
-    /// Prompt audio as μ-law (`audio/basic`) — a recorded prompt Object, or synthesised tone.
+    /// Prompt audio (G.711 in `codec`) — a recorded prompt Object, or a synthesised tone.
     pub prompt: Vec<u8>,
+    /// The negotiated G.711 codec (PCMU/PCMA) — the RTP payload type prompt frames use.
+    pub codec: crate::sip::g711::G711,
     /// The negotiated `telephone-event` RTP payload type (from the SDP answer).
     pub te_pt: u8,
     /// `digit → destination_ref` (e.g. `'1' → "voicemail"`).
@@ -50,9 +52,11 @@ pub struct IvrConfig {
 impl IvrConfig {
     /// Build a config from an [`Ivr`](commos_core::entities::ivr::Ivr)'s wire fields: the
     /// `options` object (`digit → destination_ref`), `timeout_ms` (default 5 s), and
-    /// `invalid_action` (default `repeat`). `prompt` and `te_pt` come from the media layer.
+    /// `invalid_action` (default `repeat`). `prompt`, `codec`, and `te_pt` come from the media
+    /// layer (the negotiated codec and DTMF payload type).
     pub fn from_ivr(
         prompt: Vec<u8>,
+        codec: crate::sip::g711::G711,
         te_pt: u8,
         options: &serde_json::Value,
         timeout_ms: Option<i64>,
@@ -71,6 +75,7 @@ impl IvrConfig {
         let timeout = Duration::from_millis(timeout_ms.filter(|&t| t > 0).unwrap_or(5000) as u64);
         IvrConfig {
             prompt,
+            codec,
             te_pt,
             options: map,
             timeout,
@@ -108,8 +113,9 @@ pub async fn run_ivr(
 ) -> IvrResult {
     let mut peer: Option<SocketAddr> = None;
     let mut outcome = IvrOutcome::Timeout;
+    let audio_pt = cfg.codec.payload_type();
     for _ in 0..cfg.max_attempts.max(1) {
-        match play_and_collect(sock, &cfg.prompt, cfg.te_pt, cfg.timeout, info_rx, &mut peer).await {
+        match play_and_collect(sock, &cfg.prompt, audio_pt, cfg.te_pt, cfg.timeout, info_rx, &mut peer).await {
             Some(digit) => {
                 outcome = if let Some(dest) = cfg.options.get(&digit) {
                     IvrOutcome::Selected { digit, destination: dest.clone() }
@@ -136,12 +142,14 @@ pub async fn run_ivr(
     IvrResult { outcome, peer }
 }
 
-/// One attempt: latch the caller (persisting `peer` across attempts), stream `prompt` as PCMU
-/// RTP while decoding inbound DTMF, and return the first digit collected (in-band or injected)
-/// within `timeout`, else `None`.
+/// One attempt: latch the caller (persisting `peer` across attempts), stream `prompt` (G.711 at
+/// payload type `audio_pt`) as RTP while decoding inbound DTMF, and return the first digit
+/// collected (in-band or injected) within `timeout`, else `None`.
+#[allow(clippy::too_many_arguments)]
 async fn play_and_collect(
     sock: &UdpSocket,
     prompt: &[u8],
+    audio_pt: u8,
     te_pt: u8,
     timeout: Duration,
     info_rx: &mut UnboundedReceiver<char>,
@@ -183,7 +191,7 @@ async fn play_and_collect(
             _ = ticker.tick() => {
                 if let (Some(dst), true) = (*peer, frame_idx < frames.len()) {
                     let payload = frames[frame_idx];
-                    let pkt = pcmu_frame(seq, ts, payload, first_frame);
+                    let pkt = rtp_frame(audio_pt, seq, ts, payload, first_frame);
                     let _ = sock.send_to(&pkt, dst).await;
                     seq = seq.wrapping_add(1);
                     ts = ts.wrapping_add(payload.len() as u32);
@@ -195,16 +203,17 @@ async fn play_and_collect(
     }
 }
 
-/// Play `audio` (μ-law) to `peer` as PCMU RTP at 20 ms cadence, returning once every frame is
-/// sent. Used for the voicemail "leave a message" beep after an IVR selects voicemail.
-pub async fn play(sock: &UdpSocket, peer: SocketAddr, audio: &[u8]) {
+/// Play `audio` (G.711 at payload type `pt`) to `peer` as RTP at 20 ms cadence, returning once
+/// every frame is sent. Used for the voicemail "leave a message" beep after an IVR selects
+/// voicemail.
+pub async fn play(sock: &UdpSocket, peer: SocketAddr, pt: u8, audio: &[u8]) {
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
     let mut first = true;
     let mut ticker = tokio::time::interval(FRAME_INTERVAL);
     for chunk in audio.chunks(FRAME_BYTES) {
         ticker.tick().await;
-        let _ = sock.send_to(&pcmu_frame(seq, ts, chunk, first), peer).await;
+        let _ = sock.send_to(&rtp_frame(pt, seq, ts, chunk, first), peer).await;
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(chunk.len() as u32);
         first = false;
@@ -244,13 +253,13 @@ pub async fn record_until_stop(
     }
 }
 
-/// Build a PCMU (payload type 0) RTP packet with a 12-byte header. `marker` is set on the
+/// Build a G.711 RTP packet at payload type `pt` with a 12-byte header. `marker` is set on the
 /// first packet of the talkspurt (RFC 3550 §5.1). Shared with the ring-back playout in
 /// [`crate::sip::server`].
-pub fn pcmu_frame(seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec<u8> {
+pub fn rtp_frame(pt: u8, seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec<u8> {
     let mut p = Vec::with_capacity(12 + payload.len());
     p.push(0x80); // version 2, no padding/extension/CSRC
-    p.push(if marker { 0x80 } else { 0x00 }); // marker + payload type 0 (PCMU)
+    p.push((if marker { 0x80 } else { 0x00 }) | (pt & 0x7f)); // marker + payload type
     p.extend_from_slice(&seq.to_be_bytes());
     p.extend_from_slice(&ts.to_be_bytes());
     p.extend_from_slice(&SSRC.to_be_bytes());
@@ -272,8 +281,10 @@ mod tests {
     }
 
     fn cfg(options: &[(char, &str)], invalid: &str) -> IvrConfig {
+        let codec = crate::sip::g711::G711::Ulaw;
         IvrConfig {
-            prompt: crate::sip::g711::beep(60), // short prompt so tests are fast
+            prompt: crate::sip::g711::beep(60, codec), // short prompt so tests are fast
+            codec,
             te_pt: TELEPHONE_EVENT_PT,
             options: options.iter().map(|(d, r)| (*d, r.to_string())).collect(),
             timeout: Duration::from_millis(600),
@@ -338,7 +349,7 @@ mod tests {
     #[test]
     fn from_ivr_parses_options_and_defaults() {
         let opts = serde_json::json!({"1": "voicemail", "2": "queue:sales", "invalid": "x"});
-        let cfg = IvrConfig::from_ivr(vec![], TELEPHONE_EVENT_PT, &opts, None, None);
+        let cfg = IvrConfig::from_ivr(vec![], crate::sip::g711::G711::Ulaw, TELEPHONE_EVENT_PT, &opts, None, None);
         assert_eq!(cfg.options.get(&'1').map(String::as_str), Some("voicemail"));
         assert_eq!(cfg.options.get(&'2').map(String::as_str), Some("queue:sales"));
         // Multi-char keys are ignored (not single digits).
