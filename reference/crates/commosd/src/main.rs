@@ -247,6 +247,8 @@ async fn run(cfg: Config) -> i32 {
             recordings.clone(),
             cfg.voicemail_enabled,
             voicemails.clone(),
+            ivrs.clone(),
+            objects.clone(),
         );
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");

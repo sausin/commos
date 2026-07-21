@@ -21,7 +21,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use commos_core::common::{Timestamp, Uuid};
+use commos_core::entities::ivr::Ivr;
 
+use crate::control::ivr::IvrService;
+use crate::control::objects::ObjectService;
 use crate::control::recordings::RecordingService;
 use crate::control::registrations::{Registration, RegistrationRegistry};
 use crate::control::routing::Routing;
@@ -35,10 +38,14 @@ fn now_unix() -> i64 {
 }
 
 use super::message::{self, SipMessage};
-use super::rtp;
+use super::{dtmf, g711, ivr, rtp};
 
 /// Largest UDP SIP datagram we accept (the UDP ceiling; ample for INVITE+SDP).
 const MAX_DATAGRAM: usize = 65_535;
+
+/// Cap an IVR-deposited voicemail recording (~2 min of G.711) so an abandoned line can't
+/// record forever; a graceful hangup (BYE) stops it sooner.
+const IVR_VOICEMAIL_MAX: Duration = Duration::from_secs(120);
 
 /// How long we wait for a registered callee to answer our outbound INVITE before falling
 /// back to the echo path so the caller's dial still completes.
@@ -51,14 +58,23 @@ enum Media {
     Echo(JoinHandle<()>),
     /// A live two-leg RTP relay between the caller and the callee.
     Bridge(rtp::Bridge),
+    /// An IVR menu session (prompt playback + DTMF collection). Torn down *gracefully* — a
+    /// hangup signals `stop` so an in-progress voicemail deposit is saved before the task
+    /// exits — rather than hard-aborted; the detached task then finishes on its own.
+    Ivr { task: JoinHandle<()>, stop: tokio::sync::watch::Sender<bool> },
 }
 
 impl Media {
-    /// Tear the media plane down (abort the relay/echo task).
+    /// Tear the media plane down. Echo/Bridge abort immediately; an IVR session is asked to
+    /// stop gracefully (so it can persist a voicemail deposit) and detached.
     fn abort(self) {
         match self {
             Media::Echo(task) => task.abort(),
             Media::Bridge(bridge) => bridge.abort(),
+            Media::Ivr { task, stop } => {
+                let _ = stop.send(true);
+                drop(task); // detach: the task drains its stop signal and exits itself
+            }
         }
     }
 }
@@ -110,6 +126,9 @@ struct Dialog {
     /// Set when this dialog is a voicemail (the callee did not answer or is offline); drives
     /// voicemail storage + MWI on hangup instead of ordinary call recording.
     voicemail: Option<VoicemailBox>,
+    /// For an active IVR dialog, the channel that injects SIP INFO DTMF digits into the running
+    /// menu session; `None` for echo/bridge/voicemail dialogs.
+    info_tx: Option<tokio::sync::mpsc::UnboundedSender<char>>,
 }
 
 /// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
@@ -143,6 +162,10 @@ pub struct SipServer {
     voicemail_enabled: bool,
     /// Voicemail service used to store captured audio and drive the MWI summary.
     voicemails: VoicemailService,
+    /// IVR service — resolve an `ivr:<id>` routing target to its menu definition.
+    ivrs: IvrService,
+    /// Object service — fetch an IVR's prompt audio Object for playback.
+    objects: ObjectService,
 }
 
 impl SipServer {
@@ -159,6 +182,8 @@ impl SipServer {
         recordings: RecordingService,
         voicemail_enabled: bool,
         voicemails: VoicemailService,
+        ivrs: IvrService,
+        objects: ObjectService,
     ) -> Self {
         SipServer {
             registrations,
@@ -175,6 +200,8 @@ impl SipServer {
             recordings,
             voicemail_enabled,
             voicemails,
+            ivrs,
+            objects,
         }
     }
 
@@ -293,11 +320,36 @@ impl SipServer {
                 Ok(())
             }
             "BYE" | "CANCEL" => self.on_bye(socket, &msg, src).await,
+            "INFO" => self.on_info(socket, &msg, src).await,
             other => {
                 tracing::info!(method = %other, %src, "SIP method not implemented");
                 self.reply(socket, &msg, 501, "Not Implemented", src).await
             }
         }
+    }
+
+    /// INFO: out-of-band DTMF (`application/dtmf-relay` / `application/dtmf`). If the datagram's
+    /// dialog is a live IVR session, inject the pressed digit into it; always `200 OK`.
+    async fn on_info(
+        &self,
+        socket: &UdpSocket,
+        msg: &SipMessage,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
+        let body = String::from_utf8_lossy(msg.body());
+        if let (Some(call_id), Some(digit)) = (msg.call_id(), dtmf::parse_info_dtmf(&body)) {
+            let injected = self
+                .dialogs
+                .lock()
+                .expect("dialogs mutex")
+                .get(call_id)
+                .and_then(|d| d.info_tx.as_ref().map(|tx| tx.send(digit).is_ok()))
+                .unwrap_or(false);
+            if injected {
+                tracing::info!(%call_id, %digit, "SIP INFO DTMF injected into IVR");
+            }
+        }
+        self.reply(socket, msg, 200, "OK", src).await
     }
 
     /// REGISTER: bind the AoR to its contact and confirm with a `200 OK`.
@@ -433,6 +485,12 @@ impl SipServer {
         let routed_uri = self.resolve_route(request_uri).await;
         let effective_uri = routed_uri.as_deref().unwrap_or(request_uri);
 
+        // An extension routing to `ivr:<id>` runs the IVR menu runtime: answer with SDP, play
+        // the prompt, and collect DTMF (the caller's audio is not recorded here).
+        if let Some(ivr_id) = self.resolve_ivr_target(request_uri).await {
+            return self.answer_with_ivr(socket, msg, src, call_id, &call_id_hdr, ivr_id).await;
+        }
+
         // If the (routed) request-URI names a REGISTERED endpoint, try to bridge the two legs:
         // bind a two-leg RTP relay, INVITE the callee (offering leg B), and on its 200 OK
         // answer the caller (offering leg A). A callee that never answers (or an internal
@@ -453,6 +511,7 @@ impl SipServer {
                                 callee: Some(callee_leg),
                                 capture: capture.clone(),
                                 voicemail: None,
+                                info_tx: None,
                             },
                         );
                         // Index the callee-leg Call-ID so a callee-side BYE finds this dialog.
@@ -510,6 +569,7 @@ impl SipServer {
                                 callee: None,
                                 capture: Some(vm_capture),
                                 voicemail: Some(vmbox),
+                                info_tx: None,
                             },
                         );
                     } else {
@@ -541,6 +601,7 @@ impl SipServer {
                             callee: None,
                             capture: capture.clone(),
                             voicemail: None,
+                            info_tx: None,
                         },
                     );
                 } else {
@@ -577,6 +638,185 @@ impl SipServer {
             tracing::info!(%dest, number, "extension routes to a non-SIP destination; using echo path");
             None
         }
+    }
+
+    /// Resolve an `ivr:<uuid>` routing target for the dialled number, if the extension routes
+    /// to an IVR menu. Returns the IVR id, else `None` (a non-IVR destination).
+    async fn resolve_ivr_target(&self, request_uri: &str) -> Option<Uuid> {
+        let number = user_part(request_uri)?;
+        let dest = self.routing.resolve_extension(self.default_tenant, number).await?;
+        let id = dest.strip_prefix("ivr:")?.trim();
+        Uuid::parse(id).ok()
+    }
+
+    /// Load an IVR's prompt audio: the recorded prompt Object (μ-law) when set, else a short
+    /// generated tone so the caller hears that the menu is live.
+    async fn load_ivr_prompt(&self, tenant: Uuid, ivr: &Ivr) -> Vec<u8> {
+        if let Some(obj_id) = ivr.prompt_object_id {
+            match self.objects.get_bytes(tenant, obj_id).await {
+                Ok((_obj, bytes)) => return bytes,
+                Err(e) => tracing::warn!(error = %e, %obj_id, "IVR prompt object missing; using a tone"),
+            }
+        }
+        g711::beep(400)
+    }
+
+    /// Answer an INVITE that routes to an IVR: bind an RTP socket, answer `200 OK` with SDP, and
+    /// spawn the menu session (play prompt + collect DTMF → resolve destination). Falls back to
+    /// the echo path if the IVR is missing or its media socket can't bind.
+    async fn answer_with_ivr(
+        &self,
+        socket: &UdpSocket,
+        msg: &SipMessage,
+        src: SocketAddr,
+        call_id: Uuid,
+        call_id_hdr: &str,
+        ivr_id: Uuid,
+    ) -> std::io::Result<()> {
+        let tenant = self.default_tenant;
+        let ivr = match self.ivrs.get(tenant, ivr_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, %ivr_id, "IVR not found; falling back to echo");
+                return self.answer_with_echo(socket, msg, src, call_id, call_id_hdr).await;
+            }
+        };
+        let prompt = self.load_ivr_prompt(tenant, &ivr).await;
+        let cfg = ivr::IvrConfig::from_ivr(
+            prompt,
+            dtmf::TELEPHONE_EVENT_PT,
+            &ivr.options,
+            ivr.timeout_ms,
+            ivr.invalid_action.as_deref(),
+        );
+
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind IVR RTP socket; falling back to echo");
+                return self.answer_with_echo(socket, msg, src, call_id, call_id_hdr).await;
+            }
+        };
+        let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+
+        let (info_tx, info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(Self::ivr_driver(
+            sock,
+            cfg,
+            tenant,
+            call_id,
+            self.voicemails.clone(),
+            info_rx,
+            stop_rx,
+        ));
+
+        if !call_id_hdr.is_empty() {
+            self.dialogs.lock().expect("dialogs mutex").insert(
+                call_id_hdr.to_string(),
+                Dialog {
+                    call_id,
+                    media: Media::Ivr { task, stop: stop_tx },
+                    callee: None,
+                    capture: None,
+                    voicemail: None,
+                    info_tx: Some(info_tx),
+                },
+            );
+        } else {
+            let _ = stop_tx.send(true); // no dialog key to track it → stop the session
+        }
+
+        let sdp = self.build_sdp(rtp_port);
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        tracing::info!(%call_id, %ivr_id, rtp_port, "SIP INVITE answered (IVR menu)");
+        self.send(socket, ok.as_bytes(), src).await
+    }
+
+    /// Drive an IVR session to completion, then enact its outcome. A `voicemail*` selection
+    /// records the caller (after a beep) until they hang up (graceful `stop`) or the cap, and
+    /// stores a [`Voicemail`]. Other selections/timeouts hold the line until hangup — full
+    /// mid-call transfer to the chosen destination is future work (tied to B2BUA transfer).
+    async fn ivr_driver(
+        sock: UdpSocket,
+        cfg: ivr::IvrConfig,
+        tenant: Uuid,
+        call_id: Uuid,
+        voicemails: VoicemailService,
+        mut info_rx: tokio::sync::mpsc::UnboundedReceiver<char>,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let result = tokio::select! {
+            r = ivr::run_ivr(&sock, &cfg, &mut info_rx) => r,
+            _ = stop_rx.changed() => {
+                tracing::info!(%call_id, "caller hung up during IVR menu");
+                return;
+            }
+        };
+        tracing::info!(%call_id, outcome = ?result.outcome, "IVR menu resolved");
+
+        match result.outcome {
+            ivr::IvrOutcome::Selected { destination, .. } if destination.starts_with("voicemail") => {
+                if let Some(peer) = result.peer {
+                    ivr::play(&sock, peer, &g711::beep(250)).await;
+                }
+                let capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
+                ivr::record_until_stop(&sock, cfg.te_pt, &capture, &mut stop_rx, IVR_VOICEMAIL_MAX).await;
+                let audio = std::mem::take(&mut *capture.lock().expect("capture mutex"));
+                if audio.is_empty() {
+                    tracing::info!(%call_id, "IVR voicemail: nothing recorded");
+                    return;
+                }
+                match voicemails.save(tenant, call_id, None, &audio).await {
+                    Ok(vm) => tracing::info!(%call_id, voicemail_id = %vm.base.id, bytes = audio.len(),
+                        "IVR voicemail saved"),
+                    Err(e) => tracing::warn!(error = %e, %call_id, "saving IVR voicemail failed"),
+                }
+            }
+            _ => {
+                // Hold the line until the caller hangs up (no dead-air ambiguity).
+                let _ = stop_rx.changed().await;
+            }
+        }
+    }
+
+    /// Answer an INVITE with a plain RTP echo path (the IVR fallback). One UDP socket
+    /// reflecting RTP back to the caller.
+    async fn answer_with_echo(
+        &self,
+        socket: &UdpSocket,
+        msg: &SipMessage,
+        src: SocketAddr,
+        call_id: Uuid,
+        call_id_hdr: &str,
+    ) -> std::io::Result<()> {
+        let rtp_port = match rtp::bind_echo(None).await {
+            Ok((port, task)) => {
+                if !call_id_hdr.is_empty() {
+                    self.dialogs.lock().expect("dialogs mutex").insert(
+                        call_id_hdr.to_string(),
+                        Dialog {
+                            call_id,
+                            media: Media::Echo(task),
+                            callee: None,
+                            capture: None,
+                            voicemail: None,
+                            info_tx: None,
+                        },
+                    );
+                } else {
+                    task.abort();
+                }
+                port
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind RTP; answering without media");
+                0
+            }
+        };
+        let sdp = self.build_sdp(rtp_port);
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        self.send(socket, ok.as_bytes(), src).await
     }
 
     /// Find a registered callee whose AoR user-part matches the request-URI's user-part
@@ -884,7 +1124,9 @@ impl SipServer {
         self.reply(socket, msg, 200, "OK", src).await
     }
 
-    /// Build the SDP answer advertising the RTP echo port (PCMU/8000, sendrecv).
+    /// Build the SDP answer advertising the RTP port: PCMU/8000 plus RFC 4733
+    /// `telephone-event/8000` (dynamic PT [`dtmf::TELEPHONE_EVENT_PT`]) so phones send DTMF
+    /// in-band for the IVR runtime; harmless on the echo/bridge paths (they relay it).
     fn build_sdp(&self, rtp_port: u16) -> String {
         format!(
             "v=0\r\n\
@@ -892,11 +1134,14 @@ impl SipServer {
              s=CommOS\r\n\
              c=IN IP4 {ip}\r\n\
              t=0 0\r\n\
-             m=audio {port} RTP/AVP 0\r\n\
+             m=audio {port} RTP/AVP 0 {te}\r\n\
              a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:{te} telephone-event/8000\r\n\
+             a=fmtp:{te} 0-16\r\n\
              a=sendrecv\r\n",
             ip = self.media_ip,
-            port = rtp_port
+            port = rtp_port,
+            te = dtmf::TELEPHONE_EVENT_PT,
         )
     }
 

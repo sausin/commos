@@ -15,6 +15,9 @@
 //! full mid-dialog correctness, PSTN trunking, and SRTP are the remaining media-plane work.
 
 pub mod digest;
+pub mod dtmf;
+pub mod g711;
+pub mod ivr;
 pub mod message;
 pub mod rtp;
 pub mod server;
