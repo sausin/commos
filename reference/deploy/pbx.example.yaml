@@ -55,6 +55,10 @@ trunk_srtp:        false   # also offer SRTP to a carrier trunk. Off keeps the c
 record_calls:      false   # capture call audio as stored objects on hangup.
 voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
 no_answer_rings:   5       # rings before an unanswered call diverts to voicemail (~6s each, so 5 ≈ 30s).
+on_decline:        announce # a caller whose call is *actively declined* (Decline/Reject button):
+                           #   announce = play "unavailable", then offer voicemail (press 1) or hang up (default)
+                           #   voicemail = divert straight to voicemail, same as a no-answer
+                           #   busy      = relay busy/decline to the caller (its phone shows Busy); no voicemail
 
 # ── Voicemail-to-email (optional) ────────────────────────────────────────────
 # When `smtp:` is set, each new voicemail is emailed to the mailbox owner, matched by the

@@ -24,6 +24,7 @@ use commos_core::common::{Timestamp, Uuid};
 use commos_core::entities::gateway::{Gateway, GatewayHealth, GatewayKind};
 use commos_core::entities::ivr::Ivr;
 
+use crate::config::OnDecline;
 use crate::control::dialplan;
 use crate::control::ivr::IvrService;
 use crate::control::objects::ObjectService;
@@ -125,6 +126,23 @@ struct CalleeLeg {
 struct CallerId<'a> {
     number: Option<&'a str>,
     display: Option<&'a str>,
+}
+
+/// The outcome of an outbound bridge attempt ([`SipServer::try_bridge`]). Distinguishes an
+/// *active* callee rejection (`486 Busy Here` / `600` / `603 Decline` — the Decline button) from
+/// a plain no-answer/failure, so the direct-call path can treat a decline differently (announce /
+/// relay busy / voicemail) instead of silently folding it into "did not answer".
+// A short-lived move value returned straight up the call stack (never stored in a collection), so
+// the size gap between `Answered` and the unit variants doesn't matter — boxing would just add an
+// allocation on the answered hot path.
+#[allow(clippy::large_enum_variant)]
+enum BridgeOutcome {
+    /// The callee answered (2xx): the live bridge + callee leg + negotiated codec/DTMF/SRTP.
+    Answered(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>),
+    /// The callee actively declined with the carried final status (`486`/`600`/`603`).
+    Declined(u16),
+    /// No answer within the ring timeout, or any setup failure (unresolvable/bind/cancel).
+    NoAnswer,
 }
 
 /// Preloaded audio prompts for the `*97`/`*98` retrieval session, already transcoded to the
@@ -229,6 +247,9 @@ pub struct SipServer {
     recordings: RecordingService,
     /// Take a voicemail when an internal callee does not answer / is offline (Volume 7).
     voicemail_enabled: bool,
+    /// How to treat a caller when the called extension actively declines (SIP `486`/`603`), as
+    /// distinct from a plain no-answer. See [`OnDecline`] / `Config::on_decline`.
+    on_decline: OnDecline,
     /// How long a called extension rings before an unanswered call diverts to voicemail/echo.
     /// Derived from the configured `no_answer_rings` (× [`SECONDS_PER_RING`]).
     no_answer_timeout: Duration,
@@ -278,6 +299,7 @@ impl SipServer {
         record_calls: bool,
         recordings: RecordingService,
         voicemail_enabled: bool,
+        on_decline: OnDecline,
         no_answer_rings: u32,
         voicemails: VoicemailService,
         ivrs: IvrService,
@@ -304,6 +326,7 @@ impl SipServer {
             record_calls,
             recordings,
             voicemail_enabled,
+            on_decline,
             no_answer_timeout: Duration::from_secs(no_answer_rings.max(1) as u64 * SECONDS_PER_RING),
             voicemails,
             ivrs,
@@ -874,7 +897,7 @@ impl SipServer {
                 };
                 match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer,
                     caller_crypto.as_ref(), caller_id, None).await {
-                    Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
+                    BridgeOutcome::Answered(bridge, callee_leg, sel_codec, sel_te, leg_a_crypto) => {
                         let leg_a_port = bridge.leg_a_port;
                         // Answer the caller with the codec the callee selected (transparent relay),
                         // plus our SRTP key when the caller leg is encrypted.
@@ -909,7 +932,44 @@ impl SipServer {
                             codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE bridged to registered callee");
                         return resp.send(ok.as_bytes()).await;
                     }
-                    None if self.voicemail_enabled => {
+                    // The callee actively declined (Decline/Reject button). Treat it per the
+                    // operator's `on_decline` policy rather than folding it into "no answer".
+                    BridgeOutcome::Declined(code) => match self.on_decline {
+                        OnDecline::Busy => {
+                            // Relay the busy/decline status: the caller's phone shows Busy/Declined
+                            // and plays busy tone; no voicemail, no answer.
+                            let (status, reason) = decline_status(code);
+                            tracing::info!(%call_id, code, callee = %callee_reg.aor,
+                                "callee declined; relaying {status} {reason} to caller");
+                            return self.reply(resp, msg, status, reason).await;
+                        }
+                        OnDecline::Voicemail if self.voicemail_enabled => {
+                            // Legacy behaviour: a decline diverts straight to voicemail, same as a
+                            // no-answer.
+                            let notify = resolve_contact_addr(&callee_reg.contact)
+                                .await
+                                .map(|addr| (addr, callee_reg.contact.clone()));
+                            tracing::info!(%call_id, code, mailbox = %callee_reg.aor,
+                                "callee declined; diverting to voicemail");
+                            voicemail_target = Some(VoicemailBox { aor: callee_reg.aor.clone(), notify });
+                        }
+                        OnDecline::Voicemail => {
+                            tracing::warn!(%call_id, code, callee = %callee_reg.contact,
+                                "callee declined but voicemail is disabled; falling back to echo");
+                        }
+                        OnDecline::Announce => {
+                            // Answer the caller, play an "unavailable" announcement, then offer to
+                            // leave a message or drop the call.
+                            tracing::info!(%call_id, code, callee = %callee_reg.aor,
+                                "callee declined; announcing to caller");
+                            return self
+                                .answer_with_decline_announcement(
+                                    resp, msg, call_id, &call_id_hdr, &callee_reg, g711, te_pt, src,
+                                )
+                                .await;
+                        }
+                    },
+                    BridgeOutcome::NoAnswer if self.voicemail_enabled => {
                         // Rang but never answered → take a voicemail. MWI is pushed to the
                         // callee's registered contact on hangup.
                         let notify = resolve_contact_addr(&callee_reg.contact)
@@ -919,7 +979,7 @@ impl SipServer {
                             "registered callee did not answer; diverting to voicemail");
                         voicemail_target = Some(VoicemailBox { aor: callee_reg.aor.clone(), notify });
                     }
-                    None => {
+                    BridgeOutcome::NoAnswer => {
                         tracing::warn!(%call_id, callee = %callee_reg.contact,
                             "registered callee did not answer within timeout; falling back to echo");
                     }
@@ -1551,6 +1611,25 @@ impl SipServer {
         greeting
     }
 
+    /// The announcement + menu played to a caller whose call was actively declined
+    /// (`on_decline = announce`). Composed from the sound pack — an "unavailable" preamble then a
+    /// "press 1 to leave a message" instruction — each segment best-effort (a missing file is
+    /// skipped) and closed with a short tone, so there is always an audible cue even with no sound
+    /// pack. Reword by editing `DECLINE_PROMPTS`.
+    async fn decline_announcement(&self, codec: g711::G711) -> Vec<u8> {
+        // "I'm sorry; nobody is available to take your call. Press one — please leave a message."
+        const DECLINE_PROMPTS: &[&str] =
+            &["im-sorry", "vm-nobodyavail", "vm-press", "digits/1", "vm-leavemsg"];
+        let mut out = Vec::new();
+        for name in DECLINE_PROMPTS {
+            if let Some(mut audio) = self.load_prompt(name, codec).await {
+                out.append(&mut audio);
+            }
+        }
+        out.extend_from_slice(&g711::beep(200, codec));
+        out
+    }
+
     /// Preload the retrieval prompt buffers (transcoded to `codec`) so the spawned driver — which
     /// has no `&self` handle — can voice the count/feedback. Missing files become empty buffers.
     async fn load_retrieval_prompts(&self, codec: g711::G711) -> RetrievalPrompts {
@@ -1676,6 +1755,186 @@ impl SipServer {
                 }
             }
             Err(e) => tracing::warn!(error = %e, %call_id, "saving voicemail failed"),
+        }
+    }
+
+    /// Answer a caller whose call the callee actively declined, then hand off to
+    /// [`Self::decline_driver`] (announcement → leave-a-message-or-hang-up). Like the
+    /// voicemail-deposit path the media is plaintext G.711 (SRTP for prompt-bearing media is
+    /// future work). Falls back to a bare answer if the media socket can't bind, so the caller is
+    /// never left ringing.
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_with_decline_announcement(
+        &self,
+        resp: &Responder,
+        msg: &SipMessage,
+        call_id: Uuid,
+        call_id_hdr: &str,
+        callee: &Registration,
+        g711: g711::G711,
+        te_pt: u8,
+        src: SocketAddr,
+    ) -> std::io::Result<()> {
+        let g711_codec = codec::Codec {
+            pt: g711.payload_type(),
+            name: g711.sdp_name().to_string(),
+            clock: 8000,
+        };
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind RTP for decline announcement; answering without media");
+                self.mark_answered(call_id).await;
+                let sdp = self.build_sdp(0, &g711_codec, te_pt, None);
+                let ok = self.build_invite_ok(msg, &sdp, call_id);
+                return resp.send(ok.as_bytes()).await;
+            }
+        };
+        let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+        let announcement = self.decline_announcement(g711).await;
+        // The mailbox the "leave a message" branch deposits to (the declining extension), with its
+        // MWI target resolved now while we hold the registration.
+        let notify = resolve_contact_addr(&callee.contact)
+            .await
+            .map(|addr| (addr, callee.contact.clone()));
+        let vmbox = VoicemailBox { aor: callee.aor.clone(), notify };
+        let caller_leg = self.caller_leg(msg, call_id, src);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(Self::decline_driver(
+            sock,
+            g711,
+            te_pt,
+            announcement,
+            g711::beep(250, g711),
+            self.default_tenant,
+            call_id,
+            vmbox,
+            self.voicemails.clone(),
+            self.media_ip,
+            self.dialogs.clone(),
+            call_id_hdr.to_string(),
+            caller_leg,
+            self.routing.clone(),
+            stop_rx,
+        ));
+        // Answer plaintext G.711 (prompt-bearing media path, like the voicemail deposit).
+        let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, None);
+        if !call_id_hdr.is_empty() {
+            self.dialogs.lock().expect("dialogs mutex").insert(
+                call_id_hdr.to_string(),
+                Dialog {
+                    call_id,
+                    // Media::Ivr tears down gracefully on a caller BYE (signals `stop`).
+                    media: Media::Ivr { task, stop: stop_tx },
+                    callee: None,
+                    caller: None,
+                    capture: None,
+                    voicemail: None,
+                    info_tx: None,
+                    answer_sdp: sdp.clone(),
+                },
+            );
+        } else {
+            let _ = stop_tx.send(true);
+        }
+        self.mark_answered(call_id).await;
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, "SIP INVITE answered (decline announcement)");
+        resp.send(ok.as_bytes()).await
+    }
+
+    /// Drive the declined-call treatment: play the announcement, then honour a DTMF choice — `1`
+    /// records a voicemail (like the deposit path), anything else (or silence) ends the call.
+    /// Unlike the deposit/queue drivers this one **proactively hangs the caller up** when it
+    /// finishes, since the caller reached a terminal announcement rather than a live party. If the
+    /// caller hangs up first, `on_bye` tears the dialog down and signals `stop`, and this exits
+    /// without a second teardown.
+    #[allow(clippy::too_many_arguments)]
+    async fn decline_driver(
+        sock: UdpSocket,
+        codec: g711::G711,
+        te_pt: u8,
+        announcement: Vec<u8>,
+        record_cue: Vec<u8>,
+        tenant: Uuid,
+        call_id: Uuid,
+        vmbox: VoicemailBox,
+        voicemails: VoicemailService,
+        media_ip: IpAddr,
+        dialogs: Arc<Mutex<HashMap<String, Dialog>>>,
+        call_id_hdr: String,
+        caller_leg: CalleeLeg,
+        routing: Routing,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        const LEAVE_MESSAGE_KEY: char = '1';
+        let pt = codec.payload_type();
+        let (_info_tx, mut info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
+        let mut peer: Option<SocketAddr> = None;
+        // Play the announcement + menu, latching the caller and collecting a DTMF choice. The
+        // window is the prompt length plus ~6 s to decide (G.711 is 8 bytes/ms).
+        let window = Duration::from_millis((announcement.len() as u64 / 8) + 6000);
+        let choice = tokio::select! {
+            d = ivr::play_and_collect(&sock, &announcement, pt, te_pt, window, &mut info_rx, &mut peer) => d,
+            _ = stop_rx.changed() => return, // caller hung up during the announcement → on_bye handles it
+        };
+        if *stop_rx.borrow() {
+            return;
+        }
+        if choice == Some(LEAVE_MESSAGE_KEY) {
+            // Leave-a-message branch: a record cue then capture until hangup/cap, saved as a
+            // voicemail with MWI — the same tail as the deposit driver.
+            if let Some(dst) = peer {
+                ivr::play(&sock, dst, pt, &record_cue).await;
+            }
+            let capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
+            ivr::record_until_stop(&sock, te_pt, &capture, &mut stop_rx, IVR_VOICEMAIL_MAX).await;
+            let audio = std::mem::take(&mut *capture.lock().expect("capture mutex"));
+            if !audio.is_empty() {
+                match voicemails.save(tenant, call_id, None, &audio).await {
+                    Ok(vm) => {
+                        tracing::info!(%call_id, voicemail_id = %vm.base.id, bytes = audio.len(), mailbox = %vmbox.aor,
+                            "voicemail saved (after decline)");
+                        if let Some((addr, contact)) = &vmbox.notify {
+                            let number = user_part(&vmbox.aor).unwrap_or("");
+                            let (new, old) = voicemails.mailbox_summary(tenant, number).await.unwrap_or((1, 0));
+                            send_mwi_notify(*addr, contact, &vmbox.aor, media_ip, new, old).await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, %call_id, "saving voicemail failed"),
+                }
+            }
+        }
+        // Terminal announcement (or message left): proactively release the caller, unless it has
+        // already hung up (then on_bye did the teardown).
+        if *stop_rx.borrow() {
+            return;
+        }
+        Self::hangup_caller(media_ip, &caller_leg, &dialogs, &call_id_hdr, &routing, tenant, call_id).await;
+    }
+
+    /// Proactively end a caller CommOS answered: remove the dialog (so a late caller BYE is a
+    /// no-op and the entry doesn't leak), BYE the caller's phone, and record the hangup for the
+    /// CDR. The caller-side mirror of the callee-BYE half of [`Self::on_bye`], callable from a
+    /// detached driver (no `&self`). The `remove` doubles as the race guard: if a caller BYE beat
+    /// us to it, the entry is already gone and we do nothing.
+    async fn hangup_caller(
+        media_ip: IpAddr,
+        caller_leg: &CalleeLeg,
+        dialogs: &Arc<Mutex<HashMap<String, Dialog>>>,
+        call_id_hdr: &str,
+        routing: &Routing,
+        tenant: Uuid,
+        call_id: Uuid,
+    ) {
+        let existed = dialogs.lock().expect("dialogs mutex").remove(call_id_hdr).is_some();
+        if !existed {
+            return; // a caller BYE raced us; on_bye already tore down + logged the hangup
+        }
+        bye_leg(media_ip, caller_leg).await;
+        match routing.hangup(tenant, call_id, Some("BYE".to_string())).await {
+            Ok(_) => tracing::info!(%call_id, "decline announcement complete; caller released"),
+            Err(e) => tracing::debug!(error = %e, %call_id, "decline: caller hangup transition failed"),
         }
     }
 
@@ -1902,36 +2161,41 @@ impl SipServer {
         caller_id: CallerId<'_>,
     ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         if regs.len() == 1 {
-            return self
+            // Ring groups fold a decline into "no member answered" (a single member declining
+            // shouldn't speak for the whole group); only the direct-call path acts on Declined.
+            return match self
                 .try_bridge(&regs[0], call_id, capture, offer, caller_crypto, caller_id, None)
-                .await;
+                .await
+            {
+                BridgeOutcome::Answered(bridge, leg, codec, te, crypto) => Some((bridge, leg, codec, te, crypto)),
+                BridgeOutcome::Declined(_) | BridgeOutcome::NoAnswer => None,
+            };
         }
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        type Leg = (rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>);
         #[allow(clippy::type_complexity)]
-        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send + '_>>> =
+        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = BridgeOutcome> + Send + '_>>> =
             regs
                 .iter()
                 .map(|reg| {
                     let rx = cancel_rx.clone();
                     let cap = capture.clone();
                     Box::pin(self.try_bridge(reg, call_id, cap, offer, caller_crypto, caller_id, Some(rx)))
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send>>
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = BridgeOutcome> + Send>>
                 })
                 .collect();
 
-        // Race all legs on this task. First `Some` wins; a leg returning `None` (declined /
-        // failed) drops out and the rest keep ringing.
+        // Race all legs on this task. First `Answered` wins; a leg that declines or fails drops
+        // out and the rest keep ringing.
         let winner = std::future::poll_fn(|cx| {
             let mut i = 0;
             while i < futs.len() {
                 match futs[i].as_mut().poll(cx) {
-                    std::task::Poll::Ready(Some(won)) => {
+                    std::task::Poll::Ready(BridgeOutcome::Answered(bridge, leg, codec, te, crypto)) => {
                         drop(futs.swap_remove(i)); // drop the completed winner so it is not re-polled
-                        return std::task::Poll::Ready(Some(won));
+                        return std::task::Poll::Ready(Some((bridge, leg, codec, te, crypto)));
                     }
-                    std::task::Poll::Ready(None) => {
+                    std::task::Poll::Ready(_) => {
                         drop(futs.swap_remove(i)); // this member is out; a new one now sits at i
                     }
                     std::task::Poll::Pending => i += 1,
@@ -1949,7 +2213,7 @@ impl SipServer {
         // CANCEL. Any leg that had already answered (glare) is torn down with a BYE.
         let _ = cancel_tx.send(true);
         for f in futs.drain(..) {
-            if let Some((bridge, leg, _, _, _)) = f.await {
+            if let BridgeOutcome::Answered(bridge, leg, _, _, _) = f.await {
                 bridge.abort();
                 self.send_bye_to_leg(&leg).await;
             }
@@ -1993,12 +2257,12 @@ impl SipServer {
         caller_crypto: Option<&sdes::CryptoAttr>,
         caller_id: CallerId<'_>,
         cancel: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+    ) -> BridgeOutcome {
         let pending = match rtp::bind_bridge_sockets().await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind RTP bridge");
-                return None;
+                return BridgeOutcome::NoAnswer;
             }
         };
 
@@ -2019,7 +2283,7 @@ impl SipServer {
             Some(a) => a,
             None => {
                 tracing::warn!(contact = %callee.contact, "callee contact is unresolvable");
-                return None;
+                return BridgeOutcome::NoAnswer;
             }
         };
 
@@ -2027,7 +2291,7 @@ impl SipServer {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "could not bind outbound SIP socket");
-                return None;
+                return BridgeOutcome::NoAnswer;
             }
         };
 
@@ -2099,7 +2363,13 @@ impl SipServer {
         };
         let resp = match resp {
             Some(r) if (200..300).contains(&r.status().unwrap_or(0)) => r,
-            _ => return None,
+            // Active rejection: the callee pressed Decline/Reject (486 Busy Here / 600 Busy
+            // Everywhere / 603 Decline). Carry the code so the caller-facing path can react.
+            Some(r) if matches!(r.status(), Some(486) | Some(600) | Some(603)) => {
+                return BridgeOutcome::Declined(r.status().unwrap_or(603));
+            }
+            // No answer within the ring timeout, a cancelled fork leg, or any other non-2xx.
+            _ => return BridgeOutcome::NoAnswer,
         };
 
         // Capture the callee's To (with its tag) and Contact for the mid-dialog ACK/BYE.
@@ -2161,7 +2431,7 @@ impl SipServer {
             call_id: leg_call_id,
             cseq: cseq_num,
         };
-        Some((bridge, leg, sel_codec, sel_te, leg_a_crypto))
+        BridgeOutcome::Answered(bridge, leg, sel_codec, sel_te, leg_a_crypto)
     }
 
     /// Place an **outbound** call to the PSTN/SIP carrier via `gateway`, bridged to the caller.
@@ -2335,34 +2605,7 @@ impl SipServer {
     /// TODO(B2BUA): this reconstructs the BYE from captured identifiers only; full RFC 3261
     /// mid-dialog correctness (route sets, contact refresh) is still out of scope.
     async fn send_bye_to_leg(&self, leg: &CalleeLeg) {
-        // Bind the socket first so the BYE's Via advertises the exact port we await the response
-        // on: with an unreachable Via the endpoint's 200-to-BYE is lost and the transaction is
-        // retransmitted needlessly (the leg still tears down, but unconfirmed).
-        let sock = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(error = %e, addr = %leg.addr, "could not bind socket for BYE");
-                return;
-            }
-        };
-        let sent_by = SocketAddr::new(self.media_ip, sock.local_addr().map(|a| a.port()).unwrap_or(0));
-        let bye = message::request(
-            "BYE",
-            &leg.request_uri,
-            &[
-                ("Via", message::via_header(sent_by)),
-                ("From", leg.from.clone()),
-                ("To", leg.to.clone()),
-                ("Call-ID", leg.call_id.clone()),
-                ("CSeq", format!("{} BYE", leg.cseq + 1)),
-            ],
-            None,
-        );
-        if send_request_reliable_on(&sock, bye.as_bytes(), leg.addr).await {
-            tracing::info!(addr = %leg.addr, "bridged leg BYE confirmed");
-        } else {
-            tracing::debug!(addr = %leg.addr, "bridged leg BYE unconfirmed (no final response)");
-        }
+        bye_leg(self.media_ip, leg).await;
     }
 
     /// Persist captured caller audio as a call [`Recording`], fire-and-forget off the BYE path.
@@ -3273,6 +3516,49 @@ async fn send_invite_await_final_cancellable(
     }
 }
 
+/// Send a mid-dialog `BYE` toward one leg's endpoint, reconstructed from the dialog identifiers
+/// captured when the leg was set up. Binds its own socket so the BYE's `Via` advertises the exact
+/// port the 200-to-BYE is awaited on (an unreachable Via just means the transaction is retried,
+/// not that teardown fails). Free function so a detached driver (with no `&self`) can BYE the
+/// caller it answered — the caller-side mirror of the callee BYE on hangup.
+async fn bye_leg(media_ip: IpAddr, leg: &CalleeLeg) {
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, addr = %leg.addr, "could not bind socket for BYE");
+            return;
+        }
+    };
+    let sent_by = SocketAddr::new(media_ip, sock.local_addr().map(|a| a.port()).unwrap_or(0));
+    let bye = message::request(
+        "BYE",
+        &leg.request_uri,
+        &[
+            ("Via", message::via_header(sent_by)),
+            ("From", leg.from.clone()),
+            ("To", leg.to.clone()),
+            ("Call-ID", leg.call_id.clone()),
+            ("CSeq", format!("{} BYE", leg.cseq + 1)),
+        ],
+        None,
+    );
+    if send_request_reliable_on(&sock, bye.as_bytes(), leg.addr).await {
+        tracing::info!(addr = %leg.addr, "leg BYE confirmed");
+    } else {
+        tracing::debug!(addr = %leg.addr, "leg BYE unconfirmed (no final response)");
+    }
+}
+
+/// Map a decline final status to the `(status, reason)` CommOS relays back to the caller in the
+/// `on_decline = busy` policy.
+fn decline_status(code: u16) -> (u16, &'static str) {
+    match code {
+        486 => (486, "Busy Here"),
+        600 => (600, "Busy Everywhere"),
+        _ => (603, "Decline"),
+    }
+}
+
 /// Send a non-INVITE request (a mid-dialog BYE) reliably on a caller-provided socket,
 /// retransmitting per RFC 3261 §17.1.2 until a final response arrives or [`NON_INVITE_TIMEOUT`]
 /// elapses. Returns whether the peer confirmed — so a lost BYE is retried and the callee leg is
@@ -3370,6 +3656,15 @@ mod tests {
         assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
         assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
         assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    #[test]
+    fn decline_status_maps_final_codes_to_relayable_status() {
+        assert_eq!(decline_status(486), (486, "Busy Here"));
+        assert_eq!(decline_status(600), (600, "Busy Everywhere"));
+        assert_eq!(decline_status(603), (603, "Decline"));
+        // Any other declined code collapses to a generic 603 Decline.
+        assert_eq!(decline_status(488), (603, "Decline"));
     }
 
     #[test]

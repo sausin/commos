@@ -298,6 +298,7 @@ async fn run(cfg: Config) -> i32 {
             cfg.record_calls,
             recordings.clone(),
             cfg.voicemail_enabled,
+            cfg.on_decline,
             cfg.no_answer_rings,
             voicemails.clone(),
             ivrs.clone(),
