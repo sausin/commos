@@ -19,6 +19,7 @@ pub mod recordings;
 pub mod realtime;
 pub mod registrations;
 pub mod ringing;
+pub mod ringplan;
 pub mod routing;
 pub mod trunking;
 pub mod voicemail;
