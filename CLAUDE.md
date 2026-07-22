@@ -58,7 +58,13 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
 ## Key subsystems → files
 
 - **SIP / media plane** — `sip/server.rs` (the B2BUA: INVITE/BYE, bridging, voicemail deposit +
-  `*97`/`*98` retrieval, MWI), `sip/ivr.rs` (prompt playout + DTMF collect), `sip/g711.rs`
+  `*97`/`*98` retrieval, MWI). `try_bridge` returns a `BridgeOutcome` (`Answered`/`Declined`/
+  `NoAnswer`), so a callee's active reject (`486`/`600`/`603` — the Decline button) is handled
+  distinctly from a plain no-answer on **direct** calls per the `on_decline` config knob
+  (`announce` default → answer + "unavailable" announcement + press-`1`-to-leave-a-message via
+  `decline_driver`, which proactively hangs the caller up via `hangup_caller`/`bye_leg`;
+  `voicemail`; or `busy` → relay the status). Ring groups (`fork_bridge`) still fold a declined
+  member into no-answer. `sip/ivr.rs` (prompt playout + DTMF collect), `sip/g711.rs`
   (μ-law/A-law synth + transcode), `sip/rtp.rs`, `sip/srtp.rs`/`sdes.rs` (SRTP), `sip/digest.rs`,
   `sip/reboot.rs` (remote reboot of a *registered* extension via a `check-sync;reboot=true` NOTIFY,
   answering a phone's digest challenge with its SIP credential — the reliable check-in/checkout

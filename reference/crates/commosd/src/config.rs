@@ -54,6 +54,20 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub voicemail_enabled: bool,
 
+    /// What the caller hears when the called extension *actively declines* the call (a SIP
+    /// `486 Busy Here` / `603 Decline` — the phone's Decline/Reject button), as distinct from a
+    /// call that simply rings out (`no_answer_rings`). A decline is a deliberate "not now", so by
+    /// default CommOS tells the caller instead of silently treating it like a missed call:
+    /// - `announce` (default): answer the caller, play a short "unavailable" announcement, then
+    ///   offer to leave a message (press `1`) or end the call.
+    /// - `voicemail`: treat a decline exactly like a no-answer — divert straight to voicemail
+    ///   (the previous behaviour; only takes effect when `voicemail_enabled`).
+    /// - `busy`: relay the callee's busy/decline status back to the caller so its phone shows
+    ///   "Busy"/"Declined" and plays busy tone; no voicemail. Only affects *direct* extension
+    ///   calls — a declined ring-group member still just drops out of the group.
+    #[serde(default)]
+    pub on_decline: OnDecline,
+
     /// How many times a called extension rings before an unanswered call is diverted to
     /// voicemail (or the echo fallback when voicemail is off). Default `5` (~30 s — a standard
     /// PBX ring). One "ring" is the ~6 s ring cadence, so the effective no-answer timeout is
@@ -357,6 +371,20 @@ pub enum LogFormat {
     Text,
 }
 
+/// How a caller is treated when the called extension actively declines (SIP `486`/`603`), as
+/// opposed to a plain no-answer. See [`Config::on_decline`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnDecline {
+    /// Answer, play an "unavailable" announcement, then offer voicemail (press `1`) or hang up.
+    #[default]
+    Announce,
+    /// Treat a decline like a no-answer — divert to voicemail (when `voicemail_enabled`).
+    Voicemail,
+    /// Relay the busy/decline status to the caller (its phone shows busy); no voicemail.
+    Busy,
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         LogConfig {
@@ -376,6 +404,7 @@ impl Default for Config {
             sip_realm: default_sip_realm(),
             record_calls: false,
             voicemail_enabled: true,
+            on_decline: OnDecline::default(),
             no_answer_rings: default_no_answer_rings(),
             media_ip: default_media_ip(),
             ntp_server: None,
@@ -544,5 +573,20 @@ mod tests {
         let err = Config::from_yaml("database_url: postgres://user:pw@db:5432/commos\n")
             .unwrap_err();
         assert!(matches!(err, ConfigError::InlineSecret(_)));
+    }
+
+    #[test]
+    fn on_decline_defaults_to_announce_and_parses_variants() {
+        assert_eq!(Config::from_yaml("{}").unwrap().on_decline, OnDecline::Announce);
+        assert_eq!(
+            Config::from_yaml("on_decline: busy\n").unwrap().on_decline,
+            OnDecline::Busy
+        );
+        assert_eq!(
+            Config::from_yaml("on_decline: voicemail\n").unwrap().on_decline,
+            OnDecline::Voicemail
+        );
+        // An unknown value is rejected rather than silently defaulted.
+        assert!(Config::from_yaml("on_decline: nope\n").is_err());
     }
 }

@@ -72,6 +72,32 @@ needs all three, and two of them extend surfaces that already exist.
 - **SRTP for prompt-bearing media** — IVR + voicemail greeting/deposit/retrieval are plaintext G.711
   (introduced in PR #8); bridge/echo/trunk legs already honor SRTP.
 
+## PHONE_OPERATIONS — desk-phone operations not yet supported
+
+Audited against a Grandstream GRP260x user guide (2026-07): standard SIP desk-phone operations that
+CommOS does **not** yet support server-side. Phone-local operations already work and are out of
+scope here (contacts / local phonebook, call history, redial, mute, volume, ringtone, headset,
+**call waiting** — CommOS delivers the 2nd INVITE — **3-way conference** via the phone's local
+mixing, speed-dial keys, auto-answer, multicast paging, and **DND**, which returns `486` and now
+flows into `on_decline`). Each gap below names the missing SIP mechanism.
+
+- **Call transfer (attended + blind)** — the phone sends `REFER`; the B2BUA returns `501`. Highest
+  impact (Transfer is a core button). Overlaps roadmap #4 (B2BUA transfer hardening).
+- **BLF / busy-lamp-field / presence** — no inbound `SUBSCRIBE` + `dialog-info` `NOTIFY`; needed for
+  line keys that show colleagues' call state.
+- **Shared line appearance (SCA)** — same `SUBSCRIBE`/`NOTIFY` dialog machinery as BLF.
+- **Call park / retrieve** — no park-orbit feature code or orbit store.
+- **Call pickup (directed / group, e.g. `*8`)** — no pickup feature code + ringing-dialog awareness.
+- **SIP intercom / auto-answer paging** — CommOS sends no `Call-Info: answer-after=0` / `Alert-Info`
+  auto-answer header, so a phone won't auto-answer an intercom call.
+- **Remote XML phonebook / call history served to phones** — no directory endpoint for handsets.
+  Overlaps the Parked "Provisioning directory / phonebook alignment" item.
+
+> Signalling baseline: the B2BUA answers `REGISTER`, `INVITE` (incl. re-INVITE hold/resume), `ACK`,
+> `BYE`, `CANCEL`, `OPTIONS`, `INFO`; every other method (`REFER`, `SUBSCRIBE`, `UPDATE`, `PRACK`,
+> `MESSAGE`) returns `501 Not Implemented` (`sip/server.rs` method dispatch). Closing the gaps above
+> is mostly a matter of teaching that dispatch new methods + feature codes.
+
 ## Performance & scale (Raspberry Pi 4 / 4 GB target)
 
 Analysis, not yet actioned. Honest read: **the ceiling today is set by the software
