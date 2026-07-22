@@ -136,6 +136,18 @@ impl AdminAuth {
         Some(token)
     }
 
+    /// Constant-time check of a plaintext password against the configured one **without** minting
+    /// a session — used to gate the HTTP-Basic-protected operator console. Returns `false` in dev
+    /// mode (no password configured) and on any mismatch, so a caller can never be admitted when no
+    /// credential is set.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let Some(configured) = self.password_sha256.as_ref() else {
+            return false;
+        };
+        let presented: [u8; 32] = Sha256::digest(password.as_bytes()).into();
+        constant_time_eq_bytes(&presented, configured)
+    }
+
     /// Invalidate a session token (idempotent — a no-op if unknown).
     pub fn logout(&self, token: &str) {
         let mut sessions = self.sessions.lock().expect("admin session mutex not poisoned");
@@ -383,6 +395,19 @@ mod tests {
         assert!(!token.is_empty());
         assert!(!token.contains('-'), "token is opaque (no UUID structure)");
         assert!(admin.is_valid(&token));
+    }
+
+    #[test]
+    fn verify_password_gates_the_console() {
+        // Configured: exact match passes, anything else fails.
+        let admin = AdminAuth::new(Some(PASSWORD.to_string()));
+        assert!(admin.verify_password(PASSWORD));
+        assert!(!admin.verify_password("wrong"));
+        assert!(!admin.verify_password(""));
+        // Dev mode (no password): the console must never be admitted by a password check.
+        let dev = AdminAuth::new(None);
+        assert!(!dev.verify_password(""));
+        assert!(!dev.verify_password(PASSWORD));
     }
 
     #[test]

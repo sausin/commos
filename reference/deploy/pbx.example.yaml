@@ -66,7 +66,12 @@ require_sip_auth: false     # true → ALWAYS require SIP digest auth. Even when
 sip_realm:        "commos"  # digest realm presented in the auth challenge.
 dev_tokens:       true      # accept the `tenant:<uuid>` dev bearer — honoured from LAN/loopback peers only, never from a public address.
 # jwt_secret:     { ref_uri: "env://COMMOS_JWT_SECRET" }            # override the auto-generated HS256 signing key for /v1 bearer tokens.
-# admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # required for admin from a public address; LAN admin works without it.
+# admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # gates admin AND the operator console.
+#   When set, the console (/dashboard, /onboarding, /metrics, /info, /_introspect) requires HTTP
+#   Basic auth against this password (the browser prompts; username is ignored) — the same secret
+#   as /admin/login, so one credential guards viewing and acting. When UNSET, the console is
+#   reachable from the LAN/loopback only. scripts/install.sh generates a strong random one by
+#   default (--no-admin-password to opt out).
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 data_dir: "."   # SQLite DB (commos.db) + local object store live here. Use an absolute path in production.

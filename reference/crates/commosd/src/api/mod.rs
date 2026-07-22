@@ -33,11 +33,15 @@ pub mod video_rooms;
 pub mod voicemail;
 pub mod webhooks;
 
-use axum::extract::{DefaultBodyLimit, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine;
 use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
@@ -50,6 +54,66 @@ async fn count_request(
 ) -> Response {
     st.metrics.inc_http();
     next.run(req).await
+}
+
+/// Middleware gating the **operator console** — the browser-facing surfaces (`/dashboard`,
+/// `/onboarding`, `/metrics`, `/info`, `/_introspect/*`) that sit outside the bearer-authenticated
+/// `/v1` contract and used to be fully open. Secure by default:
+///
+/// - **Admin password configured:** require HTTP Basic auth whose password matches it (the browser
+///   shows a login prompt; the username is ignored, the password is what's checked). This is the
+///   *same* secret used for `/admin/login`, so one credential guards both viewing and acting — and
+///   makes aligning full API auth later a smaller step. `scripts/install.sh` generates a strong
+///   random one by default.
+/// - **Dev mode (no admin password):** trust only loopback/LAN peers so local bring-up stays
+///   zero-config, while the public internet is refused outright (a page that leaks call metadata
+///   must never be open to the world just because a password wasn't set).
+///
+/// `/livez` and `/readyz` are deliberately *not* behind this (load balancers probe them
+/// unauthenticated), and `/provision/:file` keeps its own trusted-peer gate.
+async fn console_guard(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let admin = &st.admin;
+    if admin.is_dev_mode() {
+        // No credential to demand — admit trusted peers, refuse the public internet outright
+        // (a Basic prompt would be misleading when nothing could satisfy it).
+        if crate::net::is_trusted_ip(&peer.ip()) {
+            return next.run(req).await;
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            "operator console is restricted to the local network until an admin_password is set\n",
+        )
+            .into_response();
+    }
+    // Configured: require HTTP Basic auth matching the admin password.
+    if basic_auth_password(req.headers()).is_some_and(|pw| admin.verify_password(&pw)) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"CommOS\"")],
+        "authentication required\n",
+    )
+        .into_response()
+}
+
+/// Extract the password from an `Authorization: Basic base64("user:pass")` header, or `None` if it
+/// is absent/malformed. The password is everything after the first `:` (a password may itself
+/// contain colons).
+fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let b64 = raw
+        .strip_prefix("Basic ")
+        .or_else(|| raw.strip_prefix("basic "))?
+        .trim();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    creds.split_once(':').map(|(_, pass)| pass.to_string())
 }
 
 /// Build the application router.
@@ -168,6 +232,21 @@ pub fn router(state: AppState) -> Router {
         .route("/voicemails/:id/content", get(voicemail::get_voicemail_content))
         .route("/voicemails/:id/read", post(voicemail::mark_voicemail_read));
 
+    // The operator console — browser-facing pages and operational/introspection endpoints that
+    // leak call/config data. Gated by `console_guard` (Basic auth when an admin password is set;
+    // LAN-only in dev mode). Kept off the `/v1` bearer surface but no longer wide open.
+    let console = Router::new()
+        // Live operations dashboard + setup wizard (self-contained HTML).
+        .route("/dashboard", get(dashboard::dashboard))
+        .route("/onboarding", get(onboarding::wizard))
+        // Operational signals (Volume 15) — info + metrics leak topology/counters.
+        .route("/info", get(health::info))
+        .route("/metrics", get(health::metrics))
+        // Non-normative introspection for bring-up/testing.
+        .route("/_introspect/events", get(introspect::recent_events))
+        .route("/_introspect/events/stream", get(introspect::stream_events))
+        .layer(middleware::from_fn_with_state(state.clone(), console_guard));
+
     Router::new()
         .nest("/v1", v1)
         // Admin authentication — login/logout/whoami gate the privileged setup operations
@@ -175,19 +254,12 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/login", post(admin::login::<AppState>))
         .route("/admin/logout", post(admin::logout::<AppState>))
         .route("/admin/whoami", get(admin::whoami))
-        // Operational signals (Volume 15) — unauthenticated, outside the contract surface.
+        // Liveness/readiness stay unauthenticated so load balancers can probe them.
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
-        .route("/info", get(health::info))
-        .route("/metrics", get(health::metrics))
-        // Live operations dashboard + setup wizard (self-contained HTML, unauthenticated).
-        .route("/dashboard", get(dashboard::dashboard))
-        .route("/onboarding", get(onboarding::wizard))
-        // Phone auto-provisioning (DHCP option 66 target; unauthenticated).
+        // Phone auto-provisioning (DHCP option 66 target; keeps its own trusted-peer gate).
         .route("/provision/:file", get(provision::provision))
-        // Non-normative introspection for bring-up/testing.
-        .route("/_introspect/events", get(introspect::recent_events))
-        .route("/_introspect/events/stream", get(introspect::stream_events))
+        .merge(console)
         .layer(middleware::from_fn_with_state(state.clone(), count_request))
         // Explicit request-body ceiling (was axum's implicit 2 MiB default). Large enough for a
         // reasonable object upload, small enough that no single request can buffer unbounded
@@ -195,4 +267,40 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_map(auth: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, auth.parse().unwrap());
+        h
+    }
+
+    fn basic(creds: &str) -> String {
+        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(creds))
+    }
+
+    #[test]
+    fn basic_auth_password_extracts_password() {
+        assert_eq!(basic_auth_password(&header_map(&basic("admin:s3cr3t"))).as_deref(), Some("s3cr3t"));
+        // Any username is accepted — only the password is checked downstream.
+        assert_eq!(basic_auth_password(&header_map(&basic("ignored:pw"))).as_deref(), Some("pw"));
+        // A password may itself contain colons.
+        assert_eq!(basic_auth_password(&header_map(&basic("u:a:b:c"))).as_deref(), Some("a:b:c"));
+    }
+
+    #[test]
+    fn basic_auth_password_rejects_malformed() {
+        // Bearer, not Basic.
+        assert_eq!(basic_auth_password(&header_map("Bearer abc")), None);
+        // No colon in the decoded credential.
+        assert_eq!(basic_auth_password(&header_map(&basic("nopassword"))), None);
+        // Not valid base64.
+        assert_eq!(basic_auth_password(&header_map("Basic !!!not-base64!!!")), None);
+        // Absent header.
+        assert_eq!(basic_auth_password(&HeaderMap::new()), None);
+    }
 }
