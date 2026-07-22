@@ -27,7 +27,9 @@ pub enum Treatment {
     /// or the server streams a ringback cadence for a leg it already owns).
     Ringback,
     /// Music on hold — used while a caller waits in a queue or on a "please hold while I
-    /// transfer you" forward.
+    /// transfer you" forward. Consumed by the queue-wait treatment loop (a documented
+    /// media-plane follow-up); the ring stages produced today all use [`Treatment::Ringback`].
+    #[allow(dead_code)]
     MusicOnHold,
 }
 
@@ -79,6 +81,7 @@ impl DialPlan {
 
     /// Total seconds this plan will ring across all stages before the final action — the
     /// worst-case setup budget the executor should allow.
+    #[allow(dead_code)] // used by the executor's overall-budget guard (follow-up) + tests
     pub fn total_ring_seconds(&self) -> u32 {
         self.stages.iter().map(|s| s.ring_seconds).sum()
     }

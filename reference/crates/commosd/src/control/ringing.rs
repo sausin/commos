@@ -163,36 +163,6 @@ impl RingingService {
         Ok(removed)
     }
 
-    /// Find the active forwarding rule for a dialled extension `number`, if one exists.
-    ///
-    /// The fleet of forwarding rules is small configuration, so a paged scan is fine (there
-    /// is no per-number index) — this mirrors [`Routing::resolve_extension`]. The **first
-    /// active** rule (enabled + non-empty targets) matching the number wins; disabled or
-    /// empty rules are skipped so a parked rule never silently swallows calls.
-    ///
-    /// [`Routing::resolve_extension`]: crate::control::routing::Routing::resolve_extension
-    pub async fn forwarding_for_number(
-        &self,
-        tenant: Uuid,
-        number: &str,
-    ) -> Result<Option<Forwarding>, StoreError> {
-        let mut cursor = None;
-        loop {
-            let page = self.store.list_forwardings(tenant, 200, cursor).await?;
-            if let Some(f) = page
-                .items
-                .iter()
-                .find(|f| f.number == number && f.is_active())
-            {
-                return Ok(Some(f.clone()));
-            }
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => return Ok(None),
-            }
-        }
-    }
-
     async fn commit_forwarding(&self, f: Forwarding) -> Result<(), StoreError> {
         self.store
             .commit(Tx { forwardings: vec![f], ..Default::default() })
@@ -252,41 +222,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarding_lookup_by_number_skips_disabled_and_empty() {
-        let (s, t) = svc();
-        // A disabled rule for 100.
-        s.create_forwarding(t, ForwardingInput {
-            number: "100".into(),
-            enabled: false,
-            mode: ForwardMode::Always,
-            targets: vec!["external:+14155550100".into()],
-            ring_seconds: None,
-        }).await.unwrap();
-        // An enabled-but-empty rule for 101 (inert).
-        s.create_forwarding(t, ForwardingInput {
-            number: "101".into(),
-            enabled: true,
-            mode: ForwardMode::NoAnswer,
-            targets: vec![],
-            ring_seconds: None,
-        }).await.unwrap();
-        // An active rule for 102.
-        s.create_forwarding(t, ForwardingInput {
-            number: "102".into(),
-            enabled: true,
-            mode: ForwardMode::NoAnswer,
-            targets: vec!["sip:900".into()],
-            ring_seconds: Some(15),
-        }).await.unwrap();
-
-        assert!(s.forwarding_for_number(t, "100").await.unwrap().is_none(), "disabled skipped");
-        assert!(s.forwarding_for_number(t, "101").await.unwrap().is_none(), "empty skipped");
-        let f = s.forwarding_for_number(t, "102").await.unwrap().unwrap();
-        assert_eq!(f.targets, vec!["sip:900".to_string()]);
-        assert!(s.forwarding_for_number(t, "999").await.unwrap().is_none(), "no rule");
-    }
-
-    #[tokio::test]
     async fn forwarding_update_toggles_enabled() {
         let (s, t) = svc();
         let f = s.create_forwarding(t, ForwardingInput {
@@ -296,9 +231,9 @@ mod tests {
             targets: vec!["sip:200".into()],
             ring_seconds: None,
         }).await.unwrap();
-        assert!(s.forwarding_for_number(t, "100").await.unwrap().is_some());
+        assert!(f.is_active(), "enabled rule with a target is active");
 
-        // Disable via update → lookup now skips it.
+        // Disable via update → the rule is no longer active (routing skips it).
         let disabled = s.update_forwarding(t, f.base.id, ForwardingInput {
             number: "100".into(),
             enabled: false,
@@ -307,6 +242,6 @@ mod tests {
             ring_seconds: None,
         }).await.unwrap();
         assert_eq!(disabled.base.version, 1);
-        assert!(s.forwarding_for_number(t, "100").await.unwrap().is_none());
+        assert!(!disabled.is_active(), "disabled rule is inert");
     }
 }

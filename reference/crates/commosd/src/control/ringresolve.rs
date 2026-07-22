@@ -68,8 +68,10 @@ pub async fn resolve_plan(
 }
 
 /// Find the first **active** forwarding rule for `number` (a small config scan, like
-/// `Routing::resolve_extension`). Errors and misses both yield `None`.
-async fn active_forwarding(
+/// `Routing::resolve_extension`). Errors and misses both yield `None`. Public so the SIP layer
+/// can cheaply decide whether a dialled number needs the multi-destination plan path at all
+/// (keeping the plain single-extension bridge path untouched when it does not).
+pub async fn active_forwarding(
     store: &Arc<dyn Store>,
     tenant: Uuid,
     number: &str,

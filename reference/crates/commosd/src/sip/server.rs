@@ -257,7 +257,10 @@ pub struct SipServer {
     display_name_file: String,
     /// Music-on-hold source (loaded once at boot from `{data_dir}/moh`, or synthesised) and
     /// whether hold music is enabled. Streamed to a held/waiting caller instead of silence.
+    /// Loaded and available; the splice into the live hold bridge is a documented follow-up.
+    #[allow(dead_code)]
     moh: Arc<super::moh::MohSource>,
+    #[allow(dead_code)]
     music_on_hold: bool,
     /// Per-call rotation counter for hunt-group / round-robin member ordering (the pure ring
     /// planner takes this as its rotation input, spreading load across successive calls).
@@ -652,7 +655,7 @@ impl SipServer {
         // remains available below (e.g. to resolve the caller's own mailbox for `*97`).
         let call = match self
             .routing
-            .create_inbound_call(self.default_tenant, from_ref.clone(), to_ref)
+            .create_inbound_call(self.default_tenant, from_ref.clone(), to_ref.clone())
             .await
         {
             Ok(c) => c,
@@ -756,6 +759,86 @@ impl SipServer {
         // A direct voicemail target (e.g. a DID → "voicemail").
         if target == "voicemail" || target.starts_with("voicemail:") {
             voicemail_target = Some(VoicemailBox { aor: target.clone(), notify: None });
+        }
+
+        // Multi-destination routing: a ring group (`ringgroup:<uuid>`) or an active forwarding
+        // rule for the dialled number is executed as a resolved DialPlan (fan-out / follow-me),
+        // reusing the single-leg bridge/trunk primitives. This branch engages ONLY when there is
+        // genuinely a group or a forwarding rule in play; the plain single-extension bridge path
+        // below is left completely untouched otherwise.
+        if voicemail_target.is_none() {
+            let dialled = user_part(&to_ref).map(|s| s.to_string()).unwrap_or_default();
+            let is_group = target.starts_with(crate::control::ringresolve::RING_GROUP_SCHEME);
+            let has_forwarding = !dialled.is_empty()
+                && crate::control::ringresolve::active_forwarding(
+                    &self.store, self.default_tenant, &dialled).await.is_some();
+            if is_group || has_forwarding {
+                // Tell the caller's phone we're ringing while we walk the plan.
+                let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
+                let caller_display = msg.header("From").and_then(header_display_name);
+                let caller_id = CallerId { number: user_part(&from_ref), display: caller_display.as_deref() };
+                let opts = crate::control::ringplan::PlanOpts {
+                    default_ring_seconds: self.no_answer_timeout.as_secs().max(1) as u32,
+                    voicemail_enabled: self.voicemail_enabled,
+                };
+                let rotation = self.ring_rotation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let regs = &self.registrations;
+                let tenant = self.default_tenant;
+                let plan = crate::control::ringresolve::resolve_plan(
+                    &self.store, tenant, &dialled, &target, opts, rotation,
+                    |r: &str| find_registered(regs, tenant, r).is_some(),
+                ).await;
+
+                match self
+                    .execute_ring_plan(&plan, call_id, capture.clone(), &offer, caller_crypto.as_ref(), caller_id)
+                    .await
+                {
+                    Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
+                        let leg_a_port = bridge.leg_a_port;
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
+                        if !call_id_hdr.is_empty() {
+                            let callee_call_id = callee_leg.call_id.clone();
+                            self.dialogs.lock().expect("dialogs mutex").insert(
+                                call_id_hdr.clone(),
+                                Dialog {
+                                    call_id,
+                                    media: Media::Bridge(bridge),
+                                    callee: Some(callee_leg),
+                                    caller: Some(self.caller_leg(msg, call_id, src)),
+                                    capture: capture.clone(),
+                                    voicemail: None,
+                                    info_tx: None,
+                                    answer_sdp: sdp.clone(),
+                                },
+                            );
+                            self.bye_aliases.lock().expect("aliases mutex").insert(callee_call_id, call_id_hdr.clone());
+                        } else {
+                            bridge.abort();
+                        }
+                        self.mark_answered(call_id).await;
+                        let ok = self.build_invite_ok(msg, &sdp, call_id);
+                        tracing::info!(%call_id, leg_a_port, dialled = %dialled, group = is_group,
+                            "SIP INVITE bridged via ring plan");
+                        return resp.send(ok.as_bytes()).await;
+                    }
+                    None => {
+                        // Nobody answered → apply the plan's final action.
+                        match &plan.final_action {
+                            crate::control::ringplan::FinalAction::Voicemail(num) if self.voicemail_enabled => {
+                                voicemail_target = Some(VoicemailBox { aor: format!("sip:{num}"), notify: None });
+                            }
+                            crate::control::ringplan::FinalAction::Redirect(_) if self.voicemail_enabled => {
+                                // A redirect (queue / another group) is not yet re-resolved here;
+                                // divert the dialled number to voicemail as the safe terminus.
+                                voicemail_target = Some(VoicemailBox { aor: format!("sip:{dialled}"), notify: None });
+                            }
+                            _ => {}
+                        }
+                        // Fall through: a set voicemail_target is picked up by the deposit path;
+                        // otherwise the echo fallthrough applies (voicemail disabled).
+                    }
+                }
+            }
         }
 
         // If the target names a REGISTERED endpoint, bridge the two legs: bind a two-leg RTP
@@ -1524,6 +1607,54 @@ impl SipServer {
         self.mark_answered(call_id).await;
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         resp.send(ok.as_bytes()).await
+    }
+
+    /// Execute a resolved [`DialPlan`](crate::control::ringplan::DialPlan)'s ring stages
+    /// **sequentially**, reusing the single-leg bridge/trunk primitives: for each contact in
+    /// each stage, ring a registered internal endpoint ([`Self::try_bridge`]) or an external
+    /// number over a trunk ([`Self::try_trunk`]), returning the first leg that answers. `None`
+    /// means no contact answered — the caller then applies the plan's `FinalAction`.
+    ///
+    /// NOTE: a `RING_ALL` stage is currently rung one member at a time (a linear hunt) rather
+    /// than truly simultaneously; simultaneous forking (parallel INVITE + CANCEL of the losers)
+    /// is a documented media-plane follow-up. The call still reaches the whole group, and the
+    /// hunt strategies (`SEQUENTIAL`/`ROUND_ROBIN`/`RANDOM`) and follow-me are already exact.
+    #[allow(clippy::type_complexity)]
+    async fn execute_ring_plan(
+        &self,
+        plan: &crate::control::ringplan::DialPlan,
+        call_id: Uuid,
+        capture: Option<rtp::Capture>,
+        offer: &codec::AudioMedia,
+        caller_crypto: Option<&sdes::CryptoAttr>,
+        caller_id: CallerId<'_>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+        for stage in &plan.stages {
+            for contact in &stage.contacts {
+                // An internal registered endpoint takes priority.
+                if let Some(reg) = find_registered(&self.registrations, self.default_tenant, contact) {
+                    if let Some(won) = self
+                        .try_bridge(&reg, call_id, capture.clone(), offer, caller_crypto, caller_id)
+                        .await
+                    {
+                        return Some(won);
+                    }
+                    continue;
+                }
+                // Otherwise treat it as an external number reachable over a trunk. Strip the
+                // `external:` scheme so E.164 normalisation sees the bare number.
+                let external = contact.strip_prefix("external:").unwrap_or(contact);
+                if let Some((gw, e164)) = self.select_outbound_gateway(external).await {
+                    if let Some(won) = self
+                        .try_trunk(&gw, &e164, call_id, capture.clone(), offer, caller_crypto)
+                        .await
+                    {
+                        return Some(won);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.

@@ -170,7 +170,7 @@ impl VoicemailEmailer {
 
 /// Compose the notification email (subject + body) for a resolved voicemail.
 fn build_email(r: &Resolved, attachment: Option<Attachment>) -> Email {
-    let secs = r.duration_ms.map(|ms| (ms + 999) / 1000).unwrap_or(0);
+    let secs = r.duration_ms.map(|ms| ms.div_ceil(1000)).unwrap_or(0);
     let subject = format!("New voicemail from {} ({}s)", r.caller, secs);
     let body = format!(
         "You have a new voicemail in mailbox {}.\r\n\r\nFrom: {}\r\nDuration: {} seconds\r\n{}",
