@@ -15,16 +15,24 @@ L ≈ multi-week.
 
 | # | Gap | Size | Why |
 |---|-----|------|-----|
-| 1 | **Ring groups** | M | Most-expected feature after extensions ("ring the whole team"). No `ring_group` entity today. |
+| 1 | **Ring groups** ⏳ | M | Entity + store + `/v1/ring-groups` API + SIP execution landed (2026-07); members are hunted **sequentially** — simultaneous ring-all fork (parallel INVITE + CANCEL losers) is the remaining piece. |
 | 2 | **Time conditions / business hours / holidays** | M | Day/night-mode routing is table-stakes. Needs a schedule entity + CallFlow node. |
 | 3 | **Conferences (N-way mixer)** | L | Only two-leg bridging exists; needs a real RTP mixer (pure-Rust, no codec libs makes it non-trivial). |
 | 4 | **Harden attended/blind transfer + B2BUA** | L | Transfer is scaffolded but mid-dialog correctness is `TODO(B2BUA)`; used constantly, must be solid. |
-| 5 | **Music on hold** | S/M | Hold works but plays silence; needs an MoH source + per-hold streaming. Low effort, high polish. |
-| 6 | **Voicemail-to-email** | S | VM + MWI already work; add an SMTP sender + mailbox email config. Small lift, big value. |
-| 7 | **Call forwarding / Follow-me** | M | "Send my calls to my mobile" — mobility is a stated CommOS pillar yet absent. |
-| 8 | **More feature codes** (DND, `*72` forward, etc.) | M | Deliver as *intent*, not dialplans (honoring N-5). The `*97`/`*98` retrieval codes added in PR #8 are the pattern to build on. |
-| 9 | **Queue caller experience** | M | Position/wait announcements, queue MoH, callback. ACD assigns agents but gives the caller no treatment. |
+| 5 | **Music on hold** ⏳ | S/M | Engine (`sip/moh.rs`: file-load + synth fallback + looped streaming) + `moh_dir`/`music_on_hold` config landed (2026-07). Remaining: splice the MoH stream into the **live two-leg bridge** on a hold re-INVITE (needs a bridge-relay "play source to held leg" mode). |
+| 6 | ~~**Voicemail-to-email**~~ ✅ | S | **Done (2026-07).** Pure-Rust SMTP client (`control/smtp.rs`) + `VoicemailReceived` dispatcher + `smtp:` config (mailbox→email map, μ-law→WAV attachment). |
+| 7 | ~~**Call forwarding / Follow-me**~~ ✅ | M | **Done (2026-07).** `Forwarding` entity (ALWAYS/BUSY/NO_ANSWER/UNAVAILABLE + ordered follow-me targets) + `/v1/forwardings` API + SIP execution via the ring planner. |
+| 8 | **More feature codes** (DND, `*72` forward, etc.) | M | Deliver as *intent*, not dialplans (honoring N-5). The `*97`/`*98` retrieval codes added in PR #8 are the pattern to build on. **Now cheap:** a `*72`/`*73` code just creates/deletes a `Forwarding` row; DND is a forward-to-voicemail rule. |
+| 9 | **Queue caller experience** ⏳ | M | Position/wait announcements, queue MoH, callback. The MoH engine + `Treatment::MusicOnHold` planner hook exist; remaining is the **caller-treatment loop** (answer early, loop `ivr::play` announcements + MoH while the ACD assigns an agent). |
 | 10 | **WebRTC softphone endpoint** | L | Spec'd first-class (CMOS-07-SIP-051); unlocks browser calling + a user portal. |
+
+> **Shared spine (landed 2026-07).** Items 1/5/7/9 are built on one pure, exhaustively-tested
+> planner: `control/ringplan.rs` turns a dialled number into a `DialPlan` (ordered ring stages +
+> per-stage treatment + final action), and `control/ringresolve.rs` resolves live config
+> (ring groups, forwarding) + registration state into that plan. The SIP B2BUA executes it
+> (`SipServer::execute_ring_plan`). The three remaining ⏳ pieces are all **media-plane execution**
+> (simultaneous fork, live-bridge MoH injection, queue-wait loop) that need real-phone validation;
+> the control-plane decision logic for all of them is done and unit-tested.
 
 ### Parked — hospitality / multi-tenant hardening (added 2026-07, not yet started)
 These graduate to their own specs/branches. Grouped because a hotel/serviced-office deployment

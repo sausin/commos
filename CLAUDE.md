@@ -45,6 +45,8 @@ All runtime state hangs off **`data_dir`** (default `.`; the installer sets it, 
 - `{data_dir}/secrets/jwt.key` — auto-generated JWT secret
 - `{data_dir}/sounds/en/*.ulaw` — audio prompts (`Config::sounds_dir`; voicemail greeting +
   `*97` menu). Downloaded from FreePBX by the installer; missing files fall back to a synth beep.
+- `{data_dir}/moh/*.ulaw` — music-on-hold loop (`Config::moh_dir`; concatenated sorted). Absent →
+  a synthesized tune (`sip/moh.rs`), so hold is never silent.
 - `{data_dir}/display_name.txt` — optional (`Config::display_name_file`): the display name a
   called phone shows for CommOS-placed calls (1 line = static, N lines = random per call; absent
   → "commos"). Read per call.
@@ -74,6 +76,16 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   on multi-homed hosts).
 - **Control plane** — `control/routing.rs` (Call state machine, driven by `MediaFact`s + CDRs),
   `control/voicemail.rs`, `control/onboarding.rs`, `control/provisioning.rs`, `control/trunking.rs`.
+- **Multi-destination routing** — `control/ringplan.rs` (pure `DialPlan` builder: ring stages +
+  treatment + final action; the tested spine for ring groups / follow-me / queue-wait),
+  `control/ringresolve.rs` (resolves live `RingGroup`/`Forwarding` config + registration state into
+  a plan), `control/ringing.rs` (CRUD service). The SIP B2BUA executes a plan via
+  `SipServer::execute_ring_plan`. Ring-group members currently hunt sequentially (simultaneous
+  ring-all fork is TODO). MoH engine is `sip/moh.rs` (load/synth/stream); live hold-bridge
+  injection is TODO.
+- **Voicemail-to-email** — `control/smtp.rs` (hand-rolled pure-Rust SMTP submission client, like
+  `webhook_delivery.rs`) + `control/voicemail_email.rs` (a `VoicemailReceived` bus subscriber that
+  resolves the mailbox → `smtp.mailboxes` recipient and emails a WAV). Config: `smtp:` section.
 - **Provisioning** — `api/provision.rs` (per-vendor phone configs: Yealink/Grandstream/generic,
   incl. NTP + timezone, voicemail Message-key code `*97`, Grandstream TR-069 off (`P1409=0`, kills
   the "CPE connection failed" warning), and optional web-UI lockdown via `phone_admin_password`
