@@ -24,7 +24,11 @@
 #   --sip-port <port>      SIP UDP port (default: 5060)
 #   --data-dir <path>      State dir for the SQLite DB, objects, config (default: /var/lib/commos
 #                          as root, else ./commos-data)
-#   --admin-password <pw>  Enable admin auth; stored as a 0600 file secret, referenced from config
+#   --admin-password <pw>  Set the admin password explicitly; stored as a 0600 file secret,
+#                          referenced from config. Omit to auto-generate a strong random one.
+#   --no-admin-password    Do NOT set an admin password. The operator console (dashboard,
+#                          onboarding, metrics) is then reachable only from the local network and
+#                          admin actions fall back to dev mode. Not recommended off a trusted LAN.
 #   --tls                  Enable SIP-over-TLS (SIPS). With no --tls-cert, a self-signed cert is
 #                          generated (openssl required); builds the binary with --features tls.
 #   --tls-cert <path>      Use this PEM certificate chain for SIPS (e.g. a Let's Encrypt
@@ -53,6 +57,8 @@ MEDIA_IP=""
 TIMEZONE=""
 NTP_SERVER=""
 ADMIN_PASSWORD=""
+# Admin password: secure by default. Empty ADMIN_PASSWORD + NO_ADMIN_PW=0 → auto-generate one.
+NO_ADMIN_PW=0
 BIN=""
 CONFIG=""
 DATA_DIR=""
@@ -89,6 +95,7 @@ while [ $# -gt 0 ]; do
     --sip-port) SIP_PORT="$2"; shift 2;;
     --data-dir) DATA_DIR="$2"; shift 2;;
     --admin-password) ADMIN_PASSWORD="$2"; shift 2;;
+    --no-admin-password) NO_ADMIN_PW=1; shift;;
     --tls) DO_TLS=1; shift;;
     --tls-cert) TLS_CERT="$2"; DO_TLS=1; shift 2;;
     --tls-key) TLS_KEY="$2"; DO_TLS=1; shift 2;;
@@ -279,6 +286,25 @@ download_sounds() {
 download_sounds
 
 # ---- admin password (as a file-referenced secret, never inline) -------------------------
+# Secure by default: the admin password gates both the operator console (dashboard / onboarding /
+# metrics require HTTP Basic auth against it) and privileged admin actions. Unless the operator
+# gave one, or opted out with --no-admin-password, generate a strong random one so a fresh install
+# is never left with an open console.
+gen_password() {
+  # 24 chars from the alphanumeric set. /dev/urandom is always present on the Pi/Linux target;
+  # openssl is a fallback for the rare host without a readable urandom.
+  if [ -r /dev/urandom ]; then
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 24
+  fi
+}
+GENERATED_ADMIN_PW=0
+if [ -z "$ADMIN_PASSWORD" ] && [ "$NO_ADMIN_PW" != "1" ]; then
+  ADMIN_PASSWORD="$(gen_password)"
+  [ -n "$ADMIN_PASSWORD" ] && GENERATED_ADMIN_PW=1 || warn "could not generate a random admin password (no urandom/openssl); console will be LAN-only."
+fi
+
 ADMIN_YAML=""
 if [ -n "$ADMIN_PASSWORD" ]; then
   PW_FILE="$DATA_DIR/admin_password"
@@ -286,6 +312,8 @@ if [ -n "$ADMIN_PASSWORD" ]; then
   chmod 600 "$PW_FILE"
   ADMIN_YAML=$'admin_password:\n  ref_uri: "file://'"$PW_FILE"$'"'
   ok "admin auth enabled (secret at $PW_FILE, referenced from config)"
+elif [ "$NO_ADMIN_PW" = "1" ]; then
+  warn "no admin password set (--no-admin-password): the console is reachable only from the local network."
 fi
 
 # ---- SIP-over-TLS (SIPS) certificate ----------------------------------------------------
@@ -437,13 +465,29 @@ if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
 fi
 log "Security posture (secure-by-default — no extra config needed):"
 echo "    • The API auto-generates a JWT signing secret at $DATA_DIR/secrets/jwt.key on first boot."
-echo "    • From the LAN/loopback, the tenant:<uuid> dev token, dashboard, introspection, and phone"
-echo "      auto-provisioning work with zero setup."
+echo "    • From the LAN/loopback, the tenant:<uuid> dev token and phone auto-provisioning work with"
+echo "      zero setup."
 echo "    • From a PUBLIC source address, those conveniences are refused automatically: /v1 needs a"
 echo "      signed JWT, admin needs an admin session, and provisioning/introspection are LAN-only."
+if [ -n "$ADMIN_PASSWORD" ]; then
+  echo "    • The operator console (dashboard, onboarding, metrics, introspection) requires the admin"
+  echo "      password via HTTP Basic auth — the browser prompts on first visit."
+else
+  echo "    • The operator console (dashboard, onboarding, metrics) is LAN-only (no admin password set)."
+fi
 echo "    • SIP digest auth is auto-required for any non-LAN source address (identity is bound to"
 echo "      the credential, so one device cannot register or dial as another)."
 echo
+if [ "$GENERATED_ADMIN_PW" = "1" ]; then
+  echo "  ┌───────────────────────────────────────────────────────────────────────────┐"
+  echo "  │  ADMIN PASSWORD (generated) — save it now; it is not shown again:          │"
+  printf '  │      %-69s│\n' "$ADMIN_PASSWORD"
+  echo "  │  Use it to open the dashboard/onboarding console and to POST /admin/login. │"
+  echo "  │  Stored (0600) at $PW_FILE"
+  echo "  │  Change it by editing that file, or re-run with --admin-password <pw>.     │"
+  echo "  └───────────────────────────────────────────────────────────────────────────┘"
+  echo
+fi
 if [ "$DO_TLS" = "1" ]; then
   ok "SIPS (SIP-over-TLS) is enabled on port $SIP_TLS_PORT."
 else

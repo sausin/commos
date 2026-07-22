@@ -49,7 +49,11 @@ Then:
    without a manual power-cycle.
 2. Point each phone's SIP account at **`<box-ip>:5060`** (username = its extension) and place a
    call. Dial another extension for a two-way call; dial your own number for an echo test.
-3. Watch it live at **`/dashboard`**, scrape **`/metrics`**, or drive everything over the API:
+3. Watch it live at **`/dashboard`**, scrape **`/metrics`**, or drive everything over the API.
+   The console pages (`/dashboard`, `/onboarding`, `/metrics`, `/info`, `/_introspect`) are
+   **secure by default**: `scripts/install.sh` generates a strong admin password, and when one is
+   set the console requires it via HTTP Basic auth (the browser prompts). With no password set
+   they stay reachable from the LAN/loopback only. Drive the API:
 
 ```bash
 TENANT=01920000-0000-7000-8000-000000000001
