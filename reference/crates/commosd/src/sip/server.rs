@@ -118,6 +118,15 @@ struct CalleeLeg {
     cseq: u32,
 }
 
+/// The calling party's identity, carried from the inbound INVITE onto the outbound (callee) leg so
+/// the callee's phone shows who is really calling. `number` is the caller's user-part and `display`
+/// its display name (either may be absent for an anonymous/malformed caller).
+#[derive(Clone, Copy, Default)]
+struct CallerId<'a> {
+    number: Option<&'a str>,
+    display: Option<&'a str>,
+}
+
 /// Preloaded audio prompts for the `*97`/`*98` retrieval session, already transcoded to the
 /// negotiated codec. An empty buffer means the file is not installed — playback simply skips it,
 /// so retrieval still works (via DTMF) with no sound pack. Preloaded in the request context (which
@@ -746,7 +755,15 @@ impl SipServer {
                 // Tell the caller's phone the callee is ringing (early dialog) so it shows a
                 // "ringing" state instead of dead air while we ring the callee for real.
                 let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
-                match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
+                // Present the caller's own identity to the callee (number + display name), so the
+                // callee's phone shows who is calling instead of the bare service identity.
+                let caller_display = msg.header("From").and_then(header_display_name);
+                let caller_id = CallerId {
+                    number: user_part(&from_ref),
+                    display: caller_display.as_deref(),
+                };
+                match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer,
+                    caller_crypto.as_ref(), caller_id).await {
                     Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
                         // Answer the caller with the codec the callee selected (transparent relay),
@@ -1514,6 +1531,7 @@ impl SipServer {
         capture: Option<rtp::Capture>,
         offer: &codec::AudioMedia,
         caller_crypto: Option<&sdes::CryptoAttr>,
+        caller_id: CallerId<'_>,
     ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         let pending = match rtp::bind_bridge_sockets().await {
             Ok(b) => b,
@@ -1552,12 +1570,22 @@ impl SipServer {
             }
         };
 
+        // Our reachable sent-by for the outbound leg: `media_ip` at the ephemeral port we send from
+        // and await the response on. The callee returns its 100/180/200 here (see `via_header`);
+        // without a reachable Via the answer is lost and the call wrongly diverts to voicemail.
+        let sent_by = SocketAddr::new(self.media_ip, sock.local_addr().map(|a| a.port()).unwrap_or(0));
+
         // Outbound-leg dialog identifiers, derived from the CommOS Call id.
         let leg_call_id = format!("{}@commos", call_id.to_string().replace('-', ""));
         let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
-        // Present the operator's configurable display name (or the bare "commos") to the callee.
-        let display = self.call_display_name(call_id).await;
-        let from_hdr = commos_from_header(self.media_ip, display.as_deref(), &from_tag);
+        // Present the *caller's* identity to the callee (its number + display name) so the callee's
+        // phone shows who is calling. When the caller is anonymous, fall back to the operator's
+        // configurable display name (or the bare "commos") via `caller_from_header`.
+        let display = match caller_id.display {
+            Some(_) => caller_id.display.map(str::to_string),
+            None => self.call_display_name(call_id).await,
+        };
+        let from_hdr = caller_from_header(self.media_ip, caller_id.number, display.as_deref(), &from_tag);
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cseq_num: u32 = 1;
 
@@ -1569,6 +1597,7 @@ impl SipServer {
             "INVITE",
             &callee.contact,
             &[
+                ("Via", message::via_header(sent_by)),
                 ("From", from_hdr.clone()),
                 ("To", format!("<{}>", callee.aor)),
                 ("Call-ID", leg_call_id.clone()),
@@ -1600,6 +1629,7 @@ impl SipServer {
             "ACK",
             &callee_target,
             &[
+                ("Via", message::via_header(sent_by)),
                 ("From", from_hdr.clone()),
                 ("To", callee_to.clone()),
                 ("Call-ID", leg_call_id.clone()),
@@ -1696,6 +1726,9 @@ impl SipServer {
             }
         };
 
+        // Our reachable sent-by (see `try_bridge`): the carrier returns its responses here.
+        let sent_by = SocketAddr::new(self.media_ip, sock.local_addr().map(|a| a.port()).unwrap_or(0));
+
         // Request-URI toward the carrier, and outbound-leg dialog identifiers.
         let request_uri = format!("sip:{e164}@{gw_address}");
         let leg_call_id = format!("{}@commos-trunk", call_id.to_string().replace('-', ""));
@@ -1713,7 +1746,9 @@ impl SipServer {
         let mut auth: Option<(&str, String)> = None;
         let mut resp = None;
         for cseq in 1u32..=2 {
+            let via = message::via_header(sent_by);
             let mut headers = vec![
+                ("Via", via),
                 ("From", from_hdr.clone()),
                 ("To", format!("<{request_uri}>")),
                 ("Call-ID", leg_call_id.clone()),
@@ -1761,6 +1796,7 @@ impl SipServer {
         let callee_target = resp.header("Contact").and_then(extract_uri).unwrap_or_else(|| request_uri.clone());
         let ack_cseq = if auth.is_some() { 2 } else { 1 };
         let mut ack_headers = vec![
+            ("Via", message::via_header(sent_by)),
             ("From", from_hdr.clone()),
             ("To", callee_to.clone()),
             ("Call-ID", leg_call_id.clone()),
@@ -1811,10 +1847,22 @@ impl SipServer {
     /// TODO(B2BUA): this reconstructs the BYE from captured identifiers only; full RFC 3261
     /// mid-dialog correctness (route sets, contact refresh) is still out of scope.
     async fn send_bye_to_leg(&self, leg: &CalleeLeg) {
+        // Bind the socket first so the BYE's Via advertises the exact port we await the response
+        // on: with an unreachable Via the endpoint's 200-to-BYE is lost and the transaction is
+        // retransmitted needlessly (the leg still tears down, but unconfirmed).
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, addr = %leg.addr, "could not bind socket for BYE");
+                return;
+            }
+        };
+        let sent_by = SocketAddr::new(self.media_ip, sock.local_addr().map(|a| a.port()).unwrap_or(0));
         let bye = message::request(
             "BYE",
             &leg.request_uri,
             &[
+                ("Via", message::via_header(sent_by)),
                 ("From", leg.from.clone()),
                 ("To", leg.to.clone()),
                 ("Call-ID", leg.call_id.clone()),
@@ -1822,7 +1870,7 @@ impl SipServer {
             ],
             None,
         );
-        if send_request_reliable(bye.as_bytes(), leg.addr).await {
+        if send_request_reliable_on(&sock, bye.as_bytes(), leg.addr).await {
             tracing::info!(addr = %leg.addr, "bridged leg BYE confirmed");
         } else {
             tracing::debug!(addr = %leg.addr, "bridged leg BYE unconfirmed (no final response)");
@@ -2199,6 +2247,41 @@ fn commos_from_header(media_ip: IpAddr, display: Option<&str>, tag: &str) -> Str
         Some(d) if !d.is_empty() => format!("\"{d}\" <sip:commos@{media_ip}>;tag={tag}"),
         _ => format!("<sip:commos@{media_ip}>;tag={tag}"),
     }
+}
+
+/// Build the outbound-leg `From` that presents the **caller's** identity to a bridged callee, so
+/// the callee's phone shows who is really calling (its number, and its display name when the caller
+/// supplied one) rather than the bare "commos" service identity. `number` is the caller's
+/// user-part; the URI host is CommOS (`media_ip`), since the B2BUA is the caller's contact. `tag`
+/// is the outbound leg's from-tag. Falls back to the plain service `From` when the caller has no
+/// usable number (so an anonymous/malformed caller still gets a well-formed header).
+fn caller_from_header(media_ip: IpAddr, number: Option<&str>, display: Option<&str>, tag: &str) -> String {
+    let Some(number) = number.filter(|n| !n.is_empty()) else {
+        return commos_from_header(media_ip, display, tag);
+    };
+    match display {
+        Some(d) if !d.is_empty() => format!("\"{d}\" <sip:{number}@{media_ip}>;tag={tag}"),
+        _ => format!("<sip:{number}@{media_ip}>;tag={tag}"),
+    }
+}
+
+/// Extract the display-name (the quoted or bare text before the `<uri>`) from a `From`/`To` header
+/// value, sanitized for re-emission. Returns `None` when there is no display name (a bare
+/// `<sip:…>` or `sip:…` value). Used to carry the caller's name through to the bridged callee.
+fn header_display_name(value: &str) -> Option<String> {
+    let v = value.trim();
+    let raw = if let Some(rest) = v.strip_prefix('"') {
+        // Quoted form: "Alice" <sip:…>. Take up to the closing quote.
+        rest.split('"').next().unwrap_or("")
+    } else if let Some(idx) = v.find('<') {
+        // Unquoted display name before the angle-bracketed URI (e.g. `Alice <sip:…>`).
+        &v[..idx]
+    } else {
+        // Bare URI (`sip:100@host` or `<sip:100@host>`): no display name.
+        ""
+    };
+    let name = sip_display_name(raw);
+    (!name.is_empty()).then_some(name)
 }
 
 /// A default codec (PCMU/8000) for when an offer carries no usable audio codec.
@@ -2636,13 +2719,12 @@ async fn send_invite_await_final(
     }
 }
 
-/// Send a non-INVITE request (a mid-dialog BYE) reliably on a throwaway socket, retransmitting per
-/// RFC 3261 §17.1.2 until a final response arrives or [`NON_INVITE_TIMEOUT`] elapses. Returns
-/// whether the peer confirmed — so a lost BYE is retried and the callee leg is actually torn down.
-async fn send_request_reliable(request: &[u8], dst: SocketAddr) -> bool {
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else {
-        return false;
-    };
+/// Send a non-INVITE request (a mid-dialog BYE) reliably on a caller-provided socket,
+/// retransmitting per RFC 3261 §17.1.2 until a final response arrives or [`NON_INVITE_TIMEOUT`]
+/// elapses. Returns whether the peer confirmed — so a lost BYE is retried and the callee leg is
+/// actually torn down. The caller binds the socket so it can advertise that socket's address in
+/// the request's `Via` (see [`SipServer::send_bye_to_leg`]) and receive the final response on it.
+async fn send_request_reliable_on(sock: &UdpSocket, request: &[u8], dst: SocketAddr) -> bool {
     if sock.send_to(request, dst).await.is_err() {
         return false;
     }
@@ -2751,6 +2833,52 @@ mod tests {
         );
         // An empty display name is treated as absent.
         assert_eq!(commos_from_header(ip, Some(""), "abc"), "<sip:commos@10.0.0.5>;tag=abc");
+    }
+
+    #[test]
+    fn caller_from_header_presents_caller_identity_to_the_callee() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        // Number + display name → the callee's phone shows the real caller, not "commos".
+        assert_eq!(
+            caller_from_header(ip, Some("100"), Some("Alice"), "tg"),
+            "\"Alice\" <sip:100@10.0.0.5>;tag=tg"
+        );
+        // Number only → bare caller URI (still the caller's number, not the service identity).
+        assert_eq!(
+            caller_from_header(ip, Some("100"), None, "tg"),
+            "<sip:100@10.0.0.5>;tag=tg"
+        );
+        // No usable number → fall back to the service `From` so the header is still well-formed.
+        assert_eq!(
+            caller_from_header(ip, None, Some("Anon"), "tg"),
+            "\"Anon\" <sip:commos@10.0.0.5>;tag=tg"
+        );
+        assert_eq!(caller_from_header(ip, Some(""), None, "tg"), "<sip:commos@10.0.0.5>;tag=tg");
+    }
+
+    #[test]
+    fn header_display_name_extracts_quoted_bare_and_none() {
+        assert_eq!(header_display_name("\"Alice\" <sip:100@host>;tag=x").as_deref(), Some("Alice"));
+        assert_eq!(header_display_name("Bob <sip:101@host>").as_deref(), Some("Bob"));
+        // A bare URI (quoted or angle-only) has no display name.
+        assert_eq!(header_display_name("<sip:100@host>;tag=x"), None);
+        assert_eq!(header_display_name("sip:100@host"), None);
+        // CRLF injection in the display name is neutralised (sanitised).
+        assert_eq!(
+            header_display_name("\"Eve\r\nX: y\" <sip:1@h>").as_deref(),
+            Some("EveX: y")
+        );
+    }
+
+    #[test]
+    fn via_header_is_reachable_and_carries_rport_and_a_magic_cookie_branch() {
+        let sent_by: SocketAddr = "10.0.0.5:41000".parse().unwrap();
+        let via = message::via_header(sent_by);
+        assert!(via.starts_with("SIP/2.0/UDP 10.0.0.5:41000;rport;branch=z9hG4bK"),
+            "reachable sent-by + rport + magic-cookie branch: {via}");
+        // A parsed request carrying this Via routes the response back to 10.0.0.5:41000 — never
+        // the unreachable `commos.invalid` placeholder that loses the callee's answer.
+        assert!(!via.contains("commos.invalid"));
     }
 
     #[test]
@@ -2887,8 +3015,9 @@ mod tests {
             peer.send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
         });
         let bye = b"BYE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n";
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(
-            send_request_reliable(bye, peer_addr).await,
+            send_request_reliable_on(&sock, bye, peer_addr).await,
             "should retransmit the lost BYE and observe the 200"
         );
         peer_task.await.unwrap();
