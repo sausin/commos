@@ -2,8 +2,15 @@ name: conformance
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+
+# Feature branches are validated once via the pull_request event; push runs are reserved for the
+# default branch and tags. Cancel superseded runs regardless of which event triggered them.
+concurrency:
+  group: conformance-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   contracts:
