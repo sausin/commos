@@ -30,6 +30,10 @@ All commands run from `reference/`:
 - Test:  `cargo test --bin commosd`  ·  Lint: `cargo clippy --bin commosd`
 - Run:   `./target/release/commosd --config <pbx.yaml>`  (or `scripts/install.sh --build --systemd`)
 
+The binary's reported version (`--version`, `/metrics`, dashboard) comes from `crates/commosd/build.rs`
+via `env!("COMMOS_VERSION")` — `COMMOS_VERSION` env (CI passes the release tag) → `git describe` →
+manifest fallback. Do **not** revert these sites to `CARGO_PKG_VERSION` (it is frozen at `0.1.0`).
+
 ## Path convention (IMPORTANT — history of path-resolution bugs)
 
 All runtime state hangs off **`data_dir`** (default `.`; the installer sets it, e.g.
@@ -56,6 +60,14 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   Note: the UDP receive loop only parses + dispatches — it `tokio::spawn`s each datagram's
   `handle()` so `on_invite` blocking (up to `no_answer_timeout` while ringing the callee) no
   longer serializes other call setup.
+  IMPORTANT (history of bugs): every outbound UAC request CommOS originates (bridge/trunk
+  INVITE+ACK, mid-dialog BYE) **must** carry a reachable `Via` via `message::via_header(sent_by)`
+  — `sent_by` = `media_ip` at the ephemeral port the request is sent from and its response awaited
+  on. Omitting it makes `message::request` fall back to an unresolvable `commos.invalid` sent-by,
+  so the callee's `180`/`200` are lost and the call wrongly diverts to voicemail. Bridged legs also
+  pass the caller's identity (`CallerId` → `caller_from_header`) so the callee sees the real
+  caller, not "commos". This depends on a correct `media_ip` (the installer picks the phone-LAN NIC
+  on multi-homed hosts).
 - **Control plane** — `control/routing.rs` (Call state machine, driven by `MediaFact`s + CDRs),
   `control/voicemail.rs`, `control/onboarding.rs`, `control/provisioning.rs`, `control/trunking.rs`.
 - **Provisioning** — `api/provision.rs` (per-vendor phone configs: Yealink/Grandstream/generic,
