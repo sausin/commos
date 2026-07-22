@@ -607,12 +607,23 @@ impl SipServer {
         // hold) for a dialog we already answered. Re-answer 200 OK from the stored media — echoing
         // the incoming INVITE's headers/CSeq — without creating a duplicate Call or re-binding
         // media. (Full re-negotiation of a hold's media direction is future B2BUA work.)
-        let existing = self
-            .dialogs
-            .lock()
-            .expect("dialogs mutex")
-            .get(&call_id_hdr)
-            .map(|d| (d.call_id, d.answer_sdp.clone()));
+        let existing = {
+            let dialogs = self.dialogs.lock().expect("dialogs mutex");
+            dialogs.get(&call_id_hdr).map(|d| {
+                // A hold/resume re-INVITE on a live bridge drives music-on-hold. The party that
+                // sent this re-INVITE is the caller (leg A of this dialog), so on hold the callee
+                // (leg B) hears MoH; on resume the two-way relay comes back. A plain retransmit
+                // (no direction change) leaves the state untouched.
+                if let Media::Bridge(bridge) = &d.media {
+                    match hold_direction(&String::from_utf8_lossy(msg.body())) {
+                        Some(true) => bridge.set_hold(rtp::HoldState::Held(rtp::Leg::A)),
+                        Some(false) => bridge.set_hold(rtp::HoldState::Active),
+                        None => {}
+                    }
+                }
+                (d.call_id, d.answer_sdp.clone())
+            })
+        };
         if let Some((dialog_call_id, answer_sdp)) = existing {
             tracing::info!(%dialog_call_id, %src, "SIP re-INVITE / retransmit → replaying answer");
             let ok = self.build_invite_ok(msg, &answer_sdp, dialog_call_id);
@@ -1946,6 +1957,17 @@ impl SipServer {
         winner
     }
 
+    /// Build the music-on-hold loop for a bridge whose legs negotiated `codec`, transcoded to
+    /// that codec's G.711 flavour and ready for the relay to packetise while a leg is on hold.
+    /// `None` when hold music is disabled or the negotiated codec isn't G.711.
+    fn moh_loop_for(&self, codec: &codec::Codec) -> Option<rtp::MohLoop> {
+        if !self.music_on_hold {
+            return None;
+        }
+        let g = g711::G711::from_name(&codec.name)?;
+        Some(rtp::MohLoop { audio: self.moh.for_codec(g), payload_type: codec.pt })
+    }
+
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.
     ///
     /// Binds a two-leg [`rtp::Bridge`], sends an INVITE offering leg B to the callee's
@@ -2129,7 +2151,7 @@ impl SipServer {
                 "SRTP bridge: caller leg encrypted; callee leg {}",
                 if srtp_b.is_some() { "encrypted" } else { "plaintext (callee declined)" });
         }
-        let bridge = pending.start(capture, srtp_a, srtp_b);
+        let bridge = pending.start(capture, srtp_a, srtp_b, self.moh_loop_for(&sel_codec));
 
         let leg = CalleeLeg {
             addr,
@@ -2292,7 +2314,7 @@ impl SipServer {
         tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = pending.leg_b_port,
             codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), carrier_srtp = srtp_b.is_some(),
             "outbound trunk: call placed to carrier");
-        let bridge = pending.start(capture, srtp_a, srtp_b);
+        let bridge = pending.start(capture, srtp_a, srtp_b, self.moh_loop_for(&sel_codec));
 
         let leg = CalleeLeg {
             addr,
@@ -3100,6 +3122,21 @@ async fn ivr_transfer(
     true
 }
 
+/// Classify an SDP body's media direction for hold detection: `Some(true)` = the offerer put
+/// the call on hold (`a=sendonly` / `a=inactive`), `Some(false)` = active/resume
+/// (`a=sendrecv` / `a=recvonly`), `None` = no direction attribute at all (a plain retransmit,
+/// so the hold state is left unchanged). The check is idempotent — a retransmitted hold or
+/// resume re-INVITE re-asserts the same state.
+fn hold_direction(sdp: &str) -> Option<bool> {
+    if sdp.contains("a=sendonly") || sdp.contains("a=inactive") {
+        Some(true)
+    } else if sdp.contains("a=sendrecv") || sdp.contains("a=recvonly") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Push a message-waiting indication to a phone as an unsolicited SIP `NOTIFY` with an
 /// `application/simple-message-summary` body (RFC 3842). `addr`/`request_uri` are the phone's
 /// contact; `aor` is its mailbox. Fire-and-forget over a throwaway socket — a phone that does
@@ -3594,6 +3631,18 @@ mod tests {
 
         // And the await resolves to None (this leg did not win).
         assert!(awaiter.await.unwrap().is_none());
+    }
+
+    #[test]
+    fn hold_direction_classifies_sdp() {
+        // Hold: sendonly / inactive.
+        assert_eq!(hold_direction("v=0\r\na=sendonly\r\n"), Some(true));
+        assert_eq!(hold_direction("m=audio 5004 RTP/AVP 0\r\na=inactive\r\n"), Some(true));
+        // Resume / active: sendrecv / recvonly.
+        assert_eq!(hold_direction("a=sendrecv\r\n"), Some(false));
+        assert_eq!(hold_direction("a=recvonly\r\n"), Some(false));
+        // No direction attribute → unchanged (plain retransmit).
+        assert_eq!(hold_direction("v=0\r\nm=audio 5004 RTP/AVP 0\r\n"), None);
     }
 
     /// The queue-wait driver latches the caller, plays treatment audio, and — with no member to

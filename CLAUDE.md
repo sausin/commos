@@ -86,7 +86,10 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   `sip/moh.rs` (load/synth/stream). A `queue:<uuid>` caller is answered early and handed to
   `SipServer::queue_wait_driver` (greeting + MoH + announcements, rings registered queue members
   via `ivr_transfer`, overflows after `max_wait_ms`); wait policy is the pure `sip/queuewait.rs`.
-  Live hold-bridge MoH injection (for a *bridged* caller on hold) is still TODO.
+  Live hold-bridge MoH injection is wired for caller-side hold: a hold/resume re-INVITE
+  (`hold_direction`) drives `rtp::Bridge::set_hold` (`HoldState`/`Leg`), which suspends the relay
+  and streams MoH to the held leg (callee-initiated hold — a leg-B re-INVITE — is the remaining
+  wiring; the media path already supports `Held(Leg::B)`).
 - **Voicemail-to-email** — `control/smtp.rs` (hand-rolled pure-Rust SMTP submission client, like
   `webhook_delivery.rs`) + `control/voicemail_email.rs` (a `VoicemailReceived` bus subscriber that
   resolves the mailbox → `smtp.mailboxes` recipient and emails a WAV). Config: `smtp:` section.

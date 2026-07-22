@@ -9,11 +9,37 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::srtp::SrtpSession;
+
+/// One side of a [`Bridge`]. Leg A faces the caller (the original INVITE sender), leg B the
+/// callee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leg {
+    A,
+    /// The relay handles holding either leg symmetrically, but only caller-side hold
+    /// (`Held(Leg::A)`) is SIP-wired today — a *callee*-initiated hold re-INVITE arrives on the
+    /// leg-B dialog, which the in-dialog handler does not yet route. Wiring that is a documented
+    /// follow-up; the media path is already ready for it.
+    #[allow(dead_code)]
+    B,
+}
+
+/// Whether the bridge is relaying normally or one leg's phone has put the call on hold. While
+/// held, the relay stops forwarding between the legs and streams music-on-hold to the leg that
+/// is *not* holding, so the held party hears music instead of silence (the TODO.md gap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldState {
+    /// Normal two-way relay.
+    Active,
+    /// The named leg's phone initiated hold → play MoH to the *other* leg, stop relaying.
+    Held(Leg),
+}
 
 /// A shared capture buffer for call recording. The RTP task appends the **payload** of each
 /// received packet (RTP header stripped) so the buffer is the raw audio bytes as-negotiated —
@@ -53,12 +79,20 @@ pub struct Bridge {
     /// UDP port facing the caller — advertise this in the SDP answer sent to the caller.
     pub leg_a_port: u16,
     task: JoinHandle<()>,
+    /// Hold control: a re-INVITE handler flips this to start/stop music-on-hold.
+    hold: watch::Sender<HoldState>,
 }
 
 impl Bridge {
     /// Tear the relay down (aborts the background task; sockets are then dropped).
     pub fn abort(self) {
         self.task.abort();
+    }
+
+    /// Signal the relay to enter/leave hold. A no-op once the relay task has ended (the caller
+    /// need not care whether the bridge is still live).
+    pub fn set_hold(&self, state: HoldState) {
+        let _ = self.hold.send(state);
     }
 }
 
@@ -100,8 +134,10 @@ impl PendingBridge {
         capture: Option<Capture>,
         srtp_a: Option<SrtpSession>,
         srtp_b: Option<SrtpSession>,
+        moh: Option<MohLoop>,
     ) -> Bridge {
         let PendingBridge { leg_a, leg_b, leg_a_port, leg_b_port: _ } = self;
+        let (hold_tx, mut hold_rx) = watch::channel(HoldState::Active);
         let task = tokio::spawn(async move {
             // Each leg's peer address, learned from the first datagram it receives (latching).
             let mut peer_a: Option<SocketAddr> = None;
@@ -110,8 +146,28 @@ impl PendingBridge {
             let mut buf_b = [0u8; 2048];
             let mut srtp_a = srtp_a;
             let mut srtp_b = srtp_b;
+            let mut hold = HoldState::Active;
+
+            // Music-on-hold state: the loop pre-chunked into 20 ms frames + an RTP cursor. When a
+            // leg is held, the 20 ms ticker streams these frames to the *other* leg.
+            let moh_frames: Vec<Vec<u8>> = moh
+                .as_ref()
+                .map(|m| m.audio.chunks(FRAME_BYTES).map(|c| c.to_vec()).collect())
+                .unwrap_or_default();
+            let moh_pt = moh.as_ref().map(|m| m.payload_type).unwrap_or(0);
+            let mut moh_idx = 0usize;
+            let mut moh_seq: u16 = 0;
+            let mut moh_ts: u32 = 0;
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+
             loop {
                 tokio::select! {
+                    // A hold/resume signal from the re-INVITE handler.
+                    changed = hold_rx.changed() => {
+                        if changed.is_ok() {
+                            hold = *hold_rx.borrow();
+                        }
+                    }
                     // Packet from the caller side → decrypt (leg A), re-encrypt (leg B), forward.
                     r = leg_a.recv_from(&mut buf_a) => match r {
                         Ok((n, from)) => {
@@ -132,8 +188,11 @@ impl PendingBridge {
                             if let Some(cap) = &capture {
                                 capture_payload(cap, &plain);
                             }
-                            if let Some(dst) = peer_b {
-                                forward(&leg_b, dst, &plain, srtp_b.as_mut()).await;
+                            // While held, do not relay between the legs (the held party hears MoH).
+                            if matches!(hold, HoldState::Active) {
+                                if let Some(dst) = peer_b {
+                                    forward(&leg_b, dst, &plain, srtp_b.as_mut()).await;
+                                }
                             }
                         }
                         Err(_) => break,
@@ -152,18 +211,48 @@ impl PendingBridge {
                                 },
                                 None => Cow::Borrowed(&buf_b[..n]),
                             };
-                            if let Some(dst) = peer_a {
-                                forward(&leg_a, dst, &plain, srtp_a.as_mut()).await;
+                            if matches!(hold, HoldState::Active) {
+                                if let Some(dst) = peer_a {
+                                    forward(&leg_a, dst, &plain, srtp_a.as_mut()).await;
+                                }
                             }
                         }
                         Err(_) => break,
                     },
+                    // 20 ms tick: while a leg is held, stream one MoH frame to the *other* leg. The
+                    // arm is disabled entirely when there is no MoH loop, so a call that never holds
+                    // pays nothing.
+                    _ = ticker.tick(), if !moh_frames.is_empty() => {
+                        let target = match hold {
+                            HoldState::Held(Leg::A) => peer_b.map(|dst| (&leg_b, dst, srtp_b.as_mut())),
+                            HoldState::Held(Leg::B) => peer_a.map(|dst| (&leg_a, dst, srtp_a.as_mut())),
+                            HoldState::Active => None,
+                        };
+                        if let Some((sock, dst, srtp)) = target {
+                            let payload = &moh_frames[moh_idx % moh_frames.len()];
+                            let pkt = super::ivr::rtp_frame(moh_pt, moh_seq, moh_ts, payload, moh_seq == 0);
+                            forward(sock, dst, &pkt, srtp).await;
+                            moh_seq = moh_seq.wrapping_add(1);
+                            moh_ts = moh_ts.wrapping_add(FRAME_BYTES as u32);
+                            moh_idx += 1;
+                        }
+                    }
                 }
             }
         });
-        Bridge { leg_a_port, task }
+        Bridge { leg_a_port, task, hold: hold_tx }
     }
 }
+
+/// A music-on-hold loop for a [`Bridge`]: G.711 audio already transcoded to the bridge's
+/// negotiated codec, plus the RTP payload type to packetise it with.
+pub struct MohLoop {
+    pub audio: Vec<u8>,
+    pub payload_type: u8,
+}
+
+/// 20 ms of 8 kHz G.711 = 160 bytes — the frame size used for MoH packetisation.
+const FRAME_BYTES: usize = 160;
 
 /// Send `plain` (a plaintext RTP packet) to `dst` on `sock`, encrypting it with the destination
 /// leg's `outbound` SRTP context first when that leg is secure.
@@ -236,7 +325,7 @@ mod tests {
         let pending = bind_bridge_sockets().await.expect("bind bridge sockets");
         let leg_a: SocketAddr = format!("127.0.0.1:{}", pending.leg_a_port).parse().unwrap();
         let leg_b: SocketAddr = format!("127.0.0.1:{}", pending.leg_b_port).parse().unwrap();
-        let bridge = pending.start(None, None, None);
+        let bridge = pending.start(None, None, None, None);
 
         // Two "phones", each bound to its own local port.
         let phone_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -294,7 +383,7 @@ mod tests {
         let pending = bind_bridge_sockets().await.expect("bind sockets");
         let leg_a: SocketAddr = format!("127.0.0.1:{}", pending.leg_a_port).parse().unwrap();
         let leg_b: SocketAddr = format!("127.0.0.1:{}", pending.leg_b_port).parse().unwrap();
-        let bridge = pending.start(None, Some(srtp_a), Some(srtp_b));
+        let bridge = pending.start(None, Some(srtp_a), Some(srtp_b), None);
 
         let phone_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let phone_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -326,6 +415,60 @@ mod tests {
         let mut b_in = ctx(&kb);
         let recovered = b_in.unprotect(&buf[..n]).expect("phone B decrypts with key B");
         assert_eq!(recovered, rtp);
+
+        bridge.abort();
+    }
+
+    /// While a leg is held the other leg hears music-on-hold (not silence), and relaying is
+    /// suspended; on resume the two-way relay comes back.
+    #[tokio::test]
+    async fn hold_streams_moh_to_other_leg_then_resume_relays() {
+        let pending = bind_bridge_sockets().await.expect("bind sockets");
+        let leg_a: SocketAddr = format!("127.0.0.1:{}", pending.leg_a_port).parse().unwrap();
+        let leg_b: SocketAddr = format!("127.0.0.1:{}", pending.leg_b_port).parse().unwrap();
+        // A one-frame MoH loop with a recognisable payload (0xAB × 160), PCMU payload type.
+        let moh = MohLoop { audio: vec![0xAB; FRAME_BYTES], payload_type: 0 };
+        let bridge = pending.start(None, None, None, Some(moh));
+
+        let phone_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Latch both legs.
+        phone_a.send_to(b"latch-a", leg_a).await.unwrap();
+        phone_b.send_to(b"latch-b", leg_b).await.unwrap();
+        let mut scratch = [0u8; 2048];
+        let _ = timeout(Duration::from_millis(50), phone_a.recv_from(&mut scratch)).await;
+        let _ = timeout(Duration::from_millis(50), phone_b.recv_from(&mut scratch)).await;
+
+        // Caller (leg A) holds → phone B (the other leg) receives MoH RTP frames.
+        bridge.set_hold(HoldState::Held(Leg::A));
+        let mut buf = [0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(1), phone_b.recv_from(&mut buf))
+            .await
+            .expect("MoH should reach the held leg")
+            .expect("recv MoH");
+        assert!(n >= RTP_HEADER_LEN + 1);
+        assert!(
+            buf[RTP_HEADER_LEN..n].iter().all(|&b| b == 0xAB),
+            "the held leg hears the music-on-hold payload"
+        );
+
+        // Resume → relay works again. Drain any buffered MoH, then relay a packet A→B.
+        bridge.set_hold(HoldState::Active);
+        let drain_until = tokio::time::Instant::now() + Duration::from_millis(80);
+        while tokio::time::Instant::now() < drain_until {
+            let _ = timeout(Duration::from_millis(20), phone_b.recv_from(&mut scratch)).await;
+        }
+        phone_a.send_to(b"relayed-after-resume", leg_a).await.unwrap();
+        let relayed = timeout(Duration::from_secs(1), async {
+            loop {
+                let (n, _) = phone_b.recv_from(&mut buf).await.unwrap();
+                if &buf[..n] == b"relayed-after-resume" {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(relayed.is_ok(), "two-way relay resumes once hold ends");
 
         bridge.abort();
     }

@@ -19,7 +19,7 @@ L ≈ multi-week.
 | 2 | **Time conditions / business hours / holidays** | M | Day/night-mode routing is table-stakes. Needs a schedule entity + CallFlow node. |
 | 3 | **Conferences (N-way mixer)** | L | Only two-leg bridging exists; needs a real RTP mixer (pure-Rust, no codec libs makes it non-trivial). |
 | 4 | **Harden attended/blind transfer + B2BUA** | L | Transfer is scaffolded but mid-dialog correctness is `TODO(B2BUA)`; used constantly, must be solid. |
-| 5 | **Music on hold** ⏳ | S/M | Engine (`sip/moh.rs`: file-load + synth fallback + looped streaming) + `moh_dir`/`music_on_hold` config landed (2026-07), and **streamed to queue-waiting callers** (see #9). Remaining: splice the MoH stream into the **live two-leg bridge** on a hold re-INVITE (needs a bridge-relay "play source to held leg" mode) so a *bridged* caller put on hold hears it too. |
+| 5 | ~~**Music on hold**~~ ✅ | S/M | **Done (2026-07).** Engine (`sip/moh.rs`: file-load + synth fallback + looped streaming) + `moh_dir`/`music_on_hold` config; streamed to queue-waiting callers (#9) **and injected into the live two-leg bridge on a hold re-INVITE** (`rtp::Bridge` `HoldState`/`set_hold` — held leg hears MoH, relay suspends, resume restores it). Only *callee*-initiated hold is unwired (its re-INVITE arrives on the leg-B dialog which the in-dialog handler doesn't route yet); the media path already supports it (`HoldState::Held(Leg::B)`). |
 | 6 | ~~**Voicemail-to-email**~~ ✅ | S | **Done (2026-07).** Pure-Rust SMTP client (`control/smtp.rs`) + `VoicemailReceived` dispatcher + `smtp:` config (mailbox→email map, μ-law→WAV attachment). |
 | 7 | ~~**Call forwarding / Follow-me**~~ ✅ | M | **Done (2026-07).** `Forwarding` entity (ALWAYS/BUSY/NO_ANSWER/UNAVAILABLE + ordered follow-me targets) + `/v1/forwardings` API + SIP execution via the ring planner. |
 | 8 | **More feature codes** (DND, `*72` forward, etc.) | M | Deliver as *intent*, not dialplans (honoring N-5). The `*97`/`*98` retrieval codes added in PR #8 are the pattern to build on. **Now cheap:** a `*72`/`*73` code just creates/deletes a `Forwarding` row; DND is a forward-to-voicemail rule. |
@@ -31,10 +31,11 @@ L ≈ multi-week.
 > per-stage treatment + final action), and `control/ringresolve.rs` resolves live config
 > (ring groups, forwarding) + registration state into that plan. The SIP B2BUA executes it
 > (`SipServer::execute_ring_plan`, with simultaneous ring-all forking in `SipServer::fork_bridge`).
-> The one remaining ⏳ piece is **live-bridge MoH-on-hold injection** — playing hold music to a
-> *bridged* caller who was put on hold, which needs a bridge-relay refactor. Queue callers already
-> get hold music via the queue-wait driver. All the control-plane decision logic is unit-tested;
-> the media-plane execution needs real-phone validation.
+> **All of items 1/5/6/7/9 have landed.** The only leftovers are polish — *callee*-initiated hold
+> (the media path is ready; just needs the leg-B re-INVITE routed), queue position announcements,
+> and callback. All the control-plane decision logic is unit-tested; the media-plane execution
+> (forking, hold injection, queue treatment) reuses tested primitives but still merits real-phone
+> validation.
 
 ### Parked — hospitality / multi-tenant hardening (added 2026-07, not yet started)
 These graduate to their own specs/branches. Grouped because a hotel/serviced-office deployment
