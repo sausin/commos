@@ -38,9 +38,9 @@
 #   --sip-tls-port <port>  SIPS (SIP/TLS) port (default: 5061)
 #   --bin <path>           Path to the commosd binary (default: auto-locate on PATH / target dir)
 #   --config <path>        Where to write pbx.yaml (default: <data-dir>/pbx.yaml)
-#   --sounds               Download the FreePBX audio prompt pack without prompting (voicemail
+#   --sounds               Download the Asterisk audio prompt pack without prompting (voicemail
 #                          greeting, retrieval menu). Files are fetched to <data-dir>/sounds and
-#                          remain the property of FreePBX/Sangoma. Skipped if already present.
+#                          remain the property of the Asterisk Project/Sangoma. Skipped if present.
 #   --no-sounds            Do not download the audio prompt pack (voicemail falls back to a beep).
 #   --build                Build the binary from source with cargo if none is found
 #   --systemd              Install and enable a systemd service (needs root)
@@ -70,10 +70,13 @@ TLS_KEY=""
 FORCE=0
 # Sounds: "" = ask (interactive) / attempt (non-interactive), 1 = yes, 0 = no.
 DO_SOUNDS=""
-# FreePBX's publicly-downloadable G.711 μ-law core sound pack. These prompts are the work of
-# FreePBX/Sangoma; we only fetch them onto the operator's system (we do not redistribute them).
-# See https://www.freepbx.org/ and https://github.com/FreePBX. Override the mirror if needed.
-SOUNDS_URL="${SOUNDS_URL:-https://downloads.freepbx.org/sounds/core-sounds-en-ulaw.tar.gz}"
+# The Asterisk Project's publicly-downloadable G.711 μ-law core sound pack. These prompts are the
+# work of the Asterisk Project / Sangoma; we only fetch them onto the operator's system (we do not
+# redistribute them). See https://www.asterisk.org/. Override the mirror with $SOUNDS_URL if needed.
+SOUNDS_URL="${SOUNDS_URL:-https://downloads.asterisk.org/pub/telephony/sounds/asterisk-core-sounds-en-ulaw-current.tar.gz}"
+# Fallback mirror, tried only if the primary is unreachable (both serve the same Asterisk core
+# pack; downloads.digium.com is the legacy mirror). Set to empty to disable the fallback.
+SOUNDS_URL_FALLBACK="${SOUNDS_URL_FALLBACK:-https://downloads.digium.com/pub/telephony/sounds/asterisk-core-sounds-en-ulaw-current.tar.gz}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # the `reference/` workspace
@@ -240,9 +243,11 @@ ok "data dir: $DATA_DIR"
 
 # ---- audio prompts (voicemail greeting + retrieval menu) --------------------------------
 # CommOS ships no audio of its own. The voicemail "please leave a message after the tone"
-# greeting and the *97/*98 retrieval menu use FreePBX's publicly-downloadable prompts, fetched
-# here onto this system. They remain the property of FreePBX/Sangoma — we credit them and only
-# download (never redistribute). If skipped, voicemail still works with a synthesized beep.
+# greeting and the *97/*98 retrieval menu use the Asterisk Project's publicly-downloadable
+# prompts, fetched here onto this system. They remain the property of the Asterisk Project /
+# Sangoma — we credit them and only download (never redistribute). This whole step is best-effort:
+# a 404, an offline box, or an unreachable mirror must NOT abort the install — voicemail still
+# works with a synthesized beep, and the operator can add prompts later with --sounds.
 SOUNDS_DIR="$DATA_DIR/sounds"
 download_sounds() {
   # Idempotent: if the pack is already present, do nothing (upgrades don't re-download).
@@ -253,13 +258,13 @@ download_sounds() {
   command -v curl >/dev/null 2>&1 || { warn "curl not found; skipping audio prompt download (voicemail will use a beep)."; return 0; }
   echo
   log "Audio prompts (voicemail greeting + *97/*98 menu):"
-  echo "    These prompts are the work of FreePBX / Sangoma (https://www.freepbx.org/,"
-  echo "    https://github.com/FreePBX) and remain their property. CommOS only downloads them"
-  echo "    onto this machine — it does not bundle or redistribute them."
+  echo "    These prompts are the work of the Asterisk Project / Sangoma (https://www.asterisk.org/)"
+  echo "    and remain their property. CommOS only downloads them onto this machine — it does not"
+  echo "    bundle or redistribute them."
   echo "    Source: $SOUNDS_URL"
   # Prompt when interactive and the operator hasn't already decided via a flag.
   if [ -z "$DO_SOUNDS" ] && [ -t 0 ]; then
-    printf '    Download the FreePBX audio prompt pack now? [Y/n] '
+    printf '    Download the Asterisk audio prompt pack now? [Y/n] '
     read -r _ans || _ans=""
     case "$_ans" in [Nn]*) DO_SOUNDS=0;; *) DO_SOUNDS=1;; esac
   fi
@@ -270,20 +275,42 @@ download_sounds() {
     return 0
   fi
   mkdir -p "$SOUNDS_DIR/en"
-  log "downloading FreePBX audio prompts to $SOUNDS_DIR/en …"
-  # Non-fatal: a failure (offline install, bad mirror) must not abort the whole install.
-  if curl -fsSL "$SOUNDS_URL" | tar -xz -C "$SOUNDS_DIR/en" 2>/dev/null; then
-    if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
-      ok "audio prompts installed at $SOUNDS_DIR/en (courtesy of FreePBX / Sangoma)"
-    else
-      warn "audio pack downloaded but vm-intro.ulaw is missing — voicemail will use a beep. Check $SOUNDS_URL layout."
+  # Try the primary mirror, then the fallback. Two-step per URL (download to a temp file, then
+  # extract) so a 404 or truncated transfer is caught cleanly and never feeds a half-archive into
+  # tar. Every failure path is a `warn` + `return 0`: this step is best-effort and must not abort
+  # the installer (voicemail falls back to a beep).
+  local _tarball _url _ok=0
+  _tarball="$(mktemp "${TMPDIR:-/tmp}/commos-sounds.XXXXXX.tar.gz" 2>/dev/null)" || _tarball="$SOUNDS_DIR/.sounds.tar.gz"
+  for _url in "$SOUNDS_URL" "$SOUNDS_URL_FALLBACK"; do
+    [ -n "$_url" ] || continue
+    log "downloading Asterisk audio prompts from $_url …"
+    if ! curl -fsSL "$_url" -o "$_tarball"; then
+      warn "  mirror unreachable or 404: $_url"
+      continue
     fi
+    if ! tar -xzf "$_tarball" -C "$SOUNDS_DIR/en" 2>/dev/null; then
+      warn "  downloaded file is not a valid .tar.gz: $_url"
+      continue
+    fi
+    _ok=1
+    break
+  done
+  rm -f "$_tarball"
+  if [ "$_ok" != "1" ]; then
+    warn "could not download audio prompts from any mirror (404, offline, or unreachable)."
+    warn "Voicemail will use a synthesized beep. Add them later: re-run with --sounds, or set"
+    warn "  SOUNDS_URL=<mirror> to point at a reachable copy."
+    return 0
+  fi
+  if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
+    ok "audio prompts installed at $SOUNDS_DIR/en (courtesy of the Asterisk Project / Sangoma)"
   else
-    warn "could not download audio prompts (offline, or mirror unreachable). Voicemail will use a beep."
-    warn "You can add them later: re-run with --sounds, or set SOUNDS_URL to a reachable mirror."
+    warn "audio pack extracted but vm-intro.ulaw is missing — voicemail will use a beep. Check the pack layout."
   fi
 }
-download_sounds
+# Best-effort: guard the call itself so nothing in the sounds step can abort the install (which
+# would leave the box with no pbx.yaml and no admin password).
+download_sounds || warn "audio prompt step failed unexpectedly (non-fatal); continuing install."
 
 # ---- admin password (as a file-referenced secret, never inline) -------------------------
 # Secure by default: the admin password gates both the operator console (dashboard / onboarding /
@@ -293,11 +320,17 @@ download_sounds
 gen_password() {
   # 24 chars from the alphanumeric set. /dev/urandom is always present on the Pi/Linux target;
   # openssl is a fallback for the rare host without a readable urandom.
+  # NOTE: `producer | head -c 24` makes the producer (tr / openssl) die with SIGPIPE when head
+  # closes the pipe after 24 bytes. Under `set -o pipefail` that surfaces as exit 141, and under
+  # `set -e` the enclosing `ADMIN_PASSWORD="$(gen_password)"` would then abort the whole installer
+  # (leaving no pbx.yaml and no password). The 24 chars are already captured before head closes, so
+  # the SIGPIPE is harmless — force this function to return 0 so it can never abort the caller.
   if [ -r /dev/urandom ]; then
-    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 24
   elif command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 24
+    openssl rand -base64 24 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 24
   fi
+  return 0
 }
 GENERATED_ADMIN_PW=0
 if [ -z "$ADMIN_PASSWORD" ] && [ "$NO_ADMIN_PW" != "1" ]; then
@@ -460,7 +493,7 @@ echo "    • Dial another phone's extension → two-way call"
 echo "    • Dial *97 → listen to your voicemail (7 delete, 9 save, # next)"
 echo
 if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
-  log "Voicemail prompts: $SOUNDS_DIR/en  (audio courtesy of FreePBX / Sangoma — https://www.freepbx.org/)"
+  log "Voicemail prompts: $SOUNDS_DIR/en  (audio courtesy of the Asterisk Project / Sangoma — https://www.asterisk.org/)"
   echo
 fi
 log "Security posture (secure-by-default — no extra config needed):"
