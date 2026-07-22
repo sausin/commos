@@ -56,7 +56,11 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
 
 - **SIP / media plane** — `sip/server.rs` (the B2BUA: INVITE/BYE, bridging, voicemail deposit +
   `*97`/`*98` retrieval, MWI), `sip/ivr.rs` (prompt playout + DTMF collect), `sip/g711.rs`
-  (μ-law/A-law synth + transcode), `sip/rtp.rs`, `sip/srtp.rs`/`sdes.rs` (SRTP), `sip/digest.rs`.
+  (μ-law/A-law synth + transcode), `sip/rtp.rs`, `sip/srtp.rs`/`sdes.rs` (SRTP), `sip/digest.rs`,
+  `sip/reboot.rs` (remote reboot of a *registered* extension via a `check-sync;reboot=true` NOTIFY,
+  answering a phone's digest challenge with its SIP credential — the reliable check-in/checkout
+  path at `POST /v1/onboarding/reboot-extension`; the discovery sweep in
+  `control/onboarding.rs::reboot_phones` remains for freshly-found IPs).
   Note: the UDP receive loop only parses + dispatches — it `tokio::spawn`s each datagram's
   `handle()` so `on_invite` blocking (up to `no_answer_timeout` while ringing the callee) no
   longer serializes other call setup.

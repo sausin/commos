@@ -2754,7 +2754,7 @@ async fn send_request_reliable_on(sock: &UdpSocket, request: &[u8], dst: SocketA
 /// Resolve a contact URI (`sip:200@192.168.1.5:5060`) to the socket address to send requests
 /// to. Parses `host[:port]` (default port 5060), returning a literal IP directly and falling
 /// back to async DNS for hostnames. Best-effort: returns `None` if nothing resolves.
-async fn resolve_contact_addr(contact_uri: &str) -> Option<SocketAddr> {
+pub(crate) async fn resolve_contact_addr(contact_uri: &str) -> Option<SocketAddr> {
     let after_scheme = contact_uri
         .trim()
         .trim_start_matches('<')
