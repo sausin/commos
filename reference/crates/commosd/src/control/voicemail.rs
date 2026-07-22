@@ -121,6 +121,55 @@ impl VoicemailService {
         Ok(vm)
     }
 
+    /// All voicemails for the extension `number`'s mailbox, ordered for dial-in playback:
+    /// **unheard (new) first**, and newest-first within each group. Mailbox membership is matched
+    /// the same way as [`Self::mailbox_summary`] — by the originating Call's `to_ref` user-part —
+    /// so it works on the SIP path where there is no CommOS `User` on the inbound INVITE. Used by
+    /// the `*97` retrieval IVR.
+    pub async fn list_for_mailbox(
+        &self,
+        tenant: Uuid,
+        number: &str,
+    ) -> Result<Vec<Voicemail>, VoicemailError> {
+        let mut cursor = None;
+        let mut msgs: Vec<Voicemail> = Vec::new();
+        loop {
+            let page = self.store.list_voicemails(tenant, 200, cursor).await?;
+            for vm in page.items {
+                let Some(call_id) = vm.call_id else { continue };
+                let Some(call) = self.store.get_call(tenant, call_id).await? else { continue };
+                if user_part(&call.to_ref).is_some_and(|u| u.eq_ignore_ascii_case(number)) {
+                    msgs.push(vm);
+                }
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        // Unheard first; newest-first within each group (UUIDv7 ids sort by creation time).
+        msgs.sort_by(|a, b| {
+            a.read
+                .cmp(&b.read)
+                .then_with(|| b.base.id.to_string().cmp(&a.base.id.to_string()))
+        });
+        Ok(msgs)
+    }
+
+    /// Permanently delete a voicemail: remove its audio Object bytes and its metadata row. Used
+    /// when the mailbox owner presses delete during `*97` retrieval. Idempotent-ish: a missing
+    /// voicemail is reported as `NotFound`.
+    pub async fn delete(&self, tenant: Uuid, id: Uuid) -> Result<(), VoicemailError> {
+        let vm = self.get(tenant, id).await?;
+        // Delete the blob first; a leftover row with no object is worse than an orphaned blob.
+        let _ = self.store.delete_object(tenant, vm.object_id).await?;
+        if !self.store.delete_voicemail(tenant, id).await? {
+            return Err(VoicemailError::NotFound);
+        }
+        self.signal.wake();
+        Ok(())
+    }
+
     /// Summarise a mailbox for the message-waiting indicator (MWI): `(new, old)` = unread and
     /// read voicemail counts for the extension `number` (drives `Voice-Message: new/old`).
     ///
@@ -234,6 +283,35 @@ mod tests {
         // A second mark is a no-op: version stays 1.
         let again = vm_svc.mark_read(t, vm.base.id).await.unwrap();
         assert_eq!(again.base.version, 1);
+    }
+
+    #[tokio::test]
+    async fn list_for_mailbox_orders_unheard_first_and_deletes() {
+        let (vm_svc, store) = svc();
+        let t = Uuid::now_v7();
+        // Three messages for mailbox 200; mark the first read so ordering can be checked.
+        let c1 = seed_call(&store, t, "sip:200@host").await;
+        let c2 = seed_call(&store, t, "sip:200@host").await;
+        let c3 = seed_call(&store, t, "sip:201@host").await; // different mailbox
+        let first = vm_svc.save(t, c1, None, &[0u8; 8000]).await.unwrap();
+        let second = vm_svc.save(t, c2, None, &[0u8; 8000]).await.unwrap();
+        vm_svc.save(t, c3, None, &[0u8; 8000]).await.unwrap();
+        vm_svc.mark_read(t, first.base.id).await.unwrap();
+
+        let msgs = vm_svc.list_for_mailbox(t, "200").await.unwrap();
+        // Only mailbox 200's two messages, unheard (second) before read (first).
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].base.id, second.base.id);
+        assert!(!msgs[0].read);
+        assert_eq!(msgs[1].base.id, first.base.id);
+        assert!(msgs[1].read);
+
+        // Delete removes the row and its audio, and drops it from the mailbox summary.
+        vm_svc.delete(t, second.base.id).await.unwrap();
+        assert_eq!(vm_svc.list_for_mailbox(t, "200").await.unwrap().len(), 1);
+        assert!(vm_svc.get_audio(t, second.base.id).await.is_err());
+        // Deleting a missing voicemail is a NotFound.
+        assert!(matches!(vm_svc.delete(t, second.base.id).await, Err(VoicemailError::NotFound)));
     }
 
     #[tokio::test]

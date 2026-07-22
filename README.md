@@ -99,8 +99,9 @@ list:
   (transparent pass-through of any codec for bridged/trunked calls; PCMU/PCMA for prompts).
 - **PSTN / SIP trunking** — outbound calls to a carrier gateway (with digest auth) and inbound
   DID routing to any internal destination.
-- **Voicemail** — record-on-no-answer for internal extensions, message-waiting indication (MWI)
-  pushed over SIP `NOTIFY`, and a retrieval API with audio playback.
+- **Voicemail** — record-on-no-answer with a spoken "leave a message after the tone" greeting,
+  a configurable ring count before divert, message-waiting indication (MWI) pushed over SIP
+  `NOTIFY`, dial-in retrieval (`*97`/`*98`, with delete/save/next), and an HTTP retrieval API.
 - **IVR & Call Flows** — a versioned `CallFlow` entity with **publish / rollback** over
   immutable, append-only revision history, and a **media runtime** that plays prompts and
   collects **DTMF** (RFC 4733 telephone-events *and* SIP INFO) to route a caller — e.g. to
@@ -296,6 +297,16 @@ Phase 1 — Core Communications   ✓ Identity  ✓ SIP/RTP  ✓ Provisioning  �
 Phase 2 — Platform              ✓ Billing   ✓ Event Bus  ✓ Webhooks  ○ Plugins  ○ AI automation
 Phase 3 — Communications OS     ◐ Messaging  ◐ Video  ◐ Contact Centre  ○ Mobile clients  ○ Federation
 ```
+
+## Acknowledgements
+
+The voicemail greeting and `*97`/`*98` retrieval menu play audio prompts from the
+**[FreePBX](https://www.freepbx.org/) / Sangoma** publicly-downloadable sound library
+(see the [FreePBX GitHub org](https://github.com/FreePBX)). CommOS does **not** bundle or
+redistribute these files — the installer downloads them onto your system (into
+`{data_dir}/sounds`), and they remain the property of FreePBX / Sangoma. With no pack installed,
+voicemail falls back to a synthesized beep. Thank you to the FreePBX community for making these
+prompts freely available.
 
 ## Licence
 

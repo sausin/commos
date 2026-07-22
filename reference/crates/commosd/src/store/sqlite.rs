@@ -685,6 +685,9 @@ impl Store for SqliteStore {
     async fn list_voicemails(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Voicemail>, StoreError> {
         self.list("voicemails", tenant, limit, cursor).await
     }
+    async fn delete_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("voicemails", tenant, id).await
+    }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
         sqlx::query(

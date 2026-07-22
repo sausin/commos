@@ -142,6 +142,14 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
+    /// Directory holding audio prompt files (voicemail greeting, retrieval menu, etc.) as raw
+    /// G.711 μ-law `.ulaw` files, organised by language (`<sounds_dir>/en/<name>.ulaw`). `None`
+    /// (the default) resolves to `{data_dir}/sounds` — where the installer downloads the public
+    /// FreePBX sound pack. A missing file falls back to a synthesized tone, so the system still
+    /// works with no sounds installed; set this only to point at a shared/custom prompt library.
+    #[serde(default)]
+    pub sounds_dir: Option<String>,
+
     /// Object-storage backend. `None` (default) stores blobs on the local filesystem under
     /// `{data_dir}/objects`. Set to `s3://<bucket>` to use S3-compatible storage (requires a
     /// build with `--features s3`); credentials come from the environment
@@ -189,6 +197,17 @@ impl Config {
     /// Path to the embedded SQLite database used when no `database_url` is configured.
     pub fn default_sqlite_path(&self) -> String {
         format!("{}/commos.db", self.data_dir.trim_end_matches('/'))
+    }
+
+    /// Directory holding audio prompt files. Explicit `sounds_dir` wins; otherwise it is
+    /// `{data_dir}/sounds` — the same `data_dir`-relative convention as the DB, object store,
+    /// and JWT secret, so an installed binary always resolves it against the state it owns
+    /// (never the current working directory).
+    pub fn sounds_dir(&self) -> String {
+        match &self.sounds_dir {
+            Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
+            _ => format!("{}/sounds", self.data_dir.trim_end_matches('/')),
+        }
     }
 }
 
@@ -272,6 +291,7 @@ impl Default for Config {
             dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
+            sounds_dir: None,
             object_storage: None,
             s3_endpoint: None,
             s3_region: default_s3_region(),

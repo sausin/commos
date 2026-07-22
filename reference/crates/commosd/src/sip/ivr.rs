@@ -144,9 +144,10 @@ pub async fn run_ivr(
 
 /// One attempt: latch the caller (persisting `peer` across attempts), stream `prompt` (G.711 at
 /// payload type `audio_pt`) as RTP while decoding inbound DTMF, and return the first digit
-/// collected (in-band or injected) within `timeout`, else `None`.
+/// collected (in-band or injected) within `timeout`, else `None`. Also reused by the voicemail
+/// retrieval driver ([`crate::sip::server`]) to play a prompt and collect one menu digit.
 #[allow(clippy::too_many_arguments)]
-async fn play_and_collect(
+pub(crate) async fn play_and_collect(
     sock: &UdpSocket,
     prompt: &[u8],
     audio_pt: u8,

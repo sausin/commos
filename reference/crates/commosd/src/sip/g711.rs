@@ -110,6 +110,30 @@ pub fn linear_to_alaw(sample: i16) -> u8 {
     (sign as u8 | compressed) ^ 0x55
 }
 
+/// Decode one G.711 **μ-law** byte back to a 16-bit linear PCM sample (ITU-T G.711). The inverse
+/// of [`linear_to_ulaw`]; used to transcode μ-law prompt files (FreePBX `.ulaw`) to A-law when a
+/// call negotiated PCMA.
+pub fn ulaw_to_linear(u: u8) -> i16 {
+    const BIAS: i32 = 0x84;
+    let u = !u; // μ-law is stored one's-complemented
+    let sign = (u & 0x80) != 0;
+    let exponent = ((u >> 4) & 0x07) as i32;
+    let mantissa = (u & 0x0f) as i32;
+    let magnitude = (((mantissa << 3) + BIAS) << exponent) - BIAS;
+    if sign { -(magnitude as i16) } else { magnitude as i16 }
+}
+
+/// Re-encode a buffer of G.711 **μ-law** bytes (e.g. a FreePBX `.ulaw` prompt, or a stored
+/// voicemail — both μ-law) into `codec`. For a μ-law target this is a cheap copy; for A-law it
+/// decodes each sample and re-encodes, so prompts and stored messages play correctly regardless
+/// of the codec the live call negotiated.
+pub fn transcode_ulaw(ulaw: &[u8], codec: G711) -> Vec<u8> {
+    match codec {
+        G711::Ulaw => ulaw.to_vec(),
+        G711::Alaw => ulaw.iter().map(|&b| linear_to_alaw(ulaw_to_linear(b))).collect(),
+    }
+}
+
 /// Synthesise a `freq_hz` sine tone of `ms` milliseconds in `codec`, at `amplitude` (0..=32767).
 /// Used for a generated prompt/beep when an IVR has no recorded prompt Object, and for the
 /// voicemail "leave a message" beep.
@@ -162,6 +186,25 @@ mod tests {
     fn zero_sample_is_ulaw_silence() {
         // The μ-law encoding of a zero sample is 0xFF (digital silence).
         assert_eq!(linear_to_ulaw(0), SILENCE);
+    }
+
+    #[test]
+    fn ulaw_decode_and_transcode() {
+        // 0xFF is μ-law digital silence → a zero sample.
+        assert_eq!(ulaw_to_linear(0xFF), 0);
+        // Decode preserves sign polarity across the codeword's sign bit.
+        assert!(ulaw_to_linear(0x00) < 0); // sign bit set after inversion → negative, large mag
+        assert!(ulaw_to_linear(0x80) > 0); // cleared → positive, large mag
+        // Decode→encode is idempotent on the positive half (no ±0 aliasing there).
+        for b in 0x80u8..=0xFF {
+            assert_eq!(linear_to_ulaw(ulaw_to_linear(b)), b, "ulaw byte {b:#04x} did not round-trip");
+        }
+        // transcode to μ-law is a copy; to A-law it changes bytes but preserves length.
+        let ulaw = vec![0x00u8, 0x7f, 0xff, 0x80];
+        assert_eq!(transcode_ulaw(&ulaw, G711::Ulaw), ulaw);
+        assert_eq!(transcode_ulaw(&ulaw, G711::Alaw).len(), ulaw.len());
+        // Silence (0xFF μ-law == zero sample) maps to A-law silence (0xD5).
+        assert_eq!(transcode_ulaw(&[0xFF], G711::Alaw), vec![0xD5]);
     }
 
     #[test]

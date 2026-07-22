@@ -1145,6 +1145,12 @@ impl Store for PgStore {
         let next_cursor = if items.len() == limit { items.last().map(|r| r.base.id.to_string()) } else { None };
         Ok(Page { items, next_cursor })
     }
+    async fn delete_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM voicemails WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
         sqlx::query(

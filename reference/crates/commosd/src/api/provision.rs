@@ -454,6 +454,7 @@ fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, regist
 /// as `cfg<mac>.xml`. Same P-values as the plain-text form, wrapped per Grandstream's XML
 /// provisioning schema. The `<mac>` element lets the handset validate the file is meant for it;
 /// values are XML-escaped. Signature line: `<P47>`.
+#[allow(clippy::too_many_arguments)]
 fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
     out.push_str("<!-- CommOS auto-provisioning config (Grandstream XML) -->\n");

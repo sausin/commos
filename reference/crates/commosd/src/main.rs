@@ -285,6 +285,7 @@ async fn run(cfg: Config) -> i32 {
             cfg.default_country_code.clone(),
             cfg.srtp,
             cfg.trunk_srtp,
+            cfg.sounds_dir(),
         ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
@@ -295,8 +296,12 @@ async fn run(cfg: Config) -> i32 {
             tracing::info!("call recording: ENABLED (caller audio stored as-is on hangup)");
         }
         if cfg.voicemail_enabled {
+            let sounds_dir = cfg.sounds_dir();
+            let have_greeting = std::path::Path::new(&format!("{sounds_dir}/en/vm-intro.ulaw")).is_file();
             tracing::info!(
                 no_answer_rings = cfg.no_answer_rings,
+                sounds_dir = %sounds_dir,
+                prompts = if have_greeting { "installed (spoken greeting)" } else { "not found (synthesized beep only)" },
                 "voicemail: ENABLED (record-on-no-answer for internal extensions; MWI via SIP NOTIFY)"
             );
         } else {
