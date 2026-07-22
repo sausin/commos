@@ -7,11 +7,15 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
+# A PR'd feature branch is validated once (via the pull_request event); push CI is reserved for
+# the default branch and release tags. Keying concurrency on head_ref (falling back to ref for
+# push builds) cancels superseded runs whichever event triggered them.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -50,11 +54,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every published architecture is compile-checked on every push, so a tag never
-        # surprises us (amd64-gnu is covered natively by the `check` job above).
+        # Every published architecture is compile-checked, so a tag never surprises us. Two
+        # targets are covered by dedicated jobs and deliberately omitted here to avoid a second
+        # compile of the same target: amd64-gnu (the native `check` job) and aarch64-gnu (the
+        # `parity-arm64` job, which compiles *and* runs the suite under qemu).
         target:
           - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-gnueabihf
     defaults:

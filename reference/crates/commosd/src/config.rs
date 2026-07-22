@@ -4,6 +4,7 @@
 //! Git-reviewable (deterministic, diff-friendly) and MUST NOT embed secrets
 //! (CMOS-14-DEP-083): secrets are *referenced*, resolved from an external manager.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
@@ -160,6 +161,19 @@ pub struct Config {
     #[serde(default)]
     pub sounds_dir: Option<String>,
 
+    /// Whether callers on hold (and, later, waiting in a queue) hear music-on-hold. When true
+    /// (the default) a held caller hears the hold loop from [`Config::moh_dir`] (or a
+    /// synthesised tune if none is installed) instead of silence.
+    #[serde(default = "default_true")]
+    pub music_on_hold: bool,
+
+    /// Directory holding music-on-hold audio as raw G.711 μ-law `.ulaw` files (all files are
+    /// concatenated, sorted by name, into one loop). `None` (the default) resolves to
+    /// `{data_dir}/moh`; when it is absent/empty a gentle synthesised tune is used so hold is
+    /// never dead air.
+    #[serde(default)]
+    pub moh_dir: Option<String>,
+
     /// Path to a plain-text file whose contents become the **display name** shown on a phone when
     /// CommOS places the call (the identity the called handset renders — otherwise the bare
     /// "commos"). One non-empty line → that text on every call; multiple lines → one picked per
@@ -208,6 +222,12 @@ pub struct Config {
     #[serde(default)]
     pub admin_password: Option<SecretRef>,
 
+    /// Optional SMTP relay for voicemail-to-email. When set, a new voicemail is emailed to
+    /// the mailbox owner (matched by extension number in `smtp.mailboxes`). Absent → the
+    /// feature is off and no dispatcher runs.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -226,6 +246,15 @@ impl Config {
         match &self.sounds_dir {
             Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
             _ => format!("{}/sounds", self.data_dir.trim_end_matches('/')),
+        }
+    }
+
+    /// Directory holding music-on-hold audio. Explicit `moh_dir` wins; otherwise it is
+    /// `{data_dir}/moh` — the same `data_dir`-relative convention as the sounds/objects dirs.
+    pub fn moh_dir(&self) -> String {
+        match &self.moh_dir {
+            Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
+            _ => format!("{}/moh", self.data_dir.trim_end_matches('/')),
         }
     }
 
@@ -280,6 +309,38 @@ impl SecretRef {
     }
 }
 
+/// SMTP relay + voicemail-to-email settings. Only plaintext submission to a trusted relay is
+/// implemented (mirroring the `http://`-only webhook client and local-PostgreSQL posture);
+/// STARTTLS to an external provider is a documented add behind the `tls` feature. The relay
+/// password is a **reference**, never inline (CMOS-14-DEP-083).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpConfig {
+    /// SMTP relay host.
+    pub host: String,
+    /// SMTP relay port (25 = SMTP, 587 = submission).
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// Envelope + `From:` sender address for outbound notifications.
+    pub from: String,
+    /// EHLO domain to announce. Empty → derived from the `from` address's domain.
+    #[serde(default)]
+    pub helo: String,
+    /// Optional AUTH LOGIN username (paired with `password`).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional AUTH LOGIN password — a SecretRef, resolved at boot (never inline).
+    #[serde(default)]
+    pub password: Option<SecretRef>,
+    /// Mailbox (extension number) → recipient email address(es). Multiple recipients may be
+    /// given comma-separated. A mailbox absent here is simply not emailed.
+    #[serde(default)]
+    pub mailboxes: BTreeMap<String, String>,
+    /// Whether to attach the voicemail audio (wrapped as a WAV) to the email.
+    #[serde(default = "default_true")]
+    pub attach_audio: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
@@ -330,6 +391,8 @@ impl Default for Config {
             database_url: None,
             data_dir: default_data_dir(),
             sounds_dir: None,
+            music_on_hold: true,
+            moh_dir: None,
             display_name_file: None,
             object_storage: None,
             s3_endpoint: None,
@@ -339,6 +402,7 @@ impl Default for Config {
             allow_international: false,
             max_concurrent_calls: None,
             admin_password: None,
+            smtp: None,
             log: LogConfig::default(),
         }
     }
@@ -346,6 +410,10 @@ impl Default for Config {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_smtp_port() -> u16 {
+    25
 }
 
 fn default_media_ip() -> IpAddr {

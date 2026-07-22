@@ -255,6 +255,14 @@ pub struct SipServer {
     /// the text a called phone shows as the calling party instead of the bare "commos". Re-read
     /// per call so edits apply live; absent/empty → the default "commos".
     display_name_file: String,
+    /// Music-on-hold source (loaded once at boot from `{data_dir}/moh`, or synthesised) and
+    /// whether hold music is enabled. Streamed to a queue-waiting caller (see the queue-wait
+    /// driver); the splice into the live two-leg hold bridge is a documented follow-up.
+    moh: Arc<super::moh::MohSource>,
+    music_on_hold: bool,
+    /// Per-call rotation counter for hunt-group / round-robin member ordering (the pure ring
+    /// planner takes this as its rotation input, spreading load across successive calls).
+    ring_rotation: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SipServer {
@@ -279,6 +287,8 @@ impl SipServer {
         trunk_srtp: bool,
         sounds_dir: impl Into<String>,
         display_name_file: impl Into<String>,
+        moh: Arc<super::moh::MohSource>,
+        music_on_hold: bool,
     ) -> Self {
         SipServer {
             registrations,
@@ -303,6 +313,9 @@ impl SipServer {
             trunk_srtp,
             sounds_dir: sounds_dir.into(),
             display_name_file: display_name_file.into(),
+            moh,
+            music_on_hold,
+            ring_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -594,12 +607,23 @@ impl SipServer {
         // hold) for a dialog we already answered. Re-answer 200 OK from the stored media — echoing
         // the incoming INVITE's headers/CSeq — without creating a duplicate Call or re-binding
         // media. (Full re-negotiation of a hold's media direction is future B2BUA work.)
-        let existing = self
-            .dialogs
-            .lock()
-            .expect("dialogs mutex")
-            .get(&call_id_hdr)
-            .map(|d| (d.call_id, d.answer_sdp.clone()));
+        let existing = {
+            let dialogs = self.dialogs.lock().expect("dialogs mutex");
+            dialogs.get(&call_id_hdr).map(|d| {
+                // A hold/resume re-INVITE on a live bridge drives music-on-hold. The party that
+                // sent this re-INVITE is the caller (leg A of this dialog), so on hold the callee
+                // (leg B) hears MoH; on resume the two-way relay comes back. A plain retransmit
+                // (no direction change) leaves the state untouched.
+                if let Media::Bridge(bridge) = &d.media {
+                    match hold_direction(&String::from_utf8_lossy(msg.body())) {
+                        Some(true) => bridge.set_hold(rtp::HoldState::Held(rtp::Leg::A)),
+                        Some(false) => bridge.set_hold(rtp::HoldState::Active),
+                        None => {}
+                    }
+                }
+                (d.call_id, d.answer_sdp.clone())
+            })
+        };
         if let Some((dialog_call_id, answer_sdp)) = existing {
             tracing::info!(%dialog_call_id, %src, "SIP re-INVITE / retransmit → replaying answer");
             let ok = self.build_invite_ok(msg, &answer_sdp, dialog_call_id);
@@ -640,7 +664,7 @@ impl SipServer {
         // remains available below (e.g. to resolve the caller's own mailbox for `*97`).
         let call = match self
             .routing
-            .create_inbound_call(self.default_tenant, from_ref.clone(), to_ref)
+            .create_inbound_call(self.default_tenant, from_ref.clone(), to_ref.clone())
             .await
         {
             Ok(c) => c,
@@ -740,10 +764,96 @@ impl SipServer {
             return self.answer_with_ivr(resp, msg, call_id, &call_id_hdr, ivr_id, g711, te_pt).await;
         }
 
+        // A `queue:<uuid>` target → answer immediately and hand to the queue-wait treatment loop
+        // (greeting + music-on-hold + announcements while placing the caller with a member).
+        if let Some(queue_id) = target.strip_prefix("queue:").and_then(|s| Uuid::parse(s.trim()).ok()) {
+            return self.answer_with_queue(resp, msg, call_id, &call_id_hdr, queue_id, g711, te_pt).await;
+        }
+
         let mut voicemail_target: Option<VoicemailBox> = None;
         // A direct voicemail target (e.g. a DID → "voicemail").
         if target == "voicemail" || target.starts_with("voicemail:") {
             voicemail_target = Some(VoicemailBox { aor: target.clone(), notify: None });
+        }
+
+        // Multi-destination routing: a ring group (`ringgroup:<uuid>`) or an active forwarding
+        // rule for the dialled number is executed as a resolved DialPlan (fan-out / follow-me),
+        // reusing the single-leg bridge/trunk primitives. This branch engages ONLY when there is
+        // genuinely a group or a forwarding rule in play; the plain single-extension bridge path
+        // below is left completely untouched otherwise.
+        if voicemail_target.is_none() {
+            let dialled = user_part(&to_ref).map(|s| s.to_string()).unwrap_or_default();
+            let is_group = target.starts_with(crate::control::ringresolve::RING_GROUP_SCHEME);
+            let has_forwarding = !dialled.is_empty()
+                && crate::control::ringresolve::active_forwarding(
+                    &self.store, self.default_tenant, &dialled).await.is_some();
+            if is_group || has_forwarding {
+                // Tell the caller's phone we're ringing while we walk the plan.
+                let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
+                let caller_display = msg.header("From").and_then(header_display_name);
+                let caller_id = CallerId { number: user_part(&from_ref), display: caller_display.as_deref() };
+                let opts = crate::control::ringplan::PlanOpts {
+                    default_ring_seconds: self.no_answer_timeout.as_secs().max(1) as u32,
+                    voicemail_enabled: self.voicemail_enabled,
+                };
+                let rotation = self.ring_rotation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let regs = &self.registrations;
+                let tenant = self.default_tenant;
+                let plan = crate::control::ringresolve::resolve_plan(
+                    &self.store, tenant, &dialled, &target, opts, rotation,
+                    |r: &str| find_registered(regs, tenant, r).is_some(),
+                ).await;
+
+                match self
+                    .execute_ring_plan(&plan, call_id, capture.clone(), &offer, caller_crypto.as_ref(), caller_id)
+                    .await
+                {
+                    Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
+                        let leg_a_port = bridge.leg_a_port;
+                        let sdp = self.build_sdp(leg_a_port, &sel_codec, sel_te, leg_a_crypto.as_ref());
+                        if !call_id_hdr.is_empty() {
+                            let callee_call_id = callee_leg.call_id.clone();
+                            self.dialogs.lock().expect("dialogs mutex").insert(
+                                call_id_hdr.clone(),
+                                Dialog {
+                                    call_id,
+                                    media: Media::Bridge(bridge),
+                                    callee: Some(callee_leg),
+                                    caller: Some(self.caller_leg(msg, call_id, src)),
+                                    capture: capture.clone(),
+                                    voicemail: None,
+                                    info_tx: None,
+                                    answer_sdp: sdp.clone(),
+                                },
+                            );
+                            self.bye_aliases.lock().expect("aliases mutex").insert(callee_call_id, call_id_hdr.clone());
+                        } else {
+                            bridge.abort();
+                        }
+                        self.mark_answered(call_id).await;
+                        let ok = self.build_invite_ok(msg, &sdp, call_id);
+                        tracing::info!(%call_id, leg_a_port, dialled = %dialled, group = is_group,
+                            "SIP INVITE bridged via ring plan");
+                        return resp.send(ok.as_bytes()).await;
+                    }
+                    None => {
+                        // Nobody answered → apply the plan's final action.
+                        match &plan.final_action {
+                            crate::control::ringplan::FinalAction::Voicemail(num) if self.voicemail_enabled => {
+                                voicemail_target = Some(VoicemailBox { aor: format!("sip:{num}"), notify: None });
+                            }
+                            crate::control::ringplan::FinalAction::Redirect(_) if self.voicemail_enabled => {
+                                // A redirect (queue / another group) is not yet re-resolved here;
+                                // divert the dialled number to voicemail as the safe terminus.
+                                voicemail_target = Some(VoicemailBox { aor: format!("sip:{dialled}"), notify: None });
+                            }
+                            _ => {}
+                        }
+                        // Fall through: a set voicemail_target is picked up by the deposit path;
+                        // otherwise the echo fallthrough applies (voicemail disabled).
+                    }
+                }
+            }
         }
 
         // If the target names a REGISTERED endpoint, bridge the two legs: bind a two-leg RTP
@@ -763,7 +873,7 @@ impl SipServer {
                     display: caller_display.as_deref(),
                 };
                 match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer,
-                    caller_crypto.as_ref(), caller_id).await {
+                    caller_crypto.as_ref(), caller_id, None).await {
                     Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
                         // Answer the caller with the codec the callee selected (transparent relay),
@@ -1149,6 +1259,211 @@ impl SipServer {
         resp.send(ok.as_bytes()).await
     }
 
+    /// Answer a caller who reached a `queue:<uuid>` target and hand them to the queue-wait
+    /// treatment loop: they are answered immediately (never left ringing) and then hear a
+    /// greeting, music-on-hold, and periodic announcements while CommOS repeatedly tries to
+    /// place them with an available registered member, overflowing after the queue's
+    /// `max_wait_ms`. Mirrors [`Self::answer_with_ivr`]: bind a caller RTP socket, spawn the
+    /// driver, answer `200`, and track it as a [`Media::Ivr`] session so a caller BYE stops it.
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_with_queue(
+        &self,
+        resp: &Responder,
+        msg: &SipMessage,
+        call_id: Uuid,
+        call_id_hdr: &str,
+        queue_id: Uuid,
+        g711: g711::G711,
+        te_pt: u8,
+    ) -> std::io::Result<()> {
+        let tenant = self.default_tenant;
+        let queue = match self.store.get_queue(tenant, queue_id).await {
+            Ok(Some(q)) => q,
+            _ => {
+                tracing::warn!(%queue_id, "queue not found; falling back to echo");
+                return self.answer_with_echo(resp, msg, call_id, call_id_hdr).await;
+            }
+        };
+
+        // Preload prompts (transcoded to the negotiated codec) so the spawned driver — which has
+        // no `&self` — can voice them. A missing prompt file falls back to a short beep.
+        let greeting = self
+            .load_prompt("queue-greeting", g711)
+            .await
+            .unwrap_or_else(|| g711::beep(200, g711));
+        let hold_prompt = self
+            .load_prompt("queue-thankyou", g711)
+            .await
+            .unwrap_or_else(|| g711::beep(120, g711));
+
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind queue RTP socket; falling back to echo");
+                return self.answer_with_echo(resp, msg, call_id, call_id_hdr).await;
+            }
+        };
+        let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let display = self.call_display_name(call_id).await;
+        let wait = crate::sip::queuewait::WaitConfig::from_max_wait_ms(queue.max_wait_ms);
+        let task = tokio::spawn(Self::queue_wait_driver(
+            sock,
+            g711,
+            te_pt,
+            self.media_ip,
+            call_id,
+            self.moh.clone(),
+            self.music_on_hold,
+            self.registrations.clone(),
+            queue.members.clone(),
+            tenant,
+            wait,
+            queue.overflow_ref.clone(),
+            self.no_answer_timeout,
+            greeting,
+            hold_prompt,
+            display,
+            stop_rx,
+        ));
+
+        let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
+        if !call_id_hdr.is_empty() {
+            self.dialogs.lock().expect("dialogs mutex").insert(
+                call_id_hdr.to_string(),
+                Dialog {
+                    call_id,
+                    media: Media::Ivr { task, stop: stop_tx },
+                    callee: None,
+                    caller: None,
+                    capture: None,
+                    voicemail: None,
+                    info_tx: None,
+                    answer_sdp: sdp.clone(),
+                },
+            );
+        } else {
+            let _ = stop_tx.send(true);
+        }
+
+        self.mark_answered(call_id).await;
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        tracing::info!(%call_id, %queue_id, rtp_port, members = queue.members.len(),
+            "SIP INVITE answered (queue wait)");
+        resp.send(ok.as_bytes()).await
+    }
+
+    /// The queue-wait treatment loop (spawned; no `&self`). Latches the caller's RTP, plays the
+    /// greeting, then loops: try to place the caller with the next registered member (via
+    /// [`ivr_transfer`], which rings them and splices on answer); if none answers, play
+    /// music-on-hold for a poll interval with a periodic announcement; overflow once
+    /// `max_wait` elapses. Ends when the caller hangs up (`stop`), a member connects, or
+    /// overflow completes.
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_wait_driver(
+        sock: UdpSocket,
+        codec: g711::G711,
+        te_pt: u8,
+        media_ip: IpAddr,
+        call_id: Uuid,
+        moh: Arc<super::moh::MohSource>,
+        music_on_hold: bool,
+        registrations: RegistrationRegistry,
+        members: Vec<String>,
+        tenant: Uuid,
+        wait: crate::sip::queuewait::WaitConfig,
+        overflow_ref: Option<String>,
+        no_answer_timeout: Duration,
+        greeting: Vec<u8>,
+        hold_prompt: Vec<u8>,
+        display: Option<String>,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let pt = codec.payload_type();
+        // Latch the caller's RTP source (symmetric RTP) from their first packet, so we know
+        // where to stream hold music. Give up if they never send media.
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let peer = {
+            let latch = tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut buf)).await;
+            match latch {
+                Ok(Ok((_, from))) => from,
+                _ => {
+                    tracing::warn!(%call_id, "queue: caller sent no RTP; ending wait");
+                    return;
+                }
+            }
+        };
+
+        // Greeting.
+        ivr::play(&sock, peer, pt, &greeting).await;
+
+        let start = tokio::time::Instant::now();
+        let mut announced = 0u32;
+        let mut cursor = 0usize;
+        loop {
+            if *stop_rx.borrow() {
+                break; // caller hung up
+            }
+            if wait.overflow_due(start.elapsed()) {
+                tracing::info!(%call_id, "queue: max wait reached; overflowing");
+                ivr::play(&sock, peer, pt, &hold_prompt).await;
+                if let Some(dest) = overflow_ref.as_deref() {
+                    if let Some(reg) = find_registered(&registrations, tenant, dest) {
+                        let _ = ivr_transfer(&sock, peer, &reg, media_ip, call_id, codec, te_pt,
+                            no_answer_timeout, display.clone(), &mut stop_rx).await;
+                    }
+                }
+                break;
+            }
+
+            // Try to place the caller with the next registered member.
+            if let Some(i) = super::queuewait::next_registered(
+                &members,
+                |m| find_registered(&registrations, tenant, m).is_some(),
+                cursor,
+            ) {
+                cursor = i + 1;
+                if let Some(reg) = find_registered(&registrations, tenant, &members[i]) {
+                    // ivr_transfer rings the member (ring-back to the caller) and, on answer,
+                    // relays until hangup. `true` → the caller was connected and the call is done.
+                    if ivr_transfer(&sock, peer, &reg, media_ip, call_id, codec, te_pt,
+                        no_answer_timeout, display.clone(), &mut stop_rx).await
+                    {
+                        return;
+                    }
+                    // Member did not answer → keep the caller waiting.
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+
+            // Periodic "still holding" announcement.
+            if wait.announce_due(start.elapsed(), announced) {
+                ivr::play(&sock, peer, pt, &hold_prompt).await;
+                announced += 1;
+            }
+
+            // Hold music for one poll interval (or until the caller hangs up). When hold music
+            // is disabled, just wait quietly.
+            if music_on_hold {
+                let _ = tokio::time::timeout(
+                    wait.poll_every,
+                    moh.stream_until(&sock, peer, pt, codec, stop_rx.clone()),
+                )
+                .await;
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait.poll_every) => {}
+                    _ = stop_rx.changed() => {}
+                }
+            }
+        }
+        tracing::info!(%call_id, waited_s = start.elapsed().as_secs(), "queue wait ended");
+    }
+
     /// Drive an IVR session to completion, then enact its outcome. A `voicemail*` selection
     /// records the caller (after a beep) until they hang up (graceful `stop`) or the cap, and
     /// stores a [`Voicemail`]. Other selections/timeouts hold the line until hangup — full
@@ -1514,6 +1829,145 @@ impl SipServer {
         resp.send(ok.as_bytes()).await
     }
 
+    /// Execute a resolved [`DialPlan`](crate::control::ringplan::DialPlan)'s ring stages,
+    /// reusing the single-leg bridge/trunk primitives, and return the first leg that answers
+    /// (`None` → nobody answered, so the caller applies the plan's `FinalAction`).
+    ///
+    /// Within a stage, all registered internal members are rung **simultaneously** (a true
+    /// ring-all fork — parallel INVITEs, first 2xx wins, losers `CANCEL`led via
+    /// [`Self::fork_bridge`]); any external (trunk) members in the same stage are then tried in
+    /// order. Stages themselves run in order, so a hunt group / follow-me chain (one contact
+    /// per stage) still rings its members one at a time. This makes `RING_ALL` truly
+    /// simultaneous while keeping `SEQUENTIAL`/`ROUND_ROBIN`/`RANDOM`/follow-me exact.
+    #[allow(clippy::type_complexity)]
+    async fn execute_ring_plan(
+        &self,
+        plan: &crate::control::ringplan::DialPlan,
+        call_id: Uuid,
+        capture: Option<rtp::Capture>,
+        offer: &codec::AudioMedia,
+        caller_crypto: Option<&sdes::CryptoAttr>,
+        caller_id: CallerId<'_>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+        for stage in &plan.stages {
+            // Split the stage into registered internal endpoints (rung simultaneously) and
+            // external trunk targets (rung in order after).
+            let mut regs = Vec::new();
+            let mut externals = Vec::new();
+            for contact in &stage.contacts {
+                match find_registered(&self.registrations, self.default_tenant, contact) {
+                    Some(reg) => regs.push(reg),
+                    None => externals.push(contact.strip_prefix("external:").unwrap_or(contact).to_string()),
+                }
+            }
+            if !regs.is_empty() {
+                if let Some(won) = self
+                    .fork_bridge(&regs, call_id, capture.clone(), offer, caller_crypto, caller_id)
+                    .await
+                {
+                    return Some(won);
+                }
+            }
+            for e164 in &externals {
+                if let Some((gw, num)) = self.select_outbound_gateway(e164).await {
+                    if let Some(won) = self
+                        .try_trunk(&gw, &num, call_id, capture.clone(), offer, caller_crypto)
+                        .await
+                    {
+                        return Some(won);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Ring every registered member of `regs` **simultaneously** and return the first that
+    /// answers, `CANCEL`ling the rest.
+    ///
+    /// A single member is just a plain [`Self::try_bridge`] (no fork machinery). For several,
+    /// one `try_bridge` future per member is driven concurrently on this task (no `spawn`, so
+    /// the borrowed caller state needs no `'static`); [`std::future::poll_fn`] races them. The
+    /// first `Some` wins; the losers are then signalled to cancel and drained to completion so
+    /// each sends its SIP `CANCEL`. A member that answered in the same instant the winner did
+    /// (a fork glare) is torn down with a `BYE`, so no caller is left connected to a ghost leg.
+    #[allow(clippy::type_complexity)]
+    async fn fork_bridge(
+        &self,
+        regs: &[Registration],
+        call_id: Uuid,
+        capture: Option<rtp::Capture>,
+        offer: &codec::AudioMedia,
+        caller_crypto: Option<&sdes::CryptoAttr>,
+        caller_id: CallerId<'_>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+        if regs.len() == 1 {
+            return self
+                .try_bridge(&regs[0], call_id, capture, offer, caller_crypto, caller_id, None)
+                .await;
+        }
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        type Leg = (rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>);
+        #[allow(clippy::type_complexity)]
+        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send + '_>>> =
+            regs
+                .iter()
+                .map(|reg| {
+                    let rx = cancel_rx.clone();
+                    let cap = capture.clone();
+                    Box::pin(self.try_bridge(reg, call_id, cap, offer, caller_crypto, caller_id, Some(rx)))
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send>>
+                })
+                .collect();
+
+        // Race all legs on this task. First `Some` wins; a leg returning `None` (declined /
+        // failed) drops out and the rest keep ringing.
+        let winner = std::future::poll_fn(|cx| {
+            let mut i = 0;
+            while i < futs.len() {
+                match futs[i].as_mut().poll(cx) {
+                    std::task::Poll::Ready(Some(won)) => {
+                        drop(futs.swap_remove(i)); // drop the completed winner so it is not re-polled
+                        return std::task::Poll::Ready(Some(won));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        drop(futs.swap_remove(i)); // this member is out; a new one now sits at i
+                    }
+                    std::task::Poll::Pending => i += 1,
+                }
+            }
+            if futs.is_empty() {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+
+        // Tell the losers to give up, then drive each to completion so it actually sends its
+        // CANCEL. Any leg that had already answered (glare) is torn down with a BYE.
+        let _ = cancel_tx.send(true);
+        for f in futs.drain(..) {
+            if let Some((bridge, leg, _, _, _)) = f.await {
+                bridge.abort();
+                self.send_bye_to_leg(&leg).await;
+            }
+        }
+        winner
+    }
+
+    /// Build the music-on-hold loop for a bridge whose legs negotiated `codec`, transcoded to
+    /// that codec's G.711 flavour and ready for the relay to packetise while a leg is on hold.
+    /// `None` when hold music is disabled or the negotiated codec isn't G.711.
+    fn moh_loop_for(&self, codec: &codec::Codec) -> Option<rtp::MohLoop> {
+        if !self.music_on_hold {
+            return None;
+        }
+        let g = g711::G711::from_name(&codec.name)?;
+        Some(rtp::MohLoop { audio: self.moh.for_codec(g), payload_type: codec.pt })
+    }
+
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.
     ///
     /// Binds a two-leg [`rtp::Bridge`], sends an INVITE offering leg B to the callee's
@@ -1524,6 +1978,12 @@ impl SipServer {
     ///
     /// The relay latches onto each side's RTP source address from its first packet, so the
     /// callee's advertised SDP address is not required for media to flow.
+    ///
+    /// When `cancel` is supplied (the simultaneous ring-all fork), a change on that receiver
+    /// while the callee is still ringing makes this leg send a SIP `CANCEL` for its INVITE
+    /// transaction and return `None` — so the losing members' phones stop ringing the instant
+    /// another member answers. A `None` cancel keeps the exact original single-leg behaviour.
+    #[allow(clippy::too_many_arguments)]
     async fn try_bridge(
         &self,
         callee: &Registration,
@@ -1532,6 +1992,7 @@ impl SipServer {
         offer: &codec::AudioMedia,
         caller_crypto: Option<&sdes::CryptoAttr>,
         caller_id: CallerId<'_>,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         let pending = match rtp::bind_bridge_sockets().await {
             Ok(b) => b,
@@ -1593,11 +2054,15 @@ impl SipServer {
         // a shared codec CommOS relays untouched (transparent pass-through, no transcoding), plus
         // an SDES key when the caller leg is encrypted.
         let sdp = reoffer_sdp(self.media_ip, pending.leg_b_port, offer, legb_crypto.as_ref());
+        // Build the top Via once and reuse it for the INVITE and (if cancelled) the CANCEL, so
+        // the CANCEL matches the INVITE client transaction by branch (RFC 3261 §9.1). The ACK
+        // for a 2xx is a fresh transaction and keeps its own branch.
+        let via = message::via_header(sent_by);
         let invite = message::request(
             "INVITE",
             &callee.contact,
             &[
-                ("Via", message::via_header(sent_by)),
+                ("Via", via.clone()),
                 ("From", from_hdr.clone()),
                 ("To", format!("<{}>", callee.aor)),
                 ("Call-ID", leg_call_id.clone()),
@@ -1609,7 +2074,30 @@ impl SipServer {
 
         // Send the INVITE and wait for the callee's final answer, retransmitting until it responds
         // (RFC 3261 client transaction); a non-2xx (or no answer) falls back to voicemail/echo.
-        let resp = match send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await {
+        // In the fork case, a cancel signal instead sends a CANCEL for this transaction.
+        let resp = match cancel {
+            None => send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await,
+            Some(rx) => {
+                let cancel_req = message::request(
+                    "CANCEL",
+                    &callee.contact,
+                    &[
+                        ("Via", via.clone()),
+                        ("From", from_hdr.clone()),
+                        ("To", format!("<{}>", callee.aor)),
+                        ("Call-ID", leg_call_id.clone()),
+                        ("CSeq", format!("{cseq_num} CANCEL")),
+                    ],
+                    None,
+                )
+                .into_bytes();
+                send_invite_await_final_cancellable(
+                    &sock, invite.as_bytes(), addr, self.no_answer_timeout, rx, cancel_req,
+                )
+                .await
+            }
+        };
+        let resp = match resp {
             Some(r) if (200..300).contains(&r.status().unwrap_or(0)) => r,
             _ => return None,
         };
@@ -1663,7 +2151,7 @@ impl SipServer {
                 "SRTP bridge: caller leg encrypted; callee leg {}",
                 if srtp_b.is_some() { "encrypted" } else { "plaintext (callee declined)" });
         }
-        let bridge = pending.start(capture, srtp_a, srtp_b);
+        let bridge = pending.start(capture, srtp_a, srtp_b, self.moh_loop_for(&sel_codec));
 
         let leg = CalleeLeg {
             addr,
@@ -1826,7 +2314,7 @@ impl SipServer {
         tracing::info!(%call_id, gateway = %gw_address, %e164, leg_b_port = pending.leg_b_port,
             codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), carrier_srtp = srtp_b.is_some(),
             "outbound trunk: call placed to carrier");
-        let bridge = pending.start(capture, srtp_a, srtp_b);
+        let bridge = pending.start(capture, srtp_a, srtp_b, self.moh_loop_for(&sel_codec));
 
         let leg = CalleeLeg {
             addr,
@@ -2634,6 +3122,21 @@ async fn ivr_transfer(
     true
 }
 
+/// Classify an SDP body's media direction for hold detection: `Some(true)` = the offerer put
+/// the call on hold (`a=sendonly` / `a=inactive`), `Some(false)` = active/resume
+/// (`a=sendrecv` / `a=recvonly`), `None` = no direction attribute at all (a plain retransmit,
+/// so the hold state is left unchanged). The check is idempotent — a retransmitted hold or
+/// resume re-INVITE re-asserts the same state.
+fn hold_direction(sdp: &str) -> Option<bool> {
+    if sdp.contains("a=sendonly") || sdp.contains("a=inactive") {
+        Some(true)
+    } else if sdp.contains("a=sendrecv") || sdp.contains("a=recvonly") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Push a message-waiting indication to a phone as an unsolicited SIP `NOTIFY` with an
 /// `application/simple-message-summary` body (RFC 3842). `addr`/`request_uri` are the phone's
 /// contact; `aor` is its mailbox. Fire-and-forget over a throwaway socket — a phone that does
@@ -2713,6 +3216,57 @@ async fn send_invite_await_final(
                     Some(s) if (100..200).contains(&s) => retransmit = false, // provisional: keep waiting
                     Some(_) => return Some(m),                                 // final response
                     None => continue,                                          // stray request
+                }
+            }
+        }
+    }
+}
+
+/// Like [`send_invite_await_final`], but also watches a `cancel` signal: when it fires (or the
+/// sender is dropped) while the callee is still ringing, this sends the pre-built `cancel_req`
+/// (a `CANCEL` for the INVITE transaction) to `dst` and returns `None`. This is what stops the
+/// losing legs of a simultaneous ring-all fork once another member answers. A cancel that
+/// arrives after a 2xx is a no-op here (the 2xx is already returned); the forking caller BYEs
+/// that late-answering leg instead.
+async fn send_invite_await_final_cancellable(
+    sock: &UdpSocket,
+    invite: &[u8],
+    dst: SocketAddr,
+    overall: Duration,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    cancel_req: Vec<u8>,
+) -> Option<SipMessage> {
+    if sock.send_to(invite, dst).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::sleep(overall);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    let mut retransmit = true;
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return None,
+            _ = retx, if retransmit => {
+                let _ = sock.send_to(invite, dst).await;
+                interval = (interval * 2).min(T2);
+            }
+            changed = cancel.changed() => {
+                // A change to `true` (or a dropped sender) means a sibling won the race: CANCEL
+                // this still-ringing INVITE and give up.
+                if changed.is_err() || *cancel.borrow() {
+                    let _ = sock.send_to(&cancel_req, dst).await;
+                    return None;
+                }
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = r else { return None };
+                let Ok(m) = message::parse(&buf[..n]) else { continue };
+                match m.status() {
+                    Some(s) if (100..200).contains(&s) => retransmit = false,
+                    Some(_) => return Some(m),
+                    None => continue,
                 }
             }
         }
@@ -3042,5 +3596,105 @@ mod tests {
         let resp = send_invite_await_final(&sock, invite, callee_addr, Duration::from_secs(3)).await;
         assert_eq!(resp.and_then(|m| m.status()), Some(200), "should return the final 200");
         callee_task.await.unwrap();
+    }
+
+    /// A losing leg of a ring-all fork: while the callee is ringing (180), a cancel signal makes
+    /// the await send a `CANCEL` for the INVITE transaction and give up (`None`) — this is what
+    /// stops the other members' phones once one answers.
+    #[tokio::test]
+    async fn cancellable_await_sends_cancel_when_signalled() {
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        // The awaiter runs concurrently; it will INVITE, see the 180, then observe the cancel.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite = b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let cancel_req = b"CANCEL sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 CANCEL\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let awaiter = tokio::spawn(async move {
+            send_invite_await_final_cancellable(
+                &sock, &invite, callee_addr, Duration::from_secs(5), cancel_rx, cancel_req,
+            )
+            .await
+        });
+
+        let mut buf = [0u8; 2048];
+        // Receive the INVITE and answer 180 (so retransmits stop and the leg is "ringing").
+        let (n, from) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"INVITE"));
+        callee.send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
+
+        // A sibling won → cancel this leg. The next datagram the callee sees must be a CANCEL.
+        cancel_tx.send(true).unwrap();
+        let (n2, _) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n2].starts_with(b"CANCEL"), "cancelled leg must send a SIP CANCEL");
+
+        // And the await resolves to None (this leg did not win).
+        assert!(awaiter.await.unwrap().is_none());
+    }
+
+    #[test]
+    fn hold_direction_classifies_sdp() {
+        // Hold: sendonly / inactive.
+        assert_eq!(hold_direction("v=0\r\na=sendonly\r\n"), Some(true));
+        assert_eq!(hold_direction("m=audio 5004 RTP/AVP 0\r\na=inactive\r\n"), Some(true));
+        // Resume / active: sendrecv / recvonly.
+        assert_eq!(hold_direction("a=sendrecv\r\n"), Some(false));
+        assert_eq!(hold_direction("a=recvonly\r\n"), Some(false));
+        // No direction attribute → unchanged (plain retransmit).
+        assert_eq!(hold_direction("v=0\r\nm=audio 5004 RTP/AVP 0\r\n"), None);
+    }
+
+    /// The queue-wait driver latches the caller, plays treatment audio, and — with no member to
+    /// answer — overflows and exits cleanly once `max_wait` elapses (never hangs on hold music).
+    #[tokio::test]
+    async fn queue_wait_driver_overflows_and_exits_with_no_members() {
+        use crate::control::registrations::RegistrationRegistry;
+
+        let driver_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let driver_addr = driver_sock.local_addr().unwrap();
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The caller sends one RTP-sized packet so the driver latches its address.
+        caller.send_to(&[0u8; 172], driver_addr).await.unwrap();
+
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let moh = Arc::new(crate::sip::moh::MohSource::synth());
+        let wait = crate::sip::queuewait::WaitConfig {
+            max_wait: Some(Duration::from_millis(300)),
+            announce_every: Duration::from_secs(30),
+            poll_every: Duration::from_millis(50),
+        };
+        let beep = g711::beep(20, g711::G711::Ulaw);
+        let driver = tokio::spawn(SipServer::queue_wait_driver(
+            driver_sock,
+            g711::G711::Ulaw,
+            dtmf::TELEPHONE_EVENT_PT,
+            "127.0.0.1".parse().unwrap(),
+            Uuid::now_v7(),
+            moh,
+            true,
+            RegistrationRegistry::new(),
+            Vec::new(), // no members → nobody to place the caller with
+            Uuid::now_v7(),
+            wait,
+            None, // no overflow target
+            Duration::from_secs(1),
+            beep.clone(),
+            beep,
+            None,
+            stop_rx,
+        ));
+
+        // The caller receives treatment audio (greeting / hold music).
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), caller.recv_from(&mut buf)).await.is_ok(),
+            "caller should hear queue treatment audio"
+        );
+        // The driver overflows shortly after max_wait and finishes (does not hang on MoH).
+        tokio::time::timeout(Duration::from_secs(3), driver)
+            .await
+            .expect("driver should finish after overflow")
+            .unwrap();
     }
 }

@@ -188,6 +188,7 @@ async fn run(cfg: Config) -> i32 {
     let messaging = control::messaging::MessagingService::new(store.clone(), signal.clone());
     let realtime = control::realtime::RealtimeService::new(store.clone(), signal.clone());
     let queues = control::queue::QueueService::new(store.clone(), signal.clone());
+    let ringing = control::ringing::RingingService::new(store.clone(), signal.clone());
     // Routing programs (Volume 2/7): versioned CallFlows with publish/rollback, and IVR nodes.
     let call_flows = control::callflow::CallFlowService::new(store.clone(), signal.clone());
     let ivrs = control::ivr::IvrService::new(store.clone(), signal.clone());
@@ -280,6 +281,12 @@ async fn run(cfg: Config) -> i32 {
     if cfg.sip_listen.is_some() || cfg.sips_listen.is_some() {
         let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
             .expect("valid default SIP tenant");
+        // Load the music-on-hold loop once (operator `.ulaw` files, or a synthesised tune).
+        let moh = std::sync::Arc::new(sip::moh::MohSource::load(&cfg.moh_dir()));
+        tracing::info!(
+            synthesised = moh.synthesised, loop_ms = moh.loop_ms(), enabled = cfg.music_on_hold,
+            "music-on-hold source loaded"
+        );
         let server = std::sync::Arc::new(sip::SipServer::new(
             registrations.clone(),
             routing.clone(),
@@ -300,6 +307,8 @@ async fn run(cfg: Config) -> i32 {
             cfg.trunk_srtp,
             cfg.sounds_dir(),
             cfg.display_name_file(),
+            moh,
+            cfg.music_on_hold,
         ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
@@ -398,6 +407,7 @@ async fn run(cfg: Config) -> i32 {
         messaging,
         realtime,
         queues,
+        ringing,
         call_flows,
         ivrs,
         trunking,
@@ -440,6 +450,47 @@ async fn run(cfg: Config) -> i32 {
         bus.clone(),
         shutdown_rx.clone(),
     ));
+
+    // Voicemail-to-email dispatcher (optional): email new voicemails to the mailbox owner.
+    // Runs only when an `smtp:` relay is configured. A password that fails to resolve disables
+    // the feature (warn) rather than failing boot — telephony must not depend on the mailer.
+    if let Some(smtp_cfg) = &cfg.smtp {
+        let auth = match (&smtp_cfg.username, &smtp_cfg.password) {
+            (Some(user), Some(secret)) => match secret.resolve() {
+                Ok(pw) => Some((user.clone(), pw)),
+                Err(e) => {
+                    tracing::error!(error = %e,
+                        "smtp.password could not be resolved; SMTP AUTH disabled");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let transport = control::smtp::SmtpTransport {
+            host: smtp_cfg.host.clone(),
+            port: smtp_cfg.port,
+            from: smtp_cfg.from.clone(),
+            helo: smtp_cfg.helo.clone(),
+            auth,
+        };
+        let mailboxes: std::collections::HashMap<String, Vec<String>> = smtp_cfg
+            .mailboxes
+            .iter()
+            .map(|(k, v)| {
+                (k.clone(), control::voicemail_email::VoicemailEmailer::parse_recipients(v))
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let emailer = control::voicemail_email::VoicemailEmailer::new(
+            transport,
+            mailboxes,
+            smtp_cfg.attach_audio,
+            store.clone(),
+            app_state.voicemails.clone(),
+        );
+        tokio::spawn(emailer.run(bus.clone(), shutdown_rx.clone()));
+        tracing::info!(relay = %smtp_cfg.host, "voicemail-to-email enabled");
+    }
 
     // Metrics collector: fold the relayed event stream into counters. Subscribing to the bus
     // keeps the control plane free of metrics plumbing (Volume 15 §OBS-010).

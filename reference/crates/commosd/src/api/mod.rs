@@ -27,6 +27,7 @@ pub mod provision;
 pub mod queues;
 pub mod recordings;
 pub mod registrations;
+pub mod ringing;
 pub mod threads;
 pub mod trunking;
 pub mod video_rooms;
@@ -152,6 +153,18 @@ pub fn router(state: AppState) -> Router {
         .route("/queues", get(queues::list_queues).post(queues::create_queue))
         .route("/queues/:id", get(queues::get_queue))
         .route("/queues/:id/enqueue", post(queues::enqueue_call))
+        // Multi-destination routing — ring groups (fan-out) and per-extension forwarding /
+        // follow-me. Reads tenant-scoped; writes admin-gated (config resources).
+        .route("/ring-groups", get(ringing::list_ring_groups).post(ringing::create_ring_group))
+        .route(
+            "/ring-groups/:id",
+            get(ringing::get_ring_group).patch(ringing::patch_ring_group).delete(ringing::delete_ring_group),
+        )
+        .route("/forwardings", get(ringing::list_forwardings).post(ringing::create_forwarding))
+        .route(
+            "/forwardings/:id",
+            get(ringing::get_forwarding).patch(ringing::patch_forwarding).delete(ringing::delete_forwarding),
+        )
         // Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
         // `:action` sub-paths (`/publish`, `/rollback`) mirror the frozen `{id}:publish`.
         .route("/call-flows", get(call_flows::list_call_flows).post(call_flows::create_call_flow))

@@ -30,6 +30,7 @@ use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::did::Did;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::forwarding::Forwarding;
 use commos_core::entities::gateway::Gateway;
 use commos_core::entities::ivr::Ivr;
 use commos_core::entities::message::Message;
@@ -38,6 +39,7 @@ use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
+use commos_core::entities::ring_group::RingGroup;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -63,6 +65,10 @@ pub struct Tx {
     /// Billing (CDR) and contact-centre (Queue) entities.
     pub cdrs: Vec<Cdr>,
     pub queues: Vec<Queue>,
+    /// Multi-destination routing targets — ring groups (fan-out) and per-extension
+    /// call-forwarding / follow-me rules.
+    pub ring_groups: Vec<RingGroup>,
+    pub forwardings: Vec<Forwarding>,
     /// Routing programs — versioned CallFlows and IVR menu nodes.
     pub call_flows: Vec<CallFlow>,
     pub ivrs: Vec<Ivr>,
@@ -201,6 +207,26 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Queue>, StoreError>;
+
+    // Ring groups (fan-out targets) — config CRUD, tenant-scoped.
+    async fn get_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<Option<RingGroup>, StoreError>;
+    async fn list_ring_groups(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<RingGroup>, StoreError>;
+    async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    // Per-extension forwarding / follow-me rules — config CRUD, tenant-scoped.
+    async fn get_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<Option<Forwarding>, StoreError>;
+    async fn list_forwardings(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Forwarding>, StoreError>;
+    async fn delete_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
     // Routing programs — CallFlows (versioned) and IVR menu nodes, tenant-scoped.
     async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError>;

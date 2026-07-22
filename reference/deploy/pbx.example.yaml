@@ -56,6 +56,22 @@ record_calls:      false   # capture call audio as stored objects on hangup.
 voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
 no_answer_rings:   5       # rings before an unanswered call diverts to voicemail (~6s each, so 5 ≈ 30s).
 
+# ── Voicemail-to-email (optional) ────────────────────────────────────────────
+# When `smtp:` is set, each new voicemail is emailed to the mailbox owner, matched by the
+# dialled extension number in `mailboxes`. Plaintext submission to a trusted relay only
+# (STARTTLS to an external provider is a documented add behind the `tls` feature). The relay
+# password is a reference, never inline. Omit the whole block to disable the feature.
+# smtp:
+#   host:  "127.0.0.1"        # SMTP relay host (e.g. a local Postfix).
+#   port:  25                 # 25 = SMTP, 587 = submission.
+#   from:  "voicemail@example.com"
+#   # username: "commos"                                   # optional AUTH LOGIN username…
+#   # password: { ref_uri: "file:///run/secrets/smtp_pw" } # …paired with a referenced password.
+#   attach_audio: true        # attach the message as a WAV (μ-law).
+#   mailboxes:                # extension number → recipient(s); comma-separate for several.
+#     "100": "alice@example.com"
+#     "101": "bob@example.com, team@example.com"
+
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Secure-by-default with zero setup: security is gated by the *source address*, not by flags you
 # have to remember. From loopback/private-LAN peers the dev bearer, dashboard, introspection, and

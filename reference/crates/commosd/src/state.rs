@@ -19,6 +19,7 @@ use crate::control::queue::QueueService;
 use crate::control::realtime::RealtimeService;
 use crate::control::recordings::RecordingService;
 use crate::control::registrations::RegistrationRegistry;
+use crate::control::ringing::RingingService;
 use crate::control::routing::Routing;
 use crate::control::trunking::TrunkingService;
 use crate::control::voicemail::VoicemailService;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub messaging: MessagingService,
     pub realtime: RealtimeService,
     pub queues: QueueService,
+    /// Multi-destination routing config — ring groups and per-extension forwarding/follow-me.
+    pub ringing: RingingService,
     /// Routing programs — versioned CallFlows (publish/rollback) and IVR menu nodes.
     pub call_flows: CallFlowService,
     pub ivrs: IvrService,
@@ -99,6 +102,7 @@ impl AppState {
         messaging: MessagingService,
         realtime: RealtimeService,
         queues: QueueService,
+        ringing: RingingService,
         call_flows: CallFlowService,
         ivrs: IvrService,
         trunking: TrunkingService,
@@ -128,6 +132,7 @@ impl AppState {
             messaging,
             realtime,
             queues,
+            ringing,
             call_flows,
             ivrs,
             trunking,

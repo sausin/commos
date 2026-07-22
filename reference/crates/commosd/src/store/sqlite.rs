@@ -27,11 +27,13 @@ use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::forwarding::Forwarding;
 use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
+use commos_core::entities::ring_group::RingGroup;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -66,6 +68,10 @@ CREATE TABLE IF NOT EXISTS cdrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS cdrs_tenant_id_idx ON cdrs (tenant_id, id);
 CREATE TABLE IF NOT EXISTS queues       (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
+CREATE TABLE IF NOT EXISTS ring_groups  (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ring_groups_tenant_id_idx ON ring_groups (tenant_id, id);
+CREATE TABLE IF NOT EXISTS forwardings  (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS forwardings_tenant_id_idx ON forwardings (tenant_id, id);
 CREATE TABLE IF NOT EXISTS call_flows   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS call_flows_tenant_id_idx ON call_flows (tenant_id, id);
 CREATE TABLE IF NOT EXISTS ivrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
@@ -361,6 +367,14 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(q).map_err(be)?;
             Self::upsert(&mut dbtx, "queues", "Queue", &q.base, &data).await?;
         }
+        for rg in &tx.ring_groups {
+            let data = serde_json::to_string(rg).map_err(be)?;
+            Self::upsert(&mut dbtx, "ring_groups", "RingGroup", &rg.base, &data).await?;
+        }
+        for f in &tx.forwardings {
+            let data = serde_json::to_string(f).map_err(be)?;
+            Self::upsert(&mut dbtx, "forwardings", "Forwarding", &f.base, &data).await?;
+        }
         for cf in &tx.call_flows {
             let data = serde_json::to_string(cf).map_err(be)?;
             Self::upsert(&mut dbtx, "call_flows", "CallFlow", &cf.base, &data).await?;
@@ -523,6 +537,26 @@ impl Store for SqliteStore {
     }
     async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
         self.list("queues", tenant, limit, cursor).await
+    }
+
+    async fn get_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<Option<RingGroup>, StoreError> {
+        self.get_one("ring_groups", tenant, id).await
+    }
+    async fn list_ring_groups(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<RingGroup>, StoreError> {
+        self.list("ring_groups", tenant, limit, cursor).await
+    }
+    async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("ring_groups", tenant, id).await
+    }
+
+    async fn get_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<Option<Forwarding>, StoreError> {
+        self.get_one("forwardings", tenant, id).await
+    }
+    async fn list_forwardings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Forwarding>, StoreError> {
+        self.list("forwardings", tenant, limit, cursor).await
+    }
+    async fn delete_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("forwardings", tenant, id).await
     }
 
     async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError> {

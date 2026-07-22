@@ -5,26 +5,62 @@ graduates to a proper spec/ADR + branch when started.
 
 ## Feature-parity roadmap (vs FreePBX / small-office PBX)
 
-Positioning: CommOS is a well-architected core engine at roughly **30–40% of small-office PBX
-parity**. The spine (SIP/RTP, provisioning, voicemail, IVR/CallFlow, trunking, ACD, CDR/billing,
-REST API + events) is real and modern; the gaps are the classic PBX *feature surface*. The FreePBX
+Positioning: CommOS is a well-architected core engine at roughly **~50% of small-office PBX
+parity** (up from ~30–40% after the 2026-07 cycle closed 5 of the top-10 gaps below — ring
+groups, call-forward/follow-me, music-on-hold, voicemail-to-email, and queue caller experience).
+The spine (SIP/RTP, provisioning, voicemail, IVR/CallFlow, trunking, ACD, CDR/billing, REST API +
+events) is real and modern; the remaining gaps are the classic PBX *feature surface*. The FreePBX
 **module / AGI / dialplan ecosystem is a deliberate non-goal** (spec N-1/N-4) — not a gap to close.
 
-Top gaps to reach "usable small-office PBX", ordered by impact. Size: S ≈ days, M ≈ weeks,
-L ≈ multi-week.
+Top gaps to reach "usable small-office PBX", ordered by impact (✅ = landed). Size: S ≈ days,
+M ≈ weeks, L ≈ multi-week. **Remaining open:** #2 (time conditions), #3 (conferences),
+#4 (transfer/B2BUA hardening), #8 (more feature codes — now cheap on the forwarding spine),
+#10 (WebRTC).
 
 | # | Gap | Size | Why |
 |---|-----|------|-----|
-| 1 | **Ring groups** | M | Most-expected feature after extensions ("ring the whole team"). No `ring_group` entity today. |
+| 1 | ~~**Ring groups**~~ ✅ | M | **Done (2026-07).** Entity + store + `/v1/ring-groups` API + SIP execution, including **true simultaneous ring-all fork** — parallel INVITEs raced on one task, first 2xx wins, losers get a SIP `CANCEL` (and a `BYE` on fork glare). Hunt strategies + follow-me exact. |
 | 2 | **Time conditions / business hours / holidays** | M | Day/night-mode routing is table-stakes. Needs a schedule entity + CallFlow node. |
 | 3 | **Conferences (N-way mixer)** | L | Only two-leg bridging exists; needs a real RTP mixer (pure-Rust, no codec libs makes it non-trivial). |
 | 4 | **Harden attended/blind transfer + B2BUA** | L | Transfer is scaffolded but mid-dialog correctness is `TODO(B2BUA)`; used constantly, must be solid. |
-| 5 | **Music on hold** | S/M | Hold works but plays silence; needs an MoH source + per-hold streaming. Low effort, high polish. |
-| 6 | **Voicemail-to-email** | S | VM + MWI already work; add an SMTP sender + mailbox email config. Small lift, big value. |
-| 7 | **Call forwarding / Follow-me** | M | "Send my calls to my mobile" — mobility is a stated CommOS pillar yet absent. |
-| 8 | **More feature codes** (DND, `*72` forward, etc.) | M | Deliver as *intent*, not dialplans (honoring N-5). The `*97`/`*98` retrieval codes added in PR #8 are the pattern to build on. |
-| 9 | **Queue caller experience** | M | Position/wait announcements, queue MoH, callback. ACD assigns agents but gives the caller no treatment. |
+| 5 | ~~**Music on hold**~~ ✅ | S/M | **Done (2026-07).** Engine (`sip/moh.rs`: file-load + synth fallback + looped streaming) + `moh_dir`/`music_on_hold` config; streamed to queue-waiting callers (#9) **and injected into the live two-leg bridge on a hold re-INVITE** (`rtp::Bridge` `HoldState`/`set_hold` — held leg hears MoH, relay suspends, resume restores it). Only *callee*-initiated hold is unwired (its re-INVITE arrives on the leg-B dialog which the in-dialog handler doesn't route yet); the media path already supports it (`HoldState::Held(Leg::B)`). |
+| 6 | ~~**Voicemail-to-email**~~ ✅ | S | **Done (2026-07).** Pure-Rust SMTP client (`control/smtp.rs`) + `VoicemailReceived` dispatcher + `smtp:` config (mailbox→email map, μ-law→WAV attachment). |
+| 7 | ~~**Call forwarding / Follow-me**~~ ✅ | M | **Done (2026-07).** `Forwarding` entity (ALWAYS/BUSY/NO_ANSWER/UNAVAILABLE + ordered follow-me targets) + `/v1/forwardings` API + SIP execution via the ring planner. |
+| 8 | **More feature codes** (DND, `*72` forward, etc.) | M | Deliver as *intent*, not dialplans (honoring N-5). The `*97`/`*98` retrieval codes added in PR #8 are the pattern to build on. **Now cheap:** a `*72`/`*73` code just creates/deletes a `Forwarding` row; DND is a forward-to-voicemail rule. |
+| 9 | ~~**Queue caller experience**~~ ✅ | M | **Done (2026-07).** A `queue:<uuid>` caller is answered immediately and hears a greeting + music-on-hold + periodic announcements while CommOS rings the queue's registered members (round-robin, `ivr_transfer` splice on answer) and overflows to `overflow_ref` after `max_wait_ms` (`sip/queuewait.rs` policy + `SipServer::queue_wait_driver`). Position announcements + callback remain as polish. |
 | 10 | **WebRTC softphone endpoint** | L | Spec'd first-class (CMOS-07-SIP-051); unlocks browser calling + a user portal. |
+
+> **Shared spine (landed 2026-07).** Items 1/5/7/9 are built on one pure, exhaustively-tested
+> planner: `control/ringplan.rs` turns a dialled number into a `DialPlan` (ordered ring stages +
+> per-stage treatment + final action), and `control/ringresolve.rs` resolves live config
+> (ring groups, forwarding) + registration state into that plan. The SIP B2BUA executes it
+> (`SipServer::execute_ring_plan`, with simultaneous ring-all forking in `SipServer::fork_bridge`).
+> **All of items 1/5/6/7/9 have landed.** The only leftovers are polish — *callee*-initiated hold
+> (the media path is ready; just needs the leg-B re-INVITE routed), queue position announcements,
+> and callback. All the control-plane decision logic is unit-tested; the media-plane execution
+> (forking, hold injection, queue treatment) reuses tested primitives but still merits real-phone
+> validation.
+
+### Parked — hospitality / multi-tenant hardening (added 2026-07, not yet started)
+These graduate to their own specs/branches. Grouped because a hotel/serviced-office deployment
+needs all three, and two of them extend surfaces that already exist.
+- **Checkout privacy purge** (S/M) — On guest checkout, delete the call logs (CDRs) **and**
+  voicemails belonging to an extension/number. Without it, the next guest inherits the previous
+  guest's call history and messages — a real privacy exposure. Natural home: alongside the
+  check-in/checkout path (`POST /v1/onboarding/reboot-extension`, `control/onboarding.rs`). Needs a
+  scoped purge that removes CDRs + `Voicemail` rows + their stored audio objects for a mailbox, with
+  an audit event.
+- **Provisioning directory / phonebook alignment** (S) — Push the platform directory
+  (`api/directory.rs` already knows the users/extensions) to the phones as a **remote phonebook**
+  during provisioning. Today `api/provision.rs` writes SIP/NTP/lockdown config but never a contact
+  list, so handsets come up with empty directories. Yealink (`remote_phonebook`) and Grandstream
+  (XML phonebook download) both take a URL — add a phonebook XML endpoint + per-vendor template.
+- **Class-of-service / call gating & whitelisting** (M) — Per-extension / per-group call-permission
+  matrix: restrict which destinations an endpoint may dial — no direct inter-guest calls, no
+  trunk/external calls from a room phone, block specific internal targets (e.g. kitchen staff).
+  Extends `control/policy.rs` from *tenant-wide* fraud guardrails (international, concurrency,
+  emergency) to a *per-endpoint* class-of-service checked on the INVITE path. Hospitality-driven but
+  broadly useful (kiosk phones, lobby phones, department restrictions).
 
 ### Honorable mentions
 - **SIP-layer security / rate-limiting** (fail2ban-style, SIP flood protection) — Missing, and a real
