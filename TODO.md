@@ -15,7 +15,7 @@ L ≈ multi-week.
 
 | # | Gap | Size | Why |
 |---|-----|------|-----|
-| 1 | **Ring groups** ⏳ | M | Entity + store + `/v1/ring-groups` API + SIP execution landed (2026-07); members are hunted **sequentially** — simultaneous ring-all fork (parallel INVITE + CANCEL losers) is the remaining piece. |
+| 1 | ~~**Ring groups**~~ ✅ | M | **Done (2026-07).** Entity + store + `/v1/ring-groups` API + SIP execution, including **true simultaneous ring-all fork** — parallel INVITEs raced on one task, first 2xx wins, losers get a SIP `CANCEL` (and a `BYE` on fork glare). Hunt strategies + follow-me exact. |
 | 2 | **Time conditions / business hours / holidays** | M | Day/night-mode routing is table-stakes. Needs a schedule entity + CallFlow node. |
 | 3 | **Conferences (N-way mixer)** | L | Only two-leg bridging exists; needs a real RTP mixer (pure-Rust, no codec libs makes it non-trivial). |
 | 4 | **Harden attended/blind transfer + B2BUA** | L | Transfer is scaffolded but mid-dialog correctness is `TODO(B2BUA)`; used constantly, must be solid. |
@@ -30,9 +30,10 @@ L ≈ multi-week.
 > planner: `control/ringplan.rs` turns a dialled number into a `DialPlan` (ordered ring stages +
 > per-stage treatment + final action), and `control/ringresolve.rs` resolves live config
 > (ring groups, forwarding) + registration state into that plan. The SIP B2BUA executes it
-> (`SipServer::execute_ring_plan`). The three remaining ⏳ pieces are all **media-plane execution**
-> (simultaneous fork, live-bridge MoH injection, queue-wait loop) that need real-phone validation;
-> the control-plane decision logic for all of them is done and unit-tested.
+> (`SipServer::execute_ring_plan`, with simultaneous ring-all forking in `SipServer::fork_bridge`).
+> The two remaining ⏳ pieces are both **media-plane execution** (live-bridge MoH injection,
+> queue-wait loop) that need real-phone validation; the control-plane decision logic for all of
+> them is done and unit-tested.
 
 ### Parked — hospitality / multi-tenant hardening (added 2026-07, not yet started)
 These graduate to their own specs/branches. Grouped because a hotel/serviced-office deployment

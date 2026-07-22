@@ -80,9 +80,10 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   treatment + final action; the tested spine for ring groups / follow-me / queue-wait),
   `control/ringresolve.rs` (resolves live `RingGroup`/`Forwarding` config + registration state into
   a plan), `control/ringing.rs` (CRUD service). The SIP B2BUA executes a plan via
-  `SipServer::execute_ring_plan`. Ring-group members currently hunt sequentially (simultaneous
-  ring-all fork is TODO). MoH engine is `sip/moh.rs` (load/synth/stream); live hold-bridge
-  injection is TODO.
+  `SipServer::execute_ring_plan`; `RING_ALL` rings all registered members **simultaneously**
+  (`SipServer::fork_bridge`: parallel INVITEs raced on one task via `poll_fn`, first 2xx wins,
+  losers `CANCEL`led — `try_bridge` takes an optional cancel `watch` receiver). MoH engine is
+  `sip/moh.rs` (load/synth/stream); live hold-bridge injection is TODO.
 - **Voicemail-to-email** — `control/smtp.rs` (hand-rolled pure-Rust SMTP submission client, like
   `webhook_delivery.rs`) + `control/voicemail_email.rs` (a `VoicemailReceived` bus subscriber that
   resolves the mailbox → `smtp.mailboxes` recipient and emails a WAV). Config: `smtp:` section.

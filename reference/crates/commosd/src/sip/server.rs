@@ -858,7 +858,7 @@ impl SipServer {
                     display: caller_display.as_deref(),
                 };
                 match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer,
-                    caller_crypto.as_ref(), caller_id).await {
+                    caller_crypto.as_ref(), caller_id, None).await {
                     Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
                         // Answer the caller with the codec the callee selected (transparent relay),
@@ -1609,16 +1609,16 @@ impl SipServer {
         resp.send(ok.as_bytes()).await
     }
 
-    /// Execute a resolved [`DialPlan`](crate::control::ringplan::DialPlan)'s ring stages
-    /// **sequentially**, reusing the single-leg bridge/trunk primitives: for each contact in
-    /// each stage, ring a registered internal endpoint ([`Self::try_bridge`]) or an external
-    /// number over a trunk ([`Self::try_trunk`]), returning the first leg that answers. `None`
-    /// means no contact answered — the caller then applies the plan's `FinalAction`.
+    /// Execute a resolved [`DialPlan`](crate::control::ringplan::DialPlan)'s ring stages,
+    /// reusing the single-leg bridge/trunk primitives, and return the first leg that answers
+    /// (`None` → nobody answered, so the caller applies the plan's `FinalAction`).
     ///
-    /// NOTE: a `RING_ALL` stage is currently rung one member at a time (a linear hunt) rather
-    /// than truly simultaneously; simultaneous forking (parallel INVITE + CANCEL of the losers)
-    /// is a documented media-plane follow-up. The call still reaches the whole group, and the
-    /// hunt strategies (`SEQUENTIAL`/`ROUND_ROBIN`/`RANDOM`) and follow-me are already exact.
+    /// Within a stage, all registered internal members are rung **simultaneously** (a true
+    /// ring-all fork — parallel INVITEs, first 2xx wins, losers `CANCEL`led via
+    /// [`Self::fork_bridge`]); any external (trunk) members in the same stage are then tried in
+    /// order. Stages themselves run in order, so a hunt group / follow-me chain (one contact
+    /// per stage) still rings its members one at a time. This makes `RING_ALL` truly
+    /// simultaneous while keeping `SEQUENTIAL`/`ROUND_ROBIN`/`RANDOM`/follow-me exact.
     #[allow(clippy::type_complexity)]
     async fn execute_ring_plan(
         &self,
@@ -1630,23 +1630,28 @@ impl SipServer {
         caller_id: CallerId<'_>,
     ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         for stage in &plan.stages {
+            // Split the stage into registered internal endpoints (rung simultaneously) and
+            // external trunk targets (rung in order after).
+            let mut regs = Vec::new();
+            let mut externals = Vec::new();
             for contact in &stage.contacts {
-                // An internal registered endpoint takes priority.
-                if let Some(reg) = find_registered(&self.registrations, self.default_tenant, contact) {
-                    if let Some(won) = self
-                        .try_bridge(&reg, call_id, capture.clone(), offer, caller_crypto, caller_id)
-                        .await
-                    {
-                        return Some(won);
-                    }
-                    continue;
+                match find_registered(&self.registrations, self.default_tenant, contact) {
+                    Some(reg) => regs.push(reg),
+                    None => externals.push(contact.strip_prefix("external:").unwrap_or(contact).to_string()),
                 }
-                // Otherwise treat it as an external number reachable over a trunk. Strip the
-                // `external:` scheme so E.164 normalisation sees the bare number.
-                let external = contact.strip_prefix("external:").unwrap_or(contact);
-                if let Some((gw, e164)) = self.select_outbound_gateway(external).await {
+            }
+            if !regs.is_empty() {
+                if let Some(won) = self
+                    .fork_bridge(&regs, call_id, capture.clone(), offer, caller_crypto, caller_id)
+                    .await
+                {
+                    return Some(won);
+                }
+            }
+            for e164 in &externals {
+                if let Some((gw, num)) = self.select_outbound_gateway(e164).await {
                     if let Some(won) = self
-                        .try_trunk(&gw, &e164, call_id, capture.clone(), offer, caller_crypto)
+                        .try_trunk(&gw, &num, call_id, capture.clone(), offer, caller_crypto)
                         .await
                     {
                         return Some(won);
@@ -1655,6 +1660,81 @@ impl SipServer {
             }
         }
         None
+    }
+
+    /// Ring every registered member of `regs` **simultaneously** and return the first that
+    /// answers, `CANCEL`ling the rest.
+    ///
+    /// A single member is just a plain [`Self::try_bridge`] (no fork machinery). For several,
+    /// one `try_bridge` future per member is driven concurrently on this task (no `spawn`, so
+    /// the borrowed caller state needs no `'static`); [`std::future::poll_fn`] races them. The
+    /// first `Some` wins; the losers are then signalled to cancel and drained to completion so
+    /// each sends its SIP `CANCEL`. A member that answered in the same instant the winner did
+    /// (a fork glare) is torn down with a `BYE`, so no caller is left connected to a ghost leg.
+    #[allow(clippy::type_complexity)]
+    async fn fork_bridge(
+        &self,
+        regs: &[Registration],
+        call_id: Uuid,
+        capture: Option<rtp::Capture>,
+        offer: &codec::AudioMedia,
+        caller_crypto: Option<&sdes::CryptoAttr>,
+        caller_id: CallerId<'_>,
+    ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
+        if regs.len() == 1 {
+            return self
+                .try_bridge(&regs[0], call_id, capture, offer, caller_crypto, caller_id, None)
+                .await;
+        }
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        type Leg = (rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>);
+        #[allow(clippy::type_complexity)]
+        let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send + '_>>> =
+            regs
+                .iter()
+                .map(|reg| {
+                    let rx = cancel_rx.clone();
+                    let cap = capture.clone();
+                    Box::pin(self.try_bridge(reg, call_id, cap, offer, caller_crypto, caller_id, Some(rx)))
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Leg>> + Send>>
+                })
+                .collect();
+
+        // Race all legs on this task. First `Some` wins; a leg returning `None` (declined /
+        // failed) drops out and the rest keep ringing.
+        let winner = std::future::poll_fn(|cx| {
+            let mut i = 0;
+            while i < futs.len() {
+                match futs[i].as_mut().poll(cx) {
+                    std::task::Poll::Ready(Some(won)) => {
+                        drop(futs.swap_remove(i)); // drop the completed winner so it is not re-polled
+                        return std::task::Poll::Ready(Some(won));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        drop(futs.swap_remove(i)); // this member is out; a new one now sits at i
+                    }
+                    std::task::Poll::Pending => i += 1,
+                }
+            }
+            if futs.is_empty() {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+
+        // Tell the losers to give up, then drive each to completion so it actually sends its
+        // CANCEL. Any leg that had already answered (glare) is torn down with a BYE.
+        let _ = cancel_tx.send(true);
+        for f in futs.drain(..) {
+            if let Some((bridge, leg, _, _, _)) = f.await {
+                bridge.abort();
+                self.send_bye_to_leg(&leg).await;
+            }
+        }
+        winner
     }
 
     /// Best-effort outbound (UAC) INVITE to a registered callee, bridged to the caller.
@@ -1667,6 +1747,12 @@ impl SipServer {
     ///
     /// The relay latches onto each side's RTP source address from its first packet, so the
     /// callee's advertised SDP address is not required for media to flow.
+    ///
+    /// When `cancel` is supplied (the simultaneous ring-all fork), a change on that receiver
+    /// while the callee is still ringing makes this leg send a SIP `CANCEL` for its INVITE
+    /// transaction and return `None` — so the losing members' phones stop ringing the instant
+    /// another member answers. A `None` cancel keeps the exact original single-leg behaviour.
+    #[allow(clippy::too_many_arguments)]
     async fn try_bridge(
         &self,
         callee: &Registration,
@@ -1675,6 +1761,7 @@ impl SipServer {
         offer: &codec::AudioMedia,
         caller_crypto: Option<&sdes::CryptoAttr>,
         caller_id: CallerId<'_>,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<(rtp::Bridge, CalleeLeg, codec::Codec, u8, Option<sdes::CryptoAttr>)> {
         let pending = match rtp::bind_bridge_sockets().await {
             Ok(b) => b,
@@ -1736,11 +1823,15 @@ impl SipServer {
         // a shared codec CommOS relays untouched (transparent pass-through, no transcoding), plus
         // an SDES key when the caller leg is encrypted.
         let sdp = reoffer_sdp(self.media_ip, pending.leg_b_port, offer, legb_crypto.as_ref());
+        // Build the top Via once and reuse it for the INVITE and (if cancelled) the CANCEL, so
+        // the CANCEL matches the INVITE client transaction by branch (RFC 3261 §9.1). The ACK
+        // for a 2xx is a fresh transaction and keeps its own branch.
+        let via = message::via_header(sent_by);
         let invite = message::request(
             "INVITE",
             &callee.contact,
             &[
-                ("Via", message::via_header(sent_by)),
+                ("Via", via.clone()),
                 ("From", from_hdr.clone()),
                 ("To", format!("<{}>", callee.aor)),
                 ("Call-ID", leg_call_id.clone()),
@@ -1752,7 +1843,30 @@ impl SipServer {
 
         // Send the INVITE and wait for the callee's final answer, retransmitting until it responds
         // (RFC 3261 client transaction); a non-2xx (or no answer) falls back to voicemail/echo.
-        let resp = match send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await {
+        // In the fork case, a cancel signal instead sends a CANCEL for this transaction.
+        let resp = match cancel {
+            None => send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await,
+            Some(rx) => {
+                let cancel_req = message::request(
+                    "CANCEL",
+                    &callee.contact,
+                    &[
+                        ("Via", via.clone()),
+                        ("From", from_hdr.clone()),
+                        ("To", format!("<{}>", callee.aor)),
+                        ("Call-ID", leg_call_id.clone()),
+                        ("CSeq", format!("{cseq_num} CANCEL")),
+                    ],
+                    None,
+                )
+                .into_bytes();
+                send_invite_await_final_cancellable(
+                    &sock, invite.as_bytes(), addr, self.no_answer_timeout, rx, cancel_req,
+                )
+                .await
+            }
+        };
+        let resp = match resp {
             Some(r) if (200..300).contains(&r.status().unwrap_or(0)) => r,
             _ => return None,
         };
@@ -2862,6 +2976,57 @@ async fn send_invite_await_final(
     }
 }
 
+/// Like [`send_invite_await_final`], but also watches a `cancel` signal: when it fires (or the
+/// sender is dropped) while the callee is still ringing, this sends the pre-built `cancel_req`
+/// (a `CANCEL` for the INVITE transaction) to `dst` and returns `None`. This is what stops the
+/// losing legs of a simultaneous ring-all fork once another member answers. A cancel that
+/// arrives after a 2xx is a no-op here (the 2xx is already returned); the forking caller BYEs
+/// that late-answering leg instead.
+async fn send_invite_await_final_cancellable(
+    sock: &UdpSocket,
+    invite: &[u8],
+    dst: SocketAddr,
+    overall: Duration,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    cancel_req: Vec<u8>,
+) -> Option<SipMessage> {
+    if sock.send_to(invite, dst).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::sleep(overall);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    let mut retransmit = true;
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return None,
+            _ = retx, if retransmit => {
+                let _ = sock.send_to(invite, dst).await;
+                interval = (interval * 2).min(T2);
+            }
+            changed = cancel.changed() => {
+                // A change to `true` (or a dropped sender) means a sibling won the race: CANCEL
+                // this still-ringing INVITE and give up.
+                if changed.is_err() || *cancel.borrow() {
+                    let _ = sock.send_to(&cancel_req, dst).await;
+                    return None;
+                }
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = r else { return None };
+                let Ok(m) = message::parse(&buf[..n]) else { continue };
+                match m.status() {
+                    Some(s) if (100..200).contains(&s) => retransmit = false,
+                    Some(_) => return Some(m),
+                    None => continue,
+                }
+            }
+        }
+    }
+}
+
 /// Send a non-INVITE request (a mid-dialog BYE) reliably on a caller-provided socket,
 /// retransmitting per RFC 3261 §17.1.2 until a final response arrives or [`NON_INVITE_TIMEOUT`]
 /// elapses. Returns whether the peer confirmed — so a lost BYE is retried and the callee leg is
@@ -3185,5 +3350,40 @@ mod tests {
         let resp = send_invite_await_final(&sock, invite, callee_addr, Duration::from_secs(3)).await;
         assert_eq!(resp.and_then(|m| m.status()), Some(200), "should return the final 200");
         callee_task.await.unwrap();
+    }
+
+    /// A losing leg of a ring-all fork: while the callee is ringing (180), a cancel signal makes
+    /// the await send a `CANCEL` for the INVITE transaction and give up (`None`) — this is what
+    /// stops the other members' phones once one answers.
+    #[tokio::test]
+    async fn cancellable_await_sends_cancel_when_signalled() {
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        // The awaiter runs concurrently; it will INVITE, see the 180, then observe the cancel.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite = b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let cancel_req = b"CANCEL sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 CANCEL\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let awaiter = tokio::spawn(async move {
+            send_invite_await_final_cancellable(
+                &sock, &invite, callee_addr, Duration::from_secs(5), cancel_rx, cancel_req,
+            )
+            .await
+        });
+
+        let mut buf = [0u8; 2048];
+        // Receive the INVITE and answer 180 (so retransmits stop and the leg is "ringing").
+        let (n, from) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"INVITE"));
+        callee.send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from).await.unwrap();
+
+        // A sibling won → cancel this leg. The next datagram the callee sees must be a CANCEL.
+        cancel_tx.send(true).unwrap();
+        let (n2, _) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n2].starts_with(b"CANCEL"), "cancelled leg must send a SIP CANCEL");
+
+        // And the await resolves to None (this leg did not win).
+        assert!(awaiter.await.unwrap().is_none());
     }
 }
