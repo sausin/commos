@@ -65,6 +65,11 @@ data_dir: "."   # SQLite DB (commos.db) + local object store live here. Use an a
 # sounds_dir: "/var/lib/commos/sounds"   # audio prompts (<dir>/en/*.ulaw). Unset → {data_dir}/sounds,
 #                                        # where scripts/install.sh downloads the public FreePBX pack.
 #                                        # Missing files fall back to a synthesized beep.
+# display_name_file: "/var/lib/commos/display_name.txt"  # text shown on a called phone as the calling
+#                                        # party (instead of "commos"). Unset → {data_dir}/display_name.txt.
+#                                        # One line = that text always; multiple lines = one picked per
+#                                        # call (rotating messages). Absent/empty → "commos". Re-read per
+#                                        # call, so edits apply without a restart.
 # database_url:   { ref_uri: "env://DATABASE_URL" }   # unset → embedded SQLite (durable, zero-dep). postgres:// for HA; memory:// for tests.
 #   Rejected (secret inline):  database_url: postgres://user:password@db:5432/commos
 # object_storage: "s3://my-bucket"                    # unset → filesystem under {data_dir}/objects. S3 needs a `--features s3` build.

@@ -150,6 +150,15 @@ pub struct Config {
     #[serde(default)]
     pub sounds_dir: Option<String>,
 
+    /// Path to a plain-text file whose contents become the **display name** shown on a phone when
+    /// CommOS places the call (the identity the called handset renders — otherwise the bare
+    /// "commos"). One non-empty line → that text on every call; multiple lines → one picked per
+    /// call (varied by call id), so you can rotate through friendly/rotating messages. `None` (the
+    /// default) resolves to `{data_dir}/display_name.txt`; if that file is absent or empty, phones
+    /// see the default "commos". Re-read per call, so edits apply without a restart.
+    #[serde(default)]
+    pub display_name_file: Option<String>,
+
     /// Object-storage backend. `None` (default) stores blobs on the local filesystem under
     /// `{data_dir}/objects`. Set to `s3://<bucket>` to use S3-compatible storage (requires a
     /// build with `--features s3`); credentials come from the environment
@@ -207,6 +216,15 @@ impl Config {
         match &self.sounds_dir {
             Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
             _ => format!("{}/sounds", self.data_dir.trim_end_matches('/')),
+        }
+    }
+
+    /// Path to the phone display-name file. Explicit `display_name_file` wins; otherwise it is
+    /// `{data_dir}/display_name.txt` — the same `data_dir`-relative convention as everything else.
+    pub fn display_name_file(&self) -> String {
+        match &self.display_name_file {
+            Some(p) if !p.trim().is_empty() => p.clone(),
+            _ => format!("{}/display_name.txt", self.data_dir.trim_end_matches('/')),
         }
     }
 }
@@ -292,6 +310,7 @@ impl Default for Config {
             database_url: None,
             data_dir: default_data_dir(),
             sounds_dir: None,
+            display_name_file: None,
             object_storage: None,
             s3_endpoint: None,
             s3_region: default_s3_region(),

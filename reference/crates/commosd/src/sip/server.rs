@@ -242,6 +242,10 @@ pub struct SipServer {
     /// boot from config (`{data_dir}/sounds` by default). Used for the voicemail greeting and the
     /// `*97`/`*98` retrieval menu; a missing file falls back to a synthesized tone.
     sounds_dir: String,
+    /// Path to the operator's phone display-name file (`{data_dir}/display_name.txt` by default):
+    /// the text a called phone shows as the calling party instead of the bare "commos". Re-read
+    /// per call so edits apply live; absent/empty → the default "commos".
+    display_name_file: String,
 }
 
 impl SipServer {
@@ -265,6 +269,7 @@ impl SipServer {
         srtp_enabled: bool,
         trunk_srtp: bool,
         sounds_dir: impl Into<String>,
+        display_name_file: impl Into<String>,
     ) -> Self {
         SipServer {
             registrations,
@@ -288,6 +293,7 @@ impl SipServer {
             srtp_enabled,
             trunk_srtp,
             sounds_dir: sounds_dir.into(),
+            display_name_file: display_name_file.into(),
         }
     }
 
@@ -1073,6 +1079,8 @@ impl SipServer {
 
         let (info_tx, info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        // The display name to present if this IVR session transfers the caller to an extension.
+        let display = self.call_display_name(call_id).await;
         let task = tokio::spawn(Self::ivr_driver(
             sock,
             cfg,
@@ -1082,6 +1090,7 @@ impl SipServer {
             self.registrations.clone(),
             self.media_ip,
             self.no_answer_timeout,
+            display,
             info_rx,
             stop_rx,
         ));
@@ -1127,6 +1136,7 @@ impl SipServer {
         registrations: RegistrationRegistry,
         media_ip: IpAddr,
         no_answer_timeout: Duration,
+        display: Option<String>,
         mut info_rx: tokio::sync::mpsc::UnboundedReceiver<char>,
         mut stop_rx: tokio::sync::watch::Receiver<bool>,
     ) {
@@ -1162,7 +1172,7 @@ impl SipServer {
                 if let (Some(peer), Some(callee)) =
                     (result.peer, find_registered(&registrations, tenant, &destination))
                 {
-                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, cfg.codec, cfg.te_pt, no_answer_timeout, &mut stop_rx).await {
+                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, cfg.codec, cfg.te_pt, no_answer_timeout, display.clone(), &mut stop_rx).await {
                         return; // relayed until the caller hung up
                     }
                 } else {
@@ -1535,7 +1545,9 @@ impl SipServer {
         // Outbound-leg dialog identifiers, derived from the CommOS Call id.
         let leg_call_id = format!("{}@commos", call_id.to_string().replace('-', ""));
         let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
-        let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
+        // Present the operator's configurable display name (or the bare "commos") to the callee.
+        let display = self.call_display_name(call_id).await;
+        let from_hdr = commos_from_header(self.media_ip, display.as_deref(), &from_tag);
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cseq_num: u32 = 1;
 
@@ -2018,6 +2030,23 @@ impl SipServer {
         }
     }
 
+    /// The display name a called phone should show as the calling party for this call — the
+    /// operator's configurable text, read from `display_name_file`. One non-empty line → that text
+    /// on every call; multiple lines → one selected per call (varied by `call_id`). `None` when the
+    /// file is absent or empty, so callers fall back to the bare "commos" identity. Re-read per
+    /// call so edits to the file apply without a restart (the file is tiny and local).
+    async fn call_display_name(&self, call_id: Uuid) -> Option<String> {
+        let content = tokio::fs::read_to_string(&self.display_name_file).await.ok()?;
+        let lines: Vec<&str> = content.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let line = match lines.len() {
+            0 => return None,
+            1 => lines[0],
+            n => lines[display_line_index(call_id, n)],
+        };
+        let sanitized = sip_display_name(line);
+        (!sanitized.is_empty()).then_some(sanitized)
+    }
+
     /// Build a `180 Ringing` provisional for the caller's INVITE, establishing the early dialog
     /// with the same To-tag the eventual 200 OK will carry (so the phone treats them as one
     /// dialog and shows a ringing indication while CommOS rings the callee). No SDP.
@@ -2121,6 +2150,44 @@ fn user_part(uri: &str) -> Option<&str> {
         None
     } else {
         Some(user)
+    }
+}
+
+/// Pick which display-name line to use for a call when the file has several, varied per call so
+/// the messages rotate. Derived from the call id's random bits (UUIDv7), so it is stable for a
+/// given call but differs between calls without needing an RNG.
+fn display_line_index(call_id: Uuid, n: usize) -> usize {
+    let sum: u32 = call_id.to_string().bytes().map(u32::from).sum();
+    (sum as usize) % n.max(1)
+}
+
+/// Sanitise operator-provided text into a SIP display-name **quoted-string** payload (without the
+/// surrounding quotes): drop control characters (so it can't inject headers), escape `\` and `"`
+/// per RFC 3261, and cap the length so a stray huge line can't bloat every INVITE.
+fn sip_display_name(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Build a CommOS outbound-leg `From` header value, prefixing the configurable display name (the
+/// text a called phone shows as the calling party) when one is set. `tag` is the leg's from-tag.
+/// With no display name it is the bare `<sip:commos@host>;tag=…` as before.
+fn commos_from_header(media_ip: IpAddr, display: Option<&str>, tag: &str) -> String {
+    match display {
+        Some(d) if !d.is_empty() => format!("\"{d}\" <sip:commos@{media_ip}>;tag={tag}"),
+        _ => format!("<sip:commos@{media_ip}>;tag={tag}"),
     }
 }
 
@@ -2328,6 +2395,7 @@ async fn ivr_transfer(
     g711: g711::G711,
     te_pt: u8,
     no_answer_timeout: Duration,
+    display: Option<String>,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let addr = match resolve_contact_addr(&callee.contact).await {
@@ -2353,7 +2421,7 @@ async fn ivr_transfer(
     // Outbound-leg dialog identifiers, derived from the CommOS Call id (mirrors try_bridge).
     let leg_call_id = format!("{}@commos-ivr", call_id.to_string().replace('-', ""));
     let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
-    let from_hdr = format!("<sip:commos@{media_ip}>;tag={from_tag}");
+    let from_hdr = commos_from_header(media_ip, display.as_deref(), &from_tag);
     // Offer the callee the IVR caller's negotiated codec (the caller is already on it).
     let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
     let sdp = media_sdp(media_ip, leg_b_port, &audio, te_pt, None);
@@ -2656,6 +2724,43 @@ mod tests {
         assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
         assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
         assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    #[test]
+    fn commos_from_header_carries_optional_display_name() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        // No display name → the bare identity, exactly as before.
+        assert_eq!(
+            commos_from_header(ip, None, "abc"),
+            "<sip:commos@10.0.0.5>;tag=abc"
+        );
+        // With a display name → a quoted display-name prefix the phone renders as the caller.
+        assert_eq!(
+            commos_from_header(ip, Some("Front Desk"), "abc"),
+            "\"Front Desk\" <sip:commos@10.0.0.5>;tag=abc"
+        );
+        // An empty display name is treated as absent.
+        assert_eq!(commos_from_header(ip, Some(""), "abc"), "<sip:commos@10.0.0.5>;tag=abc");
+    }
+
+    #[test]
+    fn sip_display_name_sanitizes_and_bounds() {
+        // Control characters (incl. CRLF header-injection attempts) are dropped.
+        assert_eq!(sip_display_name("Sales\r\nInjected: x"), "SalesInjected: x");
+        // Quotes and backslashes are escaped per RFC 3261 quoted-string rules.
+        assert_eq!(sip_display_name("A \"B\" \\C"), "A \\\"B\\\" \\\\C");
+        // Length is bounded so a huge line can't bloat every INVITE.
+        assert!(sip_display_name(&"x".repeat(500)).len() <= 64);
+    }
+
+    #[test]
+    fn display_line_index_is_stable_per_call_and_in_range() {
+        let id = Uuid::now_v7();
+        // Deterministic for a given call, and always a valid index.
+        assert_eq!(display_line_index(id, 3), display_line_index(id, 3));
+        for n in 1..=5 {
+            assert!(display_line_index(id, n) < n);
+        }
     }
 
     #[test]

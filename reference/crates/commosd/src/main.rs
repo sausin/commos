@@ -286,6 +286,7 @@ async fn run(cfg: Config) -> i32 {
             cfg.srtp,
             cfg.trunk_srtp,
             cfg.sounds_dir(),
+            cfg.display_name_file(),
         ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
