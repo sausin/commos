@@ -12,10 +12,10 @@
 //! loop and `ivr::play` use, so it is the reusable engine for both hold and (later) queue-wait
 //! treatment.
 //!
-//! NOTE: the streaming half of this engine ([`MohSource::stream_until`] and friends) is
-//! complete and tested but not yet spliced into the live two-leg hold bridge — that requires a
-//! bridge-relay "play a source to a held leg" mode and is a documented media-plane follow-up.
-//! The source is loaded and available; `#[allow(dead_code)]` marks the not-yet-wired paths.
+//! [`MohSource::stream_until`] streams the loop to a caller waiting in a queue (see the
+//! queue-wait driver in [`super::server`]). Splicing it into the live two-leg **hold** bridge
+//! (so a bridged caller put on hold hears it) additionally needs a bridge-relay "play a source
+//! to a held leg" mode and remains a documented follow-up.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -28,7 +28,6 @@ use super::ivr;
 
 /// 20 ms of 8 kHz G.711 = 160 samples/bytes — the frame size the whole media plane uses.
 const FRAME_BYTES: usize = 160;
-#[allow(dead_code)] // used by stream_until (wired when hold/queue injection lands)
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A looping hold-music source. The stored `ulaw` buffer is a whole number of 20 ms frames
@@ -96,7 +95,6 @@ impl MohSource {
     }
 
     /// The loop transcoded to `codec` (μ-law passthrough, A-law converted), ready to packetise.
-    #[allow(dead_code)] // used by stream_until (wired when hold/queue injection lands)
     pub fn for_codec(&self, codec: G711) -> Vec<u8> {
         g711::transcode_ulaw(&self.ulaw, codec)
     }
@@ -104,7 +102,6 @@ impl MohSource {
     /// Stream the hold loop to `peer` on a 20 ms cadence in the negotiated `codec`/`pt`, looping
     /// forever until `stop` flips to `true` (or the receiver is dropped). Reuses
     /// [`ivr::rtp_frame`] for RTP packetisation, mirroring the ringback/`play` loops.
-    #[allow(dead_code)] // spliced into the held-leg bridge / queue-wait loop (follow-up)
     pub async fn stream_until(
         &self,
         sock: &UdpSocket,

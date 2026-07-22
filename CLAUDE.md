@@ -83,7 +83,10 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   `SipServer::execute_ring_plan`; `RING_ALL` rings all registered members **simultaneously**
   (`SipServer::fork_bridge`: parallel INVITEs raced on one task via `poll_fn`, first 2xx wins,
   losers `CANCEL`led — `try_bridge` takes an optional cancel `watch` receiver). MoH engine is
-  `sip/moh.rs` (load/synth/stream); live hold-bridge injection is TODO.
+  `sip/moh.rs` (load/synth/stream). A `queue:<uuid>` caller is answered early and handed to
+  `SipServer::queue_wait_driver` (greeting + MoH + announcements, rings registered queue members
+  via `ivr_transfer`, overflows after `max_wait_ms`); wait policy is the pure `sip/queuewait.rs`.
+  Live hold-bridge MoH injection (for a *bridged* caller on hold) is still TODO.
 - **Voicemail-to-email** — `control/smtp.rs` (hand-rolled pure-Rust SMTP submission client, like
   `webhook_delivery.rs`) + `control/voicemail_email.rs` (a `VoicemailReceived` bus subscriber that
   resolves the mailbox → `smtp.mailboxes` recipient and emails a WAV). Config: `smtp:` section.
