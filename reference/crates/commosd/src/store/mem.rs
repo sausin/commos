@@ -16,6 +16,7 @@ use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::did::Did;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::forwarding::Forwarding;
 use commos_core::entities::gateway::Gateway;
 use commos_core::entities::ivr::Ivr;
 use commos_core::entities::message::Message;
@@ -24,6 +25,7 @@ use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
+use commos_core::entities::ring_group::RingGroup;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -108,6 +110,10 @@ struct Inner {
     cdr_order: Vec<(Uuid, Uuid)>,
     queues: HashMap<(Uuid, Uuid), Queue>,
     queue_order: Vec<(Uuid, Uuid)>,
+    ring_groups: HashMap<(Uuid, Uuid), RingGroup>,
+    ring_group_order: Vec<(Uuid, Uuid)>,
+    forwardings: HashMap<(Uuid, Uuid), Forwarding>,
+    forwarding_order: Vec<(Uuid, Uuid)>,
     /// Routing programs — CallFlows, IVR nodes, and the append-only CallFlow revision log.
     call_flows: HashMap<(Uuid, Uuid), CallFlow>,
     call_flow_order: Vec<(Uuid, Uuid)>,
@@ -265,6 +271,26 @@ impl Store for MemStore {
                 }
             } else if q.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "Queue", id: q.base.id.to_string(), expected: 0 });
+            }
+        }
+        for rg in &tx.ring_groups {
+            let key = (rg.base.tenant_id, rg.base.id);
+            if let Some(existing) = g.ring_groups.get(&key) {
+                if rg.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "RingGroup", id: rg.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if rg.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "RingGroup", id: rg.base.id.to_string(), expected: 0 });
+            }
+        }
+        for f in &tx.forwardings {
+            let key = (f.base.tenant_id, f.base.id);
+            if let Some(existing) = g.forwardings.get(&key) {
+                if f.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Forwarding", id: f.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if f.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Forwarding", id: f.base.id.to_string(), expected: 0 });
             }
         }
         // CallFlows and IVRs support in-place update (edit/publish/rollback bump the version).
@@ -464,6 +490,20 @@ impl Store for MemStore {
                 g.queue_order.push(key);
             }
             g.queues.insert(key, q);
+        }
+        for rg in tx.ring_groups {
+            let key = (rg.base.tenant_id, rg.base.id);
+            if !g.ring_groups.contains_key(&key) {
+                g.ring_group_order.push(key);
+            }
+            g.ring_groups.insert(key, rg);
+        }
+        for f in tx.forwardings {
+            let key = (f.base.tenant_id, f.base.id);
+            if !g.forwardings.contains_key(&key) {
+                g.forwarding_order.push(key);
+            }
+            g.forwardings.insert(key, f);
         }
         for cf in tx.call_flows {
             let key = (cf.base.tenant_id, cf.base.id);
@@ -756,6 +796,42 @@ impl Store for MemStore {
     async fn list_queues(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Queue>, StoreError> {
         let g = self.inner.lock().expect("store mutex not poisoned");
         Ok(page_from(&g.queue_order, |k| g.queues.get(k).cloned(), tenant, limit, cursor))
+    }
+
+    async fn get_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<Option<RingGroup>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.ring_groups.get(&(tenant, id)).cloned())
+    }
+    async fn list_ring_groups(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<RingGroup>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.ring_group_order, |k| g.ring_groups.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.ring_groups.remove(&key).is_some();
+        if removed {
+            g.ring_group_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+
+    async fn get_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<Option<Forwarding>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.forwardings.get(&(tenant, id)).cloned())
+    }
+    async fn list_forwardings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Forwarding>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.forwarding_order, |k| g.forwardings.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.forwardings.remove(&key).is_some();
+        if removed {
+            g.forwarding_order.retain(|k| k != &key);
+        }
+        Ok(removed)
     }
 
     async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError> {

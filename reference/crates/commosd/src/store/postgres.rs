@@ -17,11 +17,13 @@ use commos_core::entities::cdr::Cdr;
 use commos_core::entities::channel::Channel;
 use commos_core::entities::device::Device;
 use commos_core::entities::extension::Extension;
+use commos_core::entities::forwarding::Forwarding;
 use commos_core::entities::message::Message;
 use commos_core::entities::object::Object;
 use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
+use commos_core::entities::ring_group::RingGroup;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -127,6 +129,26 @@ CREATE TABLE IF NOT EXISTS queues (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queues_tenant_id_idx ON queues (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS ring_groups (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ring_groups_tenant_id_idx ON ring_groups (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS forwardings (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS forwardings_tenant_id_idx ON forwardings (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS call_flows (
     id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
@@ -585,6 +607,12 @@ impl Store for PgStore {
         for q in &tx.queues {
             upsert(&mut dbtx, "queues", "Queue", &q.base, &serde_json::to_value(q).map_err(be)?).await?;
         }
+        for rg in &tx.ring_groups {
+            upsert(&mut dbtx, "ring_groups", "RingGroup", &rg.base, &serde_json::to_value(rg).map_err(be)?).await?;
+        }
+        for f in &tx.forwardings {
+            upsert(&mut dbtx, "forwardings", "Forwarding", &f.base, &serde_json::to_value(f).map_err(be)?).await?;
+        }
         for cf in &tx.call_flows {
             upsert(&mut dbtx, "call_flows", "CallFlow", &cf.base, &serde_json::to_value(cf).map_err(be)?).await?;
         }
@@ -912,6 +940,50 @@ impl Store for PgStore {
             None
         };
         Ok(Page { items, next_cursor })
+    }
+
+    async fn get_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<Option<RingGroup>, StoreError> {
+        let row = sqlx::query("SELECT data FROM ring_groups WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_ring_groups(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<RingGroup>, StoreError> {
+        let items = self.list_entities::<RingGroup>("ring_groups", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|rg| rg.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM ring_groups WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<Option<Forwarding>, StoreError> {
+        let row = sqlx::query("SELECT data FROM forwardings WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_forwardings(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Forwarding>, StoreError> {
+        let items = self.list_entities::<Forwarding>("forwardings", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|f| f.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM forwardings WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError> {

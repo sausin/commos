@@ -18,6 +18,7 @@ pub mod rating;
 pub mod recordings;
 pub mod realtime;
 pub mod registrations;
+pub mod ringing;
 pub mod routing;
 pub mod trunking;
 pub mod voicemail;

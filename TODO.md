@@ -26,6 +26,27 @@ L ≈ multi-week.
 | 9 | **Queue caller experience** | M | Position/wait announcements, queue MoH, callback. ACD assigns agents but gives the caller no treatment. |
 | 10 | **WebRTC softphone endpoint** | L | Spec'd first-class (CMOS-07-SIP-051); unlocks browser calling + a user portal. |
 
+### Parked — hospitality / multi-tenant hardening (added 2026-07, not yet started)
+These graduate to their own specs/branches. Grouped because a hotel/serviced-office deployment
+needs all three, and two of them extend surfaces that already exist.
+- **Checkout privacy purge** (S/M) — On guest checkout, delete the call logs (CDRs) **and**
+  voicemails belonging to an extension/number. Without it, the next guest inherits the previous
+  guest's call history and messages — a real privacy exposure. Natural home: alongside the
+  check-in/checkout path (`POST /v1/onboarding/reboot-extension`, `control/onboarding.rs`). Needs a
+  scoped purge that removes CDRs + `Voicemail` rows + their stored audio objects for a mailbox, with
+  an audit event.
+- **Provisioning directory / phonebook alignment** (S) — Push the platform directory
+  (`api/directory.rs` already knows the users/extensions) to the phones as a **remote phonebook**
+  during provisioning. Today `api/provision.rs` writes SIP/NTP/lockdown config but never a contact
+  list, so handsets come up with empty directories. Yealink (`remote_phonebook`) and Grandstream
+  (XML phonebook download) both take a URL — add a phonebook XML endpoint + per-vendor template.
+- **Class-of-service / call gating & whitelisting** (M) — Per-extension / per-group call-permission
+  matrix: restrict which destinations an endpoint may dial — no direct inter-guest calls, no
+  trunk/external calls from a room phone, block specific internal targets (e.g. kitchen staff).
+  Extends `control/policy.rs` from *tenant-wide* fraud guardrails (international, concurrency,
+  emergency) to a *per-endpoint* class-of-service checked on the INVITE path. Hospitality-driven but
+  broadly useful (kiosk phones, lobby phones, department restrictions).
+
 ### Honorable mentions
 - **SIP-layer security / rate-limiting** (fail2ban-style, SIP flood protection) — Missing, and a real
   risk once 5060 faces a network (README already warns about this). Auth-level fraud guardrails exist
