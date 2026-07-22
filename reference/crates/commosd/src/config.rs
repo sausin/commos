@@ -161,6 +161,19 @@ pub struct Config {
     #[serde(default)]
     pub sounds_dir: Option<String>,
 
+    /// Whether callers on hold (and, later, waiting in a queue) hear music-on-hold. When true
+    /// (the default) a held caller hears the hold loop from [`Config::moh_dir`] (or a
+    /// synthesised tune if none is installed) instead of silence.
+    #[serde(default = "default_true")]
+    pub music_on_hold: bool,
+
+    /// Directory holding music-on-hold audio as raw G.711 μ-law `.ulaw` files (all files are
+    /// concatenated, sorted by name, into one loop). `None` (the default) resolves to
+    /// `{data_dir}/moh`; when it is absent/empty a gentle synthesised tune is used so hold is
+    /// never dead air.
+    #[serde(default)]
+    pub moh_dir: Option<String>,
+
     /// Path to a plain-text file whose contents become the **display name** shown on a phone when
     /// CommOS places the call (the identity the called handset renders — otherwise the bare
     /// "commos"). One non-empty line → that text on every call; multiple lines → one picked per
@@ -233,6 +246,15 @@ impl Config {
         match &self.sounds_dir {
             Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
             _ => format!("{}/sounds", self.data_dir.trim_end_matches('/')),
+        }
+    }
+
+    /// Directory holding music-on-hold audio. Explicit `moh_dir` wins; otherwise it is
+    /// `{data_dir}/moh` — the same `data_dir`-relative convention as the sounds/objects dirs.
+    pub fn moh_dir(&self) -> String {
+        match &self.moh_dir {
+            Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
+            _ => format!("{}/moh", self.data_dir.trim_end_matches('/')),
         }
     }
 
@@ -369,6 +391,8 @@ impl Default for Config {
             database_url: None,
             data_dir: default_data_dir(),
             sounds_dir: None,
+            music_on_hold: true,
+            moh_dir: None,
             display_name_file: None,
             object_storage: None,
             s3_endpoint: None,

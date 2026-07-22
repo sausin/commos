@@ -281,6 +281,12 @@ async fn run(cfg: Config) -> i32 {
     if cfg.sip_listen.is_some() || cfg.sips_listen.is_some() {
         let default_tenant = commos_core::common::Uuid::parse(SIP_DEFAULT_TENANT)
             .expect("valid default SIP tenant");
+        // Load the music-on-hold loop once (operator `.ulaw` files, or a synthesised tune).
+        let moh = std::sync::Arc::new(sip::moh::MohSource::load(&cfg.moh_dir()));
+        tracing::info!(
+            synthesised = moh.synthesised, loop_ms = moh.loop_ms(), enabled = cfg.music_on_hold,
+            "music-on-hold source loaded"
+        );
         let server = std::sync::Arc::new(sip::SipServer::new(
             registrations.clone(),
             routing.clone(),
@@ -301,6 +307,8 @@ async fn run(cfg: Config) -> i32 {
             cfg.trunk_srtp,
             cfg.sounds_dir(),
             cfg.display_name_file(),
+            moh,
+            cfg.music_on_hold,
         ));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");

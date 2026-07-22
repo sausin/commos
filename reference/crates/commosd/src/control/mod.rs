@@ -20,6 +20,7 @@ pub mod realtime;
 pub mod registrations;
 pub mod ringing;
 pub mod ringplan;
+pub mod ringresolve;
 pub mod routing;
 pub mod smtp;
 pub mod voicemail_email;

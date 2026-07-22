@@ -255,6 +255,13 @@ pub struct SipServer {
     /// the text a called phone shows as the calling party instead of the bare "commos". Re-read
     /// per call so edits apply live; absent/empty → the default "commos".
     display_name_file: String,
+    /// Music-on-hold source (loaded once at boot from `{data_dir}/moh`, or synthesised) and
+    /// whether hold music is enabled. Streamed to a held/waiting caller instead of silence.
+    moh: Arc<super::moh::MohSource>,
+    music_on_hold: bool,
+    /// Per-call rotation counter for hunt-group / round-robin member ordering (the pure ring
+    /// planner takes this as its rotation input, spreading load across successive calls).
+    ring_rotation: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SipServer {
@@ -279,6 +286,8 @@ impl SipServer {
         trunk_srtp: bool,
         sounds_dir: impl Into<String>,
         display_name_file: impl Into<String>,
+        moh: Arc<super::moh::MohSource>,
+        music_on_hold: bool,
     ) -> Self {
         SipServer {
             registrations,
@@ -303,6 +312,9 @@ impl SipServer {
             trunk_srtp,
             sounds_dir: sounds_dir.into(),
             display_name_file: display_name_file.into(),
+            moh,
+            music_on_hold,
+            ring_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
