@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 
 /// The default registration lifetime when a REGISTER carries no `Expires` header and no
 /// `expires=` contact parameter (RFC 3261 §10.2 / §20.19 recommend one hour).
@@ -595,6 +596,20 @@ fn dialog_tag(seed: &str) -> String {
     let mut h = DefaultHasher::new();
     seed.hash(&mut h);
     format!("cmos{:016x}", h.finish())
+}
+
+/// Build the topmost `Via` for a locally-originated (UAC) request — the INVITE/ACK/BYE CommOS
+/// sends toward a callee or carrier. `sent_by` is our **reachable** `ip:port` (the address of the
+/// very socket we send from and await the response on), so the peer's `100`/`180`/`200` come back
+/// to us; `;rport` (RFC 3581) additionally has the peer answer to the packet's source, surviving
+/// NAT and a slightly-off advertised address. The branch is a fresh CSPRNG magic-cookie token.
+///
+/// Passing this as the `Via` header to [`request`] is mandatory for any request whose response we
+/// actually wait for: without it, `request` falls back to an unresolvable `commos.invalid` sent-by
+/// and the peer's responses (including the callee's answer) are silently lost — the call then
+/// looks unanswered and wrongly diverts to voicemail.
+pub fn via_header(sent_by: SocketAddr) -> String {
+    format!("SIP/2.0/UDP {sent_by};rport;branch=z9hG4bK{}", rand_tag())
 }
 
 /// A CSPRNG-backed opaque token (128 bits, hex) for a locally-originated request's Via branch,

@@ -50,7 +50,7 @@ pub async fn metrics(State(st): State<AppState>) -> impl axum::response::IntoRes
         .max(0) as u64;
     let body = st.metrics.render(
         uptime,
-        env!("CARGO_PKG_VERSION"),
+        env!("COMMOS_VERSION"),
         std::env::consts::ARCH,
         st.registrations.total(),
     );
@@ -64,7 +64,7 @@ pub async fn metrics(State(st): State<AppState>) -> impl axum::response::IntoRes
 pub async fn info(State(st): State<AppState>) -> Json<Info> {
     Json(Info {
         product: "commosd",
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("COMMOS_VERSION"),
         spec_version: commos_core::event::SPEC_VERSION,
         topology: "single-binary",
         started_at: st.started_at.to_string(),

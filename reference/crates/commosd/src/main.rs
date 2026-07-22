@@ -139,12 +139,12 @@ fn parse_args() -> Result<PathBuf, i32> {
                     "commosd {} — CommOS single-binary\n\n\
                      USAGE:\n  commosd [--config <pbx.yaml>]\n\n\
                      ENV:\n  RUST_LOG   override log level\n",
-                    env!("CARGO_PKG_VERSION")
+                    env!("COMMOS_VERSION")
                 );
                 return Err(exit::OK);
             }
             "--version" => {
-                println!("commosd {}", env!("CARGO_PKG_VERSION"));
+                println!("commosd {}", env!("COMMOS_VERSION"));
                 return Err(exit::OK);
             }
             other => {
@@ -465,7 +465,7 @@ async fn run(cfg: Config) -> i32 {
     app_state.set_ready(true);
     tracing::info!(
         addr = %bind,
-        version = env!("CARGO_PKG_VERSION"),
+        version = env!("COMMOS_VERSION"),
         arch = std::env::consts::ARCH,
         "commosd ready"
     );
