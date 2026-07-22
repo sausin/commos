@@ -237,6 +237,15 @@ impl Config {
             _ => format!("{}/display_name.txt", self.data_dir.trim_end_matches('/')),
         }
     }
+
+    /// Directory of optional operator-supplied provisioning overlays, `{data_dir}/provision`
+    /// (same `data_dir`-relative convention as everything else). A `<vendor>.cfg` file there
+    /// (e.g. `grandstream.cfg`, `yealink.cfg`) holds vendor-native `KEY = VALUE` lines that are
+    /// appended to that vendor's generated phone config — the import hook for hardware-specific
+    /// settings CommOS does not model (LCD backlight, screensaver, …). Absent → nothing appended.
+    pub fn provision_dir(&self) -> String {
+        format!("{}/provision", self.data_dir.trim_end_matches('/'))
+    }
 }
 
 /// A reference to a secret held in an external manager (Vault / KMS / 1Password, Volume 9).

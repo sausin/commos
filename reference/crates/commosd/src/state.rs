@@ -74,6 +74,10 @@ pub struct AppState {
     /// Resolved admin (web-UI) password written into provisioned phone configs to lock the
     /// handset down against tampering. `None` → the phone's web password is left untouched.
     pub phone_admin_password: Option<String>,
+    /// Directory of optional operator-supplied provisioning overlays (`{data_dir}/provision`).
+    /// A `<vendor>.cfg` there is appended to that vendor's generated phone config — the import
+    /// hook for hardware-specific settings CommOS does not model.
+    pub provision_dir: String,
     /// Human-readable description of the system of record (e.g. the SQLite file path), surfaced
     /// to the operator at the end of onboarding so they know where their configuration lives.
     pub storage_location: String,
@@ -113,6 +117,7 @@ impl AppState {
         ntp_server: Option<String>,
         timezone: Option<String>,
         phone_admin_password: Option<String>,
+        provision_dir: String,
         storage_location: String,
         bus: EventBus,
         recent: RecentEvents,
@@ -141,6 +146,7 @@ impl AppState {
             ntp_server,
             timezone,
             phone_admin_password,
+            provision_dir,
             storage_location,
             bus,
             recent,

@@ -233,6 +233,12 @@ pub async fn provision(
         .as_deref()
         .filter(|s| !s.trim().is_empty());
 
+    // 5e. Optional operator-supplied overlay: vendor-native `KEY = VALUE` lines from
+    //     `{data_dir}/provision/<vendor>.cfg`, appended to the generated config (and overriding
+    //     CommOS's own values on collision). The import hook for hardware-specific settings CommOS
+    //     does not model — LCD backlight, screensaver, ringtones, … Missing file → empty → no-op.
+    let overlay = load_overlay(&st.provision_dir, &vendor).await;
+
     // 6. Render the vendor-specific config. Format, body, and Content-Type depend on the vendor
     //    and on the filename the phone asked for (Grandstream's `cfg<mac>.xml` wants XML).
     let (content_type, body) = render(
@@ -247,6 +253,7 @@ pub async fn provision(
         &ntp_server,
         timezone.as_deref(),
         admin_password,
+        &overlay,
     );
     tracing::info!(
         mac = %mac,
@@ -338,6 +345,57 @@ async fn find_account(
     }
 }
 
+/// Load an operator-supplied overlay for `vendor` from `{provision_dir}/<vendor>.cfg`.
+///
+/// The file is a set of vendor-native `KEY = VALUE` lines (Grandstream P-codes, Yealink dotted
+/// keys) — the import hook for hardware-specific settings CommOS does not model. Absent or
+/// unreadable file → empty (a no-op): the overlay is optional and never fails a provisioning
+/// request. Parsing is delegated to [`parse_overlay`].
+async fn load_overlay(provision_dir: &str, vendor: &str) -> Vec<(String, String)> {
+    let path = format!("{}/{}.cfg", provision_dir.trim_end_matches('/'), vendor);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => {
+            let pairs = parse_overlay(&text);
+            if !pairs.is_empty() {
+                tracing::debug!(vendor = %vendor, path = %path, lines = pairs.len(), "provisioning overlay loaded");
+            }
+            pairs
+        }
+        // The common case is "no overlay configured" — not an error worth logging.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse an overlay file body into `(key, value)` pairs.
+///
+/// One `KEY = VALUE` (or `KEY=VALUE`) per line; blank lines and `#`/`;` comment lines are
+/// ignored. The value is the remainder after the first `=`, trimmed (so values may contain `=`).
+/// Keys are restricted to a simple token (`A–Z a–z 0–9 _ . -`) so a stray line can never break the
+/// Grandstream XML document it may be injected into; malformed lines are skipped, not fatal.
+fn parse_overlay(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            continue;
+        }
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
+}
+
 /// Render a provisioning config for `vendor`, returning `(content_type, body)`.
 ///
 /// Data-driven: the `match` on `vendor` (a lowercase `Device.vendor_key`) selects the format.
@@ -353,7 +411,9 @@ async fn find_account(
 /// only when none was minted); `ntp_server` is the time source the phone syncs its clock from,
 /// `timezone` (when `Some`) is the POSIX TZ the phone displays local time in, and `admin_password`
 /// (when `Some`) is the handset web-UI password used to lock the phone down against tampering.
-/// Every form also points the Message/voicemail key at the [`VOICEMAIL_ACCESS_CODE`].
+/// Every form also points the Message/voicemail key at the [`VOICEMAIL_ACCESS_CODE`]. Finally,
+/// `overlay` is the operator-supplied vendor-native `(key, value)` pairs appended last (so they
+/// override CommOS's own values on collision) — the import hook for hardware-specific settings.
 #[allow(clippy::too_many_arguments)]
 fn render(
     vendor: &str,
@@ -367,23 +427,24 @@ fn render(
     ntp_server: &str,
     timezone: Option<&str>,
     admin_password: Option<&str>,
+    overlay: &[(String, String)],
 ) -> (String, String) {
     let plain = "text/plain; charset=utf-8".to_string();
     match vendor {
-        "yealink" => (plain, render_yealink(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password)),
+        "yealink" => (plain, render_yealink(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password, overlay)),
         // Grandstream fetches `cfg<mac>.xml` (XML) and `cfg<mac>` (plain-text P-values); serve the
         // shape it asked for so both the modern (XML) and legacy (plain P-value) paths register.
         "grandstream" if wants_xml => (
             "text/xml; charset=utf-8".to_string(),
-            render_grandstream_xml(mac, ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password),
+            render_grandstream_xml(mac, ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password, overlay),
         ),
         "grandstream" => (
             plain,
-            render_grandstream(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password),
+            render_grandstream(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password, overlay),
         ),
         // polycom / unknown / no device / anything else → generic fallback. The generic INI has
         // no portable web-UI-password key, so `admin_password` is intentionally not emitted here.
-        _ => (plain, render_generic(ext_number, display_name, secret, registrar, port, ntp_server, timezone)),
+        _ => (plain, render_generic(ext_number, display_name, secret, registrar, port, ntp_server, timezone, overlay)),
     }
 }
 
@@ -396,7 +457,7 @@ fn render(
 /// `static.security.user_password = admin:<pw>` locks the phone's web UI against tampering.
 /// Signature line: `account.1.sip_server.1.address`.
 #[allow(clippy::too_many_arguments)]
-fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>) -> String {
+fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>, overlay: &[(String, String)]) -> String {
     let mut out = format!(
         "#!version:1.0.0.1\n\
          # CommOS auto-provisioning config (Yealink)\n\
@@ -412,6 +473,9 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
          account.1.sip_server.1.expires = 3600\n\
          # The Message key dials the voicemail retrieval code.\n\
          voice_mail.number.1 = {vm}\n\
+         # Honour an unsolicited check-sync NOTIFY so CommOS can reboot/re-provision the phone\n\
+         # remotely (onboarding + guest check-in/checkout).\n\
+         sip.notify_reboot_enable = 1\n\
          # Sync the clock from the internal NTP source.\n\
          local_time.ntp_server1 = {ntp}\n",
         number = ext_number,
@@ -427,6 +491,12 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
     }
     if let Some(pw) = admin_password {
         out.push_str(&format!("# Lock the phone's web UI so guests cannot change its settings.\nstatic.security.user_password = admin:{pw}\n"));
+    }
+    if !overlay.is_empty() {
+        out.push_str("# Operator-supplied hardware settings (provision/yealink.cfg).\n");
+        for (key, value) in overlay {
+            out.push_str(&format!("{key} = {value}\n"));
+        }
     }
     out
 }
@@ -487,10 +557,16 @@ fn grandstream_pvalues(
 /// handset consumes from the no-extension `cfg<mac>` (and `cfg<mac>.cfg`) request. Signature line:
 /// `P47 = <registrar>`.
 #[allow(clippy::too_many_arguments)]
-fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>) -> String {
+fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>, overlay: &[(String, String)]) -> String {
     let mut out = String::from("# CommOS auto-provisioning config (Grandstream, plain-text P-values)\n");
     for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password) {
         out.push_str(&format!("{code} = {value}\n"));
+    }
+    if !overlay.is_empty() {
+        out.push_str("# Operator-supplied hardware settings (provision/grandstream.cfg).\n");
+        for (code, value) in overlay {
+            out.push_str(&format!("{code} = {value}\n"));
+        }
     }
     out
 }
@@ -500,7 +576,7 @@ fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, regist
 /// provisioning schema. The `<mac>` element lets the handset validate the file is meant for it;
 /// values are XML-escaped. Signature line: `<P47>`.
 #[allow(clippy::too_many_arguments)]
-fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>) -> String {
+fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>, admin_password: Option<&str>, overlay: &[(String, String)]) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
     out.push_str("<!-- CommOS auto-provisioning config (Grandstream XML) -->\n");
     out.push_str("<gs_provision version=\"1\">\n");
@@ -508,6 +584,12 @@ fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secre
     out.push_str("  <config version=\"1\">\n");
     for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server, timezone, admin_password) {
         out.push_str(&format!("    <{code}>{}</{code}>\n", xml_escape(&value)));
+    }
+    // Operator overlay (provision/grandstream.cfg): the same `Pxxx = value` pairs, wrapped as XML
+    // elements so the hardware-specific settings apply to the XML provisioning path too. Keys are
+    // token-validated in `parse_overlay`, so they are safe as element names; values are escaped.
+    for (code, value) in overlay {
+        out.push_str(&format!("    <{code}>{}</{code}>\n", xml_escape(value)));
     }
     out.push_str("  </config>\n");
     out.push_str("</gs_provision>\n");
@@ -524,12 +606,13 @@ fn xml_escape(s: &str) -> String {
 /// The original generic, vendor-neutral INI block — the fallback for polycom / unknown / no
 /// device. INI-style `key=value` with `#` comments, a shape most phones and config converters
 /// accept. Signature line: `[account]`.
-fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_host: &str, registrar_port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
+#[allow(clippy::too_many_arguments)]
+fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_host: &str, registrar_port: u16, ntp_server: &str, timezone: Option<&str>, overlay: &[(String, String)]) -> String {
     let timezone_line = match timezone {
         Some(tz) => format!("# Local timezone (POSIX TZ) so the displayed clock is not UTC.\ntimezone={tz}\n"),
         None => String::new(),
     };
-    format!(
+    let mut out = format!(
         "# CommOS auto-provisioning config\n\
          # Generic, vendor-neutral form. Vendor-specific formats (Yealink/Grandstream) are\n\
          # served when the bound Device's vendor_key is known; a converter can map these keys.\n\
@@ -564,7 +647,14 @@ fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_
         registrar_port = registrar_port,
         ntp = ntp_server,
         timezone_line = timezone_line,
-    )
+    );
+    if !overlay.is_empty() {
+        out.push_str("\n[custom]\n# Operator-supplied hardware settings (provision/<vendor>.cfg).\n");
+        for (key, value) in overlay {
+            out.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    out
 }
 
 /// Build a `text/plain; charset=utf-8` response. Used for all error paths.
@@ -723,7 +813,7 @@ mod tests {
 
     #[test]
     fn render_yealink_has_signature_and_account() {
-        let (ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None, None);
+        let (ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None, None, &[]);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Yealink signature line.
         assert!(body.contains("account.1.sip_server.1.address = 10.0.0.5"));
@@ -736,6 +826,8 @@ mod tests {
         assert!(body.contains("account.1.display_name = Front Desk"));
         // The Message key dials the *97 voicemail retrieval code.
         assert!(body.contains("voice_mail.number.1 = *97"));
+        // The phone honours a remote check-sync reboot/re-provision NOTIFY.
+        assert!(body.contains("sip.notify_reboot_enable = 1"));
         // The phone is pointed at the internal NTP source for time.
         assert!(body.contains("local_time.ntp_server1 = 10.0.0.5"));
         // No timezone configured → no timezone directive emitted.
@@ -747,7 +839,7 @@ mod tests {
     #[test]
     fn render_yealink_emits_timezone_when_set() {
         // A dedicated internal NTP server + a POSIX timezone: both flow into the Yealink config.
-        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.20", Some("PST8PDT"), None);
+        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.20", Some("PST8PDT"), None, &[]);
         // NTP points at the configured internal appliance, not the registrar.
         assert!(body.contains("local_time.ntp_server1 = 10.0.0.20"));
         assert!(body.contains("local_time.time_zone_name = PST8PDT"));
@@ -756,13 +848,13 @@ mod tests {
     #[test]
     fn render_yealink_locks_web_ui_when_admin_password_set() {
         // A configured admin password locks the handset's web UI against guest tampering.
-        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None, Some("h0tel-lock"));
+        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None, Some("h0tel-lock"), &[]);
         assert!(body.contains("static.security.user_password = admin:h0tel-lock"));
     }
 
     #[test]
     fn render_grandstream_emits_real_pvalues() {
-        let (ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None);
+        let (ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None, &[]);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Real Grandstream plain-text P-values the handset consumes — not the old readable block.
         assert!(body.contains("P271 = 1")); // account active
@@ -787,28 +879,28 @@ mod tests {
 
     #[test]
     fn render_grandstream_locks_web_ui_when_admin_password_set() {
-        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, Some("h0tel-lock"));
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, Some("h0tel-lock"), &[]);
         // P2 is the web-UI admin password.
         assert!(body.contains("P2 = h0tel-lock"));
     }
 
     #[test]
     fn render_grandstream_emits_p64_timezone_when_set() {
-        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.20", Some("CET-1CEST"), None);
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.20", Some("CET-1CEST"), None, &[]);
         assert!(body.contains("P30 = 10.0.0.20")); // NTP → configured internal appliance
         assert!(body.contains("P64 = CET-1CEST")); // self-defined timezone
     }
 
     #[test]
     fn render_grandstream_appends_nonstandard_port_to_p47() {
-        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5070, "10.0.0.6", None, None);
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5070, "10.0.0.6", None, None, &[]);
         // A non-default SIP port rides on the server field as host:port.
         assert!(body.contains("P47 = 10.0.0.6:5070"));
     }
 
     #[test]
     fn render_grandstream_xml_wraps_the_same_pvalues() {
-        let (ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", Some("GMT0"), None);
+        let (ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", Some("GMT0"), None, &[]);
         // Served as XML so the handset parses it as its cfg<mac>.xml document.
         assert_eq!(ct, "text/xml; charset=utf-8");
         // Timezone flows through as an XML P64 element when configured.
@@ -831,7 +923,7 @@ mod tests {
     #[test]
     fn grandstream_xml_escapes_special_characters() {
         // A display name with XML metacharacters must not break the document.
-        let (_ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "A&B <Front>", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None);
+        let (_ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "A&B <Front>", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None, &[]);
         assert!(body.contains("<P270>A&amp;B &lt;Front&gt;</P270>"));
         assert!(!body.contains("<Front>"));
     }
@@ -846,7 +938,7 @@ mod tests {
 
     #[test]
     fn render_polycom_falls_back_to_generic() {
-        let (ct, body) = render("polycom", false, "aabbccddeeff", "1003", "Ext 1003", "s3cr3t", "10.0.0.7", 5060, "10.0.0.7", Some("EST5EDT"), None);
+        let (ct, body) = render("polycom", false, "aabbccddeeff", "1003", "Ext 1003", "s3cr3t", "10.0.0.7", 5060, "10.0.0.7", Some("EST5EDT"), None, &[]);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Generic signature: INI [account] section, not vendor-specific keys.
         assert!(body.contains("[account]"));
@@ -862,12 +954,73 @@ mod tests {
 
     #[test]
     fn render_unknown_vendor_falls_back_to_generic() {
-        let (_ct, body) = render("unknown", false, "aabbccddeeff", "1004", "Warehouse", "s3cr3t", "10.0.0.8", 5060, "10.0.0.8", None, None);
+        let (_ct, body) = render("unknown", false, "aabbccddeeff", "1004", "Warehouse", "s3cr3t", "10.0.0.8", 5060, "10.0.0.8", None, None, &[]);
         assert!(body.contains("[account]"));
         assert!(body.contains("registrar=10.0.0.8"));
         // Display name flows into the generic block too.
         assert!(body.contains("display_name=Warehouse"));
         // No timezone configured → no timezone directive.
         assert!(!body.contains("timezone="));
+    }
+
+    #[test]
+    fn parse_overlay_reads_pairs_and_skips_noise() {
+        let text = "# a comment\n; another\n\nP1350 = 1\n  P1348 =  3 \nphone_setting.backlight_time.1 = 30\nnot a pair line\n= novalue\nbad key! = x\n";
+        let pairs = parse_overlay(text);
+        assert_eq!(
+            pairs,
+            vec![
+                ("P1350".to_string(), "1".to_string()),
+                ("P1348".to_string(), "3".to_string()),
+                ("phone_setting.backlight_time.1".to_string(), "30".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_overlay_keeps_equals_in_value() {
+        // Only the first `=` splits key/value, so a value may itself contain `=`.
+        let pairs = parse_overlay("P64 = GMT-5:30=odd\n");
+        assert_eq!(pairs, vec![("P64".to_string(), "GMT-5:30=odd".to_string())]);
+    }
+
+    #[test]
+    fn render_grandstream_appends_overlay_and_lets_it_override() {
+        let overlay = vec![
+            ("P1350".to_string(), "1".to_string()),   // a hardware setting CommOS does not model
+            ("P330".to_string(), "*98".to_string()),  // deliberately collides with the built-in
+        ];
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None, &overlay);
+        // The operator's extra P-value is emitted.
+        assert!(body.contains("P1350 = 1"));
+        // Both the built-in and the override are present; the override is emitted last so the
+        // phone (last-value-wins) honours it.
+        let builtin = body.find("P330 = *97").expect("built-in P330 present");
+        let override_ = body.find("P330 = *98").expect("overlay P330 present");
+        assert!(override_ > builtin, "overlay must come after the built-in value");
+    }
+
+    #[test]
+    fn render_grandstream_xml_wraps_overlay_as_elements() {
+        let overlay = vec![("P1350".to_string(), "1".to_string())];
+        let (_ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None, None, &overlay);
+        // The overlay is wrapped as an XML element, not a plain `P.. = ..` line.
+        assert!(body.contains("<P1350>1</P1350>"));
+        assert!(!body.contains("P1350 = 1"));
+    }
+
+    #[test]
+    fn render_yealink_appends_overlay() {
+        let overlay = vec![("phone_setting.backlight_time.1".to_string(), "30".to_string())];
+        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None, None, &overlay);
+        assert!(body.contains("phone_setting.backlight_time.1 = 30"));
+    }
+
+    #[test]
+    fn render_generic_appends_overlay_in_custom_section() {
+        let overlay = vec![("brightness".to_string(), "5".to_string())];
+        let (_ct, body) = render("unknown", false, "aabbccddeeff", "1004", "Warehouse", "s3cr3t", "10.0.0.8", 5060, "10.0.0.8", None, None, &overlay);
+        assert!(body.contains("[custom]"));
+        assert!(body.contains("brightness=5"));
     }
 }

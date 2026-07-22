@@ -416,6 +416,7 @@ async fn run(cfg: Config) -> i32 {
         cfg.ntp_server.clone(),
         cfg.timezone.clone(),
         phone_admin_password,
+        cfg.provision_dir(),
         describe_storage(&cfg),
         bus.clone(),
         recent,
