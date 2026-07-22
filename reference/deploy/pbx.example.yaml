@@ -36,6 +36,14 @@ media_ip:    "127.0.0.1"        # RTP address advertised to phones. 127.0.0.1 = 
 #                              # Examples: "GMT0" (UTC), "GMT-5" (India, +5:30 needs "IST-5:30"),
 #                              # "CET-1CEST" (Central Europe), "EST5EDT" (US Eastern).
 
+# ── Phone lockdown (guest-facing / hospitality) ───────────────────────────────
+# Web-UI admin password pushed into every provisioned phone so a guest can't open the handset's
+# web page with the factory admin/admin and change SIP/network/dial settings. Referenced, never
+# inline (CMOS-14-DEP-083). Re-asserted on every re-provision, so a checkout re-provision (reboot
+# the phone) restores the locked baseline. Applied to Yealink + Grandstream; the generic form has
+# no portable key so it's skipped there. Unset → the phone's existing web password is left as-is.
+# phone_admin_password: { ref_uri: "file:///run/secrets/phone_admin" }   # or env://PHONE_ADMIN_PW
+
 # Optional SIP-over-TLS (SIPS) — requires a build with `--features tls`.
 # sips_listen:  "0.0.0.0:5061"
 # sip_tls_cert: "/etc/commos/tls/fullchain.pem"                 # public cert chain (plain path)

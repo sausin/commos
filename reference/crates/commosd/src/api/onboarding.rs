@@ -214,6 +214,55 @@ pub async fn reboot(
     Ok(Json(outcome))
 }
 
+/// Body for `POST /v1/onboarding/reboot-extension`.
+#[derive(Deserialize)]
+pub struct RebootExtensionBody {
+    /// The extension number whose currently-registered phone should reboot + re-provision.
+    pub number: String,
+}
+
+/// The result of a single-extension reboot.
+#[derive(Serialize)]
+pub struct RebootExtensionOutcome {
+    pub number: String,
+    pub rebooted: bool,
+    /// True when the phone challenged the NOTIFY and CommOS answered with its SIP credential
+    /// (the Grandstream path); false when it accepted the unauthenticated nudge.
+    pub authenticated: bool,
+}
+
+/// `POST /v1/onboarding/reboot-extension` — reboot the phone currently **registered** as `number`
+/// and make it re-fetch its config, via a `check-sync;reboot=true` NOTIFY sent to its registered
+/// contact. Unlike the discovery sweep, this answers a digest challenge with the extension's own
+/// SIP credential, so it works on phones that authenticate NOTIFY (Grandstream) — the reliable
+/// path for guest check-in/checkout, where re-provisioning restores the locked baseline.
+/// Privileged: requires an admin.
+pub async fn reboot_extension(
+    State(st): State<AppState>,
+    admin: AdminContext,
+    Json(body): Json<RebootExtensionBody>,
+) -> Result<Json<RebootExtensionOutcome>, Problem> {
+    use crate::sip::reboot::{reboot_registered, RebootResult};
+    let number = body.number.trim().to_string();
+    if number.is_empty() {
+        return Err(Problem::bad_request("number is required"));
+    }
+    match reboot_registered(&st.registrations, &st.store, st.media_ip, admin.tenant_id, &number).await {
+        RebootResult::NotRegistered => {
+            Err(Problem::not_found(format!("extension {number} is not registered — power the phone on so it registers first")))
+        }
+        RebootResult::Unreachable(why) => Err(Problem::internal(why)),
+        RebootResult::Challenged => Err(Problem::internal(format!(
+            "extension {number} demanded SIP NOTIFY authentication but no credential is on file to answer it"
+        ))),
+        RebootResult::Sent { authenticated } => Ok(Json(RebootExtensionOutcome {
+            number,
+            rebooted: true,
+            authenticated,
+        })),
+    }
+}
+
 /// `GET /onboarding` — a self-contained setup wizard page (unauthenticated, like the
 /// dashboard). Pick an environment and fleet size; it auto-detects the rest.
 pub async fn wizard() -> Html<&'static str> {

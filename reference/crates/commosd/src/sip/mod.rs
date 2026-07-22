@@ -29,6 +29,7 @@ pub mod dtmf;
 pub mod g711;
 pub mod ivr;
 pub mod message;
+pub mod reboot;
 pub mod rtp;
 pub mod sdes;
 pub mod server;

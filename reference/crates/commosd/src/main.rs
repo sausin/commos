@@ -254,6 +254,19 @@ async fn run(cfg: Config) -> i32 {
         },
         None => None,
     };
+    // Phone web-UI admin password (if referenced): resolved once here and pushed into every
+    // provisioned phone config so a guest cannot log into the handset and change its settings.
+    // A bad reference is fatal — better to fail startup than silently ship unlocked phones.
+    let phone_admin_password = match &cfg.phone_admin_password {
+        Some(secret) => match secret.resolve() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("{e}");
+                return exit::CONFIG;
+            }
+        },
+        None => None,
+    };
     let admin = api::admin::AdminAuth::new(admin_password);
     if admin.is_dev_mode() {
         tracing::warn!("admin auth: DEV MODE (no admin_password set) — any tenant bearer acts as admin");
@@ -402,6 +415,8 @@ async fn run(cfg: Config) -> i32 {
         cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
         cfg.ntp_server.clone(),
         cfg.timezone.clone(),
+        phone_admin_password,
+        cfg.provision_dir(),
         describe_storage(&cfg),
         bus.clone(),
         recent,

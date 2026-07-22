@@ -210,6 +210,31 @@ No XML. No per-vendor templates to hand-edit. No MAC-address spreadsheets. The o
 reads the network, flags likely IP phones by MAC vendor, and generates the DNS + DHCP lines to
 paste; each phone then fetches its own config and registers itself.
 
+The generated config carries more than a SIP account: the display name, the voicemail
+Message-key code (`*97`), an NTP time source + timezone, TR-069 turned off on Grandstream (so the
+handset stops warning "CPE connection failed" against an ACS that isn't there), and — when you set
+`phone_admin_password` — a locked web UI so guests can't retune the phone.
+
+**Phone clocks / NTP.** Phones sync time over NTP (which only carries UTC) and apply the
+configured `timezone` for local display. On an isolated phone LAN with no Internet they can't
+reach public NTP, so they need an *internal* source:
+
+- set `ntp_server:` in `pbx.yaml` to a reachable time server (typically your router), **or**
+- leave it unset — phones then sync from the CommOS host itself, which only works **if that host
+  runs an NTP service the phones can reach** (e.g. `chrony` with an `allow <phone-subnet>` line).
+  `scripts/install.sh` warns when you take this default so you don't end up with wrong clocks.
+
+If a phone shows the wrong time: unset `timezone` shows UTC; an unreachable NTP source shows a
+bogus clock. Fix the config, then reboot the phone so it re-provisions.
+
+**Hardware-specific settings (import hook).** CommOS models the settings every phone needs; for
+model-specific extras it doesn't model (LCD backlight, screensaver, ringtones, …), drop a
+vendor-native `KEY = VALUE` file at `{data_dir}/provision/<vendor>.cfg` (e.g.
+`provision/grandstream.cfg`). Those lines are appended to that vendor's generated config —
+including the Grandstream XML form — and override CommOS's own values on collision. The reliable
+way to author one is to configure a single handset via its web UI, export its config, and copy the
+lines you want; no code change, and nothing device-specific lives in the repo.
+
 ## Billing that attributes to people
 
 Extensions don't make calls — **people do.** Every billable action is attributed along the chain

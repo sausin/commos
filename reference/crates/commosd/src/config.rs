@@ -81,6 +81,16 @@ pub struct Config {
     #[serde(default)]
     pub timezone: Option<String>,
 
+    /// Admin (web-UI) password written into provisioned phone configs — a **reference**, never
+    /// inline (CMOS-14-DEP-083). When set, phones are locked down so a guest cannot open the
+    /// handset's web UI with the factory `admin`/`admin` and change SIP, network, or dial
+    /// settings ("funny business"); it is re-asserted on every re-provision, so a checkout
+    /// re-provision restores the locked state. Applied to Yealink (`static.security.user_password
+    /// = admin:<pw>`) and Grandstream (`P2`); the generic fallback has no portable key so it is
+    /// skipped there. `None` (the default) leaves the phone's existing web password untouched.
+    #[serde(default)]
+    pub phone_admin_password: Option<SecretRef>,
+
     /// Encrypt the RTP media path with SRTP (RFC 3711) when a caller offers it — the secure
     /// `RTP/SAVP` profile keyed by an SDES `a=crypto` line (RFC 4568, `AES_CM_128_HMAC_SHA1_80`).
     /// Default `true`: worth doing even on a trusted LAN, since it stops a passive sniffer from
@@ -227,6 +237,15 @@ impl Config {
             _ => format!("{}/display_name.txt", self.data_dir.trim_end_matches('/')),
         }
     }
+
+    /// Directory of optional operator-supplied provisioning overlays, `{data_dir}/provision`
+    /// (same `data_dir`-relative convention as everything else). A `<vendor>.cfg` file there
+    /// (e.g. `grandstream.cfg`, `yealink.cfg`) holds vendor-native `KEY = VALUE` lines that are
+    /// appended to that vendor's generated phone config — the import hook for hardware-specific
+    /// settings CommOS does not model (LCD backlight, screensaver, …). Absent → nothing appended.
+    pub fn provision_dir(&self) -> String {
+        format!("{}/provision", self.data_dir.trim_end_matches('/'))
+    }
 }
 
 /// A reference to a secret held in an external manager (Vault / KMS / 1Password, Volume 9).
@@ -300,6 +319,7 @@ impl Default for Config {
             media_ip: default_media_ip(),
             ntp_server: None,
             timezone: None,
+            phone_admin_password: None,
             srtp: true,
             trunk_srtp: false,
             sips_listen: None,
