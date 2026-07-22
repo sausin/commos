@@ -4,6 +4,7 @@
 //! Git-reviewable (deterministic, diff-friendly) and MUST NOT embed secrets
 //! (CMOS-14-DEP-083): secrets are *referenced*, resolved from an external manager.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
@@ -208,6 +209,12 @@ pub struct Config {
     #[serde(default)]
     pub admin_password: Option<SecretRef>,
 
+    /// Optional SMTP relay for voicemail-to-email. When set, a new voicemail is emailed to
+    /// the mailbox owner (matched by extension number in `smtp.mailboxes`). Absent → the
+    /// feature is off and no dispatcher runs.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+
     #[serde(default)]
     pub log: LogConfig,
 }
@@ -280,6 +287,38 @@ impl SecretRef {
     }
 }
 
+/// SMTP relay + voicemail-to-email settings. Only plaintext submission to a trusted relay is
+/// implemented (mirroring the `http://`-only webhook client and local-PostgreSQL posture);
+/// STARTTLS to an external provider is a documented add behind the `tls` feature. The relay
+/// password is a **reference**, never inline (CMOS-14-DEP-083).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpConfig {
+    /// SMTP relay host.
+    pub host: String,
+    /// SMTP relay port (25 = SMTP, 587 = submission).
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// Envelope + `From:` sender address for outbound notifications.
+    pub from: String,
+    /// EHLO domain to announce. Empty → derived from the `from` address's domain.
+    #[serde(default)]
+    pub helo: String,
+    /// Optional AUTH LOGIN username (paired with `password`).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional AUTH LOGIN password — a SecretRef, resolved at boot (never inline).
+    #[serde(default)]
+    pub password: Option<SecretRef>,
+    /// Mailbox (extension number) → recipient email address(es). Multiple recipients may be
+    /// given comma-separated. A mailbox absent here is simply not emailed.
+    #[serde(default)]
+    pub mailboxes: BTreeMap<String, String>,
+    /// Whether to attach the voicemail audio (wrapped as a WAV) to the email.
+    #[serde(default = "default_true")]
+    pub attach_audio: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
@@ -339,6 +378,7 @@ impl Default for Config {
             allow_international: false,
             max_concurrent_calls: None,
             admin_password: None,
+            smtp: None,
             log: LogConfig::default(),
         }
     }
@@ -346,6 +386,10 @@ impl Default for Config {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_smtp_port() -> u16 {
+    25
 }
 
 fn default_media_ip() -> IpAddr {

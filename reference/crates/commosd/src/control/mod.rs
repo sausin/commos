@@ -21,6 +21,8 @@ pub mod registrations;
 pub mod ringing;
 pub mod ringplan;
 pub mod routing;
+pub mod smtp;
+pub mod voicemail_email;
 pub mod trunking;
 pub mod voicemail;
 pub mod webhook_delivery;

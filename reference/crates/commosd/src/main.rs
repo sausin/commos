@@ -443,6 +443,47 @@ async fn run(cfg: Config) -> i32 {
         shutdown_rx.clone(),
     ));
 
+    // Voicemail-to-email dispatcher (optional): email new voicemails to the mailbox owner.
+    // Runs only when an `smtp:` relay is configured. A password that fails to resolve disables
+    // the feature (warn) rather than failing boot — telephony must not depend on the mailer.
+    if let Some(smtp_cfg) = &cfg.smtp {
+        let auth = match (&smtp_cfg.username, &smtp_cfg.password) {
+            (Some(user), Some(secret)) => match secret.resolve() {
+                Ok(pw) => Some((user.clone(), pw)),
+                Err(e) => {
+                    tracing::error!(error = %e,
+                        "smtp.password could not be resolved; SMTP AUTH disabled");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let transport = control::smtp::SmtpTransport {
+            host: smtp_cfg.host.clone(),
+            port: smtp_cfg.port,
+            from: smtp_cfg.from.clone(),
+            helo: smtp_cfg.helo.clone(),
+            auth,
+        };
+        let mailboxes: std::collections::HashMap<String, Vec<String>> = smtp_cfg
+            .mailboxes
+            .iter()
+            .map(|(k, v)| {
+                (k.clone(), control::voicemail_email::VoicemailEmailer::parse_recipients(v))
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let emailer = control::voicemail_email::VoicemailEmailer::new(
+            transport,
+            mailboxes,
+            smtp_cfg.attach_audio,
+            store.clone(),
+            app_state.voicemails.clone(),
+        );
+        tokio::spawn(emailer.run(bus.clone(), shutdown_rx.clone()));
+        tracing::info!(relay = %smtp_cfg.host, "voicemail-to-email enabled");
+    }
+
     // Metrics collector: fold the relayed event stream into counters. Subscribing to the bus
     // keeps the control plane free of metrics plumbing (Volume 15 §OBS-010).
     {
