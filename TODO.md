@@ -45,32 +45,34 @@ establish only ~10–30 because call *setup* is serialized. Estimates are ±2× 
 SIPp load test whose scenario **rings a few seconds before answering** (that is what exposes the
 blocking loop); watch per-core CPU, fd count, and setup latency.
 
-### 🔴 BIGGEST WIN — de-block the SIP receive loop
+### ✅ BIGGEST WIN — de-block the SIP receive loop (DONE)
 
-The SIP receive loop is **single-threaded and blocks on call setup**. `run()` awaits `handle()`
-inline (`sip/server.rs`, the `recv_from` loop), and `on_invite` → `try_bridge` →
-`send_invite_await_final` blocks for **up to `no_answer_timeout` (~30 s)** waiting for the callee
-to answer. Consequences:
+**Landed.** The UDP `run()` loop in `sip/server.rs` now only parses + dispatches: it copies each
+datagram and hands `handle()` to `tokio::spawn` instead of awaiting it inline. `on_invite` still
+blocks for up to `no_answer_timeout` (~30 s) while ringing the callee, but that block now lives on
+a detached task, so a single ringing phone no longer freezes every other INVITE / REGISTER / BYE.
+Shared state was already `Arc`/`Mutex`, so the change was mechanical; setup now runs concurrently
+across all cores. (The TLS ingress already spawned per-connection, so it was unaffected.)
 
-- Call setup is serialized across the whole system, on one core.
-- **A single ringing phone freezes the entire SIP plane for up to 30 s** — no other INVITE /
-  REGISTER / BYE is processed. (Raising the ring timeout for UX made this worse.)
-- Established calls keep flowing (their RTP relays are separate spawned tasks); only *setup*
-  starves.
+Original analysis, for context: `run()` awaited `handle()` inline, and `on_invite` → `try_bridge`
+→ `send_invite_await_final` blocks up to ~30 s. Consequences were serialized setup on one core, a
+single ringing phone freezing the SIP plane for up to 30 s, while established calls (separate
+spawned RTP relays) kept flowing. This was **~80% of the achievable win** — everything below is
+second-order and was deferred until this landed.
 
-**Fix:** the receive loop should only parse + dispatch, then hand each transaction to
-`tokio::spawn` (shared state is already `Arc`/`Mutex`, so this is mostly mechanical). This moves
-setup from "~1 at a time" to hundreds and lets all 4 cores work. **~80% of the achievable win —
-do this before any other perf work.** Everything below is second-order until it is done.
+Follow-up worth noting: spawning means a retransmitted INVITE can now be processed concurrently
+with its original (before, retransmits queued behind the block). Real SIP transaction dedup by
+branch/Call-ID is not implemented — acceptable for now, but the natural next hardening step.
 
 ### Concrete ceilings & CPU
 
 - **File descriptors.** ~2 UDP fds per established call (the two relay sockets). Default `ulimit`
-  1024 → a hard wall near **~500 calls**. Set `LimitNOFILE=65536` in the systemd unit (installer +
-  `deploy/commosd.service`). Cheap insurance.
+  1024 → a hard wall near **~500 calls**. ✅ `LimitNOFILE=65536` now set in both the installer's
+  generated unit and `deploy/commosd.service`. Cheap insurance.
 - **ARM hardware crypto for SRTP.** The A72 has ARMv8 AES/SHA, but the `aes`/`sha1` crates only use
-  it if the build enables it. Add `-C target-feature=+aes,+sha2` for `aarch64` in
-  `.cargo/config.toml`. Without it, SRTP runs software AES — a big silent tax. One-line, high impact.
+  it if the build enables it. ✅ `rustflags = ["-C", "target-feature=+aes,+sha2"]` now set for
+  `aarch64-unknown-linux-gnu` in `.cargo/config.toml`, so SRTP uses hardware AES/SHA instead of the
+  software fallback.
 - **Per-packet allocation in the SRTP relay.** `unprotect` → `Cow::Owned` and `protect` → fresh
   `Vec` (`sip/rtp.rs`) = 2 heap allocs per packet per direction when encrypted. Use a reusable
   per-relay scratch buffer. (Plaintext relay is already alloc-free.)

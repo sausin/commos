@@ -53,7 +53,9 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
 - **SIP / media plane** — `sip/server.rs` (the B2BUA: INVITE/BYE, bridging, voicemail deposit +
   `*97`/`*98` retrieval, MWI), `sip/ivr.rs` (prompt playout + DTMF collect), `sip/g711.rs`
   (μ-law/A-law synth + transcode), `sip/rtp.rs`, `sip/srtp.rs`/`sdes.rs` (SRTP), `sip/digest.rs`.
-  Note: the receive loop is single-threaded and `on_invite` blocks while ringing the callee.
+  Note: the UDP receive loop only parses + dispatches — it `tokio::spawn`s each datagram's
+  `handle()` so `on_invite` blocking (up to `no_answer_timeout` while ringing the callee) no
+  longer serializes other call setup.
 - **Control plane** — `control/routing.rs` (Call state machine, driven by `MediaFact`s + CDRs),
   `control/voicemail.rs`, `control/onboarding.rs`, `control/provisioning.rs`, `control/trunking.rs`.
 - **Provisioning** — `api/provision.rs` (per-vendor phone configs: Yealink/Grandstream/generic,

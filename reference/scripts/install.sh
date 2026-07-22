@@ -300,6 +300,9 @@ ExecStart=$BIN --config $CONFIG
 WorkingDirectory=$DATA_DIR
 Restart=on-failure
 RestartSec=2
+# Each established call holds ~2 UDP relay sockets; the default 1024-fd ceiling caps the box at
+# ~500 concurrent calls. Raise it clear of the media plane's real ceiling (cheap insurance).
+LimitNOFILE=65536
 # Systemd sends SIGTERM; commosd drains gracefully (readiness off, then finishes in-flight).
 KillSignal=SIGTERM
 TimeoutStopSec=30

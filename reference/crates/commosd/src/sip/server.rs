@@ -418,10 +418,20 @@ impl SipServer {
                     continue;
                 }
             };
+            // Parse + dispatch on a detached task, never inline. `on_invite` blocks for up to
+            // `no_answer_timeout` (~30 s) while ringing the callee, so awaiting `handle` here
+            // would serialize *all* call setup on this one core — a single ringing phone would
+            // freeze every other INVITE/REGISTER/BYE. Shared state is `Arc`/`Mutex`, so handing
+            // each transaction to `tokio::spawn` lets setups run concurrently across all cores.
+            // The datagram is copied because the receive buffer is reused on the next iteration.
             let responder = Responder::Udp { socket: socket.clone(), dst: src };
-            if let Err(e) = self.handle(&responder, &buf[..len]).await {
-                tracing::debug!(error = %e, %src, "dropping SIP datagram");
-            }
+            let datagram = buf[..len].to_vec();
+            let server = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server.handle(&responder, &datagram).await {
+                    tracing::debug!(error = %e, %src, "dropping SIP datagram");
+                }
+            });
         }
     }
 

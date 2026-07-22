@@ -4,8 +4,12 @@
 # (CMOS-14-DEP-042/060).
 
 # Raspberry Pi 4 (Cortex-A72, arm64). 64-bit Raspberry Pi OS / Ubuntu.
+# `+aes,+sha2` lets the `aes`/`sha1` crates use the A72's ARMv8 crypto extensions instead of
+# software fallbacks — a large, otherwise-silent win for SRTP-encrypted media. The A72 (and every
+# arm64 target we ship) has these, so it is safe to require on this triple.
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-feature=+aes,+sha2"]
 
 # 32-bit Raspberry Pi OS variant, kept here as a documented future target.
 [target.armv7-unknown-linux-gnueabihf]
