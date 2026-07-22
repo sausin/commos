@@ -30,6 +30,11 @@ jobs:
         working-directory: reference
     steps:
       - uses: actions/checkout@v4
+      # The installer is bash, not Rust, so `cargo test` never touches it. Run its offline test
+      # (fake binary + file:// sound mirrors) first — it's seconds, needs no toolchain, and guards
+      # the fresh-install path (config + admin password written even when a sounds mirror 404s).
+      - name: Installer script test
+        run: bash scripts/install_test.sh
       - name: Install Rust (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:

@@ -44,7 +44,8 @@ All runtime state hangs off **`data_dir`** (default `.`; the installer sets it, 
 - `{data_dir}/objects` — local object store (recordings, voicemail, exports)
 - `{data_dir}/secrets/jwt.key` — auto-generated JWT secret
 - `{data_dir}/sounds/en/*.ulaw` — audio prompts (`Config::sounds_dir`; voicemail greeting +
-  `*97` menu). Downloaded from FreePBX by the installer; missing files fall back to a synth beep.
+  `*97` menu). Downloaded from the Asterisk Project by the installer (best-effort; a 404 or dead
+  mirror is non-fatal); missing files fall back to a synth beep.
 - `{data_dir}/moh/*.ulaw` — music-on-hold loop (`Config::moh_dir`; concatenated sorted). Absent →
   a synthesized tune (`sip/moh.rs`), so hold is never silent.
 - `{data_dir}/display_name.txt` — optional (`Config::display_name_file`): the display name a
