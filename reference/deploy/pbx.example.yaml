@@ -26,6 +26,16 @@ media_ip:    "127.0.0.1"        # RTP address advertised to phones. 127.0.0.1 = 
 #     media_ip:   "192.168.10.1"          # same interface — phones send RTP to it
 # Find the right IP with:   ip -o -4 addr show   /   ip route get <a-phone-ip>
 
+# ── Time / NTP (for provisioned phones on an isolated, offline network) ────────
+# Phones with no Internet can't reach public NTP, so their clocks drift. These settings are
+# written into the auto-provisioned phone configs so handsets sync time from an INTERNAL source
+# and display the correct LOCAL time. They do not affect the CommOS host's own clock.
+# ntp_server: "192.168.10.1"   # internal NTP server for phones. Unset → phones use media_ip
+#                              # (run an NTP service on this host, e.g. chrony with `allow`).
+# timezone:   "PST8PDT"        # POSIX TZ string. Unset → no timezone is sent (clock shows UTC).
+#                              # Examples: "GMT0" (UTC), "GMT-5" (India, +5:30 needs "IST-5:30"),
+#                              # "CET-1CEST" (Central Europe), "EST5EDT" (US Eastern).
+
 # Optional SIP-over-TLS (SIPS) — requires a build with `--features tls`.
 # sips_listen:  "0.0.0.0:5061"
 # sip_tls_cert: "/etc/commos/tls/fullchain.pem"                 # public cert chain (plain path)
@@ -36,6 +46,7 @@ srtp:              true    # encrypt RTP (SRTP/SDES) when a phone offers RTP/SAV
 trunk_srtp:        false   # also offer SRTP to a carrier trunk. Off keeps the carrier leg plaintext so trunk calls never break.
 record_calls:      false   # capture call audio as stored objects on hangup.
 voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
+no_answer_rings:   5       # rings before an unanswered call diverts to voicemail (~6s each, so 5 ≈ 30s).
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 # Secure-by-default with zero setup: security is gated by the *source address*, not by flags you

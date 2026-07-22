@@ -53,10 +53,33 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub voicemail_enabled: bool,
 
+    /// How many times a called extension rings before an unanswered call is diverted to
+    /// voicemail (or the echo fallback when voicemail is off). Default `5` (~30 s — a standard
+    /// PBX ring). One "ring" is the ~6 s ring cadence, so the effective no-answer timeout is
+    /// `no_answer_rings × 6 s`. Raise it if callers are being sent to voicemail before people
+    /// can reach the phone; lower it for a snappier fallback.
+    #[serde(default = "default_no_answer_rings")]
+    pub no_answer_rings: u32,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
+
+    /// NTP time server written into provisioned phone configs, so handsets on an isolated
+    /// network (no Internet) sync their clock from an internal source. `None` (the default)
+    /// points phones at the CommOS host itself (`media_ip`) — run an NTP service there (e.g.
+    /// chrony with `allow`). Set it to a dedicated internal NTP appliance's address/hostname
+    /// to use that instead. Only affects what phones are told at provisioning time.
+    #[serde(default)]
+    pub ntp_server: Option<String>,
+
+    /// Timezone written into provisioned phone configs so handsets show the correct *local*
+    /// time (NTP only supplies UTC). A POSIX TZ string, e.g. `PST8PDT`, `GMT-5`, `CET-1CEST`.
+    /// `None` (the default) emits no timezone directive — phones keep their own/UTC setting.
+    /// On an isolated network this is usually the real fix for a wrong clock display.
+    #[serde(default)]
+    pub timezone: Option<String>,
 
     /// Encrypt the RTP media path with SRTP (RFC 3711) when a caller offers it — the secure
     /// `RTP/SAVP` profile keyed by an SDES `a=crypto` line (RFC 4568, `AES_CM_128_HMAC_SHA1_80`).
@@ -236,7 +259,10 @@ impl Default for Config {
             sip_realm: default_sip_realm(),
             record_calls: false,
             voicemail_enabled: true,
+            no_answer_rings: default_no_answer_rings(),
             media_ip: default_media_ip(),
+            ntp_server: None,
+            timezone: None,
             srtp: true,
             trunk_srtp: false,
             sips_listen: None,
@@ -265,6 +291,10 @@ fn default_true() -> bool {
 
 fn default_media_ip() -> IpAddr {
     IpAddr::from([127, 0, 0, 1])
+}
+
+fn default_no_answer_rings() -> u32 {
+    5
 }
 
 fn default_data_dir() -> String {

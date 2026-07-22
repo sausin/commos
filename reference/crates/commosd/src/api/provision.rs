@@ -202,11 +202,21 @@ pub async fn provision(
         .flatten()
         .unwrap_or_else(|| PLACEHOLDER_SECRET.to_string());
 
-    // 5b. The NTP time server the phone should sync its clock from. We point it at the CommOS
-    //     host itself so a freshly-provisioned handset shows the right time (and stamps call
-    //     history / logs correctly) with no extra operator step — the host just needs an NTP
-    //     service reachable there (e.g. chrony with `allow`).
-    let ntp_server = registrar_host.clone();
+    // 5b. The NTP time server the phone should sync its clock from. Phones on an isolated
+    //     network have no Internet, so they need an internal source. Use the operator's
+    //     configured `ntp_server` when set (a dedicated internal NTP appliance); otherwise
+    //     default to the CommOS host itself (`media_ip`) so a freshly-provisioned handset shows
+    //     the right time with no extra step — the host just needs an NTP service reachable there
+    //     (e.g. chrony with `allow`).
+    let ntp_server = st
+        .ntp_server
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| registrar_host.clone());
+
+    // 5c. The timezone the phone displays local time in. NTP only supplies UTC, so without this
+    //     the clock reads UTC. Emitted only when the operator configured a `timezone`.
+    let timezone = st.timezone.clone().filter(|s| !s.trim().is_empty());
 
     // 6. Render the vendor-specific config. Format, body, and Content-Type depend on the vendor
     //    and on the filename the phone asked for (Grandstream's `cfg<mac>.xml` wants XML).
@@ -220,6 +230,7 @@ pub async fn provision(
         &registrar_host,
         registrar_port,
         &ntp_server,
+        timezone.as_deref(),
     );
     tracing::info!(
         mac = %mac,
@@ -323,7 +334,8 @@ async fn find_account(
 /// plain text for the P-value / INI shapes, `text/xml` for the Grandstream XML document.
 ///
 /// The SIP password is the real per-device secret resolved at delivery (`CHANGEME` placeholder
-/// only when none was minted); `ntp_server` is the time source the phone syncs its clock from.
+/// only when none was minted); `ntp_server` is the time source the phone syncs its clock from,
+/// and `timezone` (when `Some`) is the POSIX TZ the phone displays local time in.
 #[allow(clippy::too_many_arguments)]
 fn render(
     vendor: &str,
@@ -335,31 +347,33 @@ fn render(
     registrar: &str,
     port: u16,
     ntp_server: &str,
+    timezone: Option<&str>,
 ) -> (String, String) {
     let plain = "text/plain; charset=utf-8".to_string();
     match vendor {
-        "yealink" => (plain, render_yealink(ext_number, display_name, secret, registrar, port, ntp_server)),
+        "yealink" => (plain, render_yealink(ext_number, display_name, secret, registrar, port, ntp_server, timezone)),
         // Grandstream fetches `cfg<mac>.xml` (XML) and `cfg<mac>` (plain-text P-values); serve the
         // shape it asked for so both the modern (XML) and legacy (plain P-value) paths register.
         "grandstream" if wants_xml => (
             "text/xml; charset=utf-8".to_string(),
-            render_grandstream_xml(mac, ext_number, display_name, secret, registrar, port, ntp_server),
+            render_grandstream_xml(mac, ext_number, display_name, secret, registrar, port, ntp_server, timezone),
         ),
         "grandstream" => (
             plain,
-            render_grandstream(ext_number, display_name, secret, registrar, port, ntp_server),
+            render_grandstream(ext_number, display_name, secret, registrar, port, ntp_server, timezone),
         ),
         // polycom / unknown / no device / anything else → generic fallback.
-        _ => (plain, render_generic(ext_number, display_name, secret, registrar, port, ntp_server)),
+        _ => (plain, render_generic(ext_number, display_name, secret, registrar, port, ntp_server, timezone)),
     }
 }
 
 /// Yealink-style `.cfg` (`account.1.*` dotted keys). Yealink phones consume this format
 /// directly. `account.1.label` / `display_name` are what the handset shows on its LCD.
-/// `local_time.ntp_server1` points the phone's clock at the CommOS host. Signature line:
-/// `account.1.sip_server.1.address`.
-fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str) -> String {
-    format!(
+/// `local_time.ntp_server1` points the phone's clock at the internal time source; when a
+/// timezone is configured, `local_time.time_zone_name` sets the displayed local time (Yealink
+/// also honours the Olson/POSIX name here). Signature line: `account.1.sip_server.1.address`.
+fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
+    let mut out = format!(
         "#!version:1.0.0.1\n\
          # CommOS auto-provisioning config (Yealink)\n\
          account.1.enable = 1\n\
@@ -372,7 +386,7 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
          account.1.sip_server.1.port = {port}\n\
          account.1.sip_server.1.transport_type = 0\n\
          account.1.sip_server.1.expires = 3600\n\
-         # Sync the clock from the CommOS host.\n\
+         # Sync the clock from the internal NTP source.\n\
          local_time.ntp_server1 = {ntp}\n",
         number = ext_number,
         display_name = display_name,
@@ -380,7 +394,11 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
         registrar = registrar,
         port = port,
         ntp = ntp_server,
-    )
+    );
+    if let Some(tz) = timezone {
+        out.push_str(&format!("# Display local time in the configured timezone.\nlocal_time.time_zone_name = {tz}\n"));
+    }
+    out
 }
 
 /// The account-1 (plus time-server) P-values a GXP/GRP/DP/HT handset provisions from, shared by
@@ -389,8 +407,10 @@ fn render_yealink(ext_number: &str, display_name: &str, secret: &str, registrar:
 /// label), `P3` display name (caller-ID), `P35` SIP User ID, `P36` Authenticate ID, `P34`
 /// Authenticate Password, `P47` SIP Server (a non-default server port rides here as `host:port` —
 /// there is no separate per-account server-port code; `P40` is the phone's own local SIP port),
-/// `P130` SIP transport (`0` = UDP), `P32` register expiration in **minutes**, and `P30` the NTP
-/// time server (so the phone picks its clock up from CommOS).
+/// `P130` SIP transport (`0` = UDP), `P32` register expiration in **minutes**, `P30` the NTP
+/// time server (so the phone picks its clock up from the internal source), and — when a timezone
+/// is configured — `P64` the self-defined timezone (POSIX TZ string) so the phone shows correct
+/// local time rather than UTC.
 fn grandstream_pvalues(
     ext_number: &str,
     display_name: &str,
@@ -398,9 +418,10 @@ fn grandstream_pvalues(
     registrar: &str,
     port: u16,
     ntp_server: &str,
+    timezone: Option<&str>,
 ) -> Vec<(&'static str, String)> {
     let sip_server = if port == 5060 { registrar.to_string() } else { format!("{registrar}:{port}") };
-    vec![
+    let mut pvalues = vec![
         ("P271", "1".to_string()),
         ("P270", display_name.to_string()),
         ("P3", display_name.to_string()),
@@ -411,15 +432,19 @@ fn grandstream_pvalues(
         ("P130", "0".to_string()),
         ("P32", "60".to_string()),
         ("P30", ntp_server.to_string()),
-    ]
+    ];
+    if let Some(tz) = timezone {
+        pvalues.push(("P64", tz.to_string()));
+    }
+    pvalues
 }
 
 /// Grandstream **plain-text P-value file** — `Pxxx = value` lines with `#` comments, the form a
 /// handset consumes from the no-extension `cfg<mac>` (and `cfg<mac>.cfg`) request. Signature line:
 /// `P47 = <registrar>`.
-fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str) -> String {
+fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
     let mut out = String::from("# CommOS auto-provisioning config (Grandstream, plain-text P-values)\n");
-    for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server) {
+    for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server, timezone) {
         out.push_str(&format!("{code} = {value}\n"));
     }
     out
@@ -429,13 +454,13 @@ fn render_grandstream(ext_number: &str, display_name: &str, secret: &str, regist
 /// as `cfg<mac>.xml`. Same P-values as the plain-text form, wrapped per Grandstream's XML
 /// provisioning schema. The `<mac>` element lets the handset validate the file is meant for it;
 /// values are XML-escaped. Signature line: `<P47>`.
-fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str) -> String {
+fn render_grandstream_xml(mac: &str, ext_number: &str, display_name: &str, secret: &str, registrar: &str, port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n");
     out.push_str("<!-- CommOS auto-provisioning config (Grandstream XML) -->\n");
     out.push_str("<gs_provision version=\"1\">\n");
     out.push_str(&format!("  <mac>{}</mac>\n", xml_escape(mac)));
     out.push_str("  <config version=\"1\">\n");
-    for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server) {
+    for (code, value) in grandstream_pvalues(ext_number, display_name, secret, registrar, port, ntp_server, timezone) {
         out.push_str(&format!("    <{code}>{}</{code}>\n", xml_escape(&value)));
     }
     out.push_str("  </config>\n");
@@ -453,7 +478,11 @@ fn xml_escape(s: &str) -> String {
 /// The original generic, vendor-neutral INI block — the fallback for polycom / unknown / no
 /// device. INI-style `key=value` with `#` comments, a shape most phones and config converters
 /// accept. Signature line: `[account]`.
-fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_host: &str, registrar_port: u16, ntp_server: &str) -> String {
+fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_host: &str, registrar_port: u16, ntp_server: &str, timezone: Option<&str>) -> String {
+    let timezone_line = match timezone {
+        Some(tz) => format!("# Local timezone (POSIX TZ) so the displayed clock is not UTC.\ntimezone={tz}\n"),
+        None => String::new(),
+    };
     format!(
         "# CommOS auto-provisioning config\n\
          # Generic, vendor-neutral form. Vendor-specific formats (Yealink/Grandstream) are\n\
@@ -476,14 +505,16 @@ fn render_generic(ext_number: &str, display_name: &str, secret: &str, registrar_
          enabled=1\n\
          \n\
          [time]\n\
-         # NTP time source — the CommOS host, so the phone's clock is correct.\n\
-         ntp_server={ntp}\n",
+         # NTP time source — the internal server, so the phone's clock is correct.\n\
+         ntp_server={ntp}\n\
+         {timezone_line}",
         number = ext_number,
         secret = secret,
         display_name = display_name,
         registrar_host = registrar_host,
         registrar_port = registrar_port,
         ntp = ntp_server,
+        timezone_line = timezone_line,
     )
 }
 
@@ -643,7 +674,7 @@ mod tests {
 
     #[test]
     fn render_yealink_has_signature_and_account() {
-        let (ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5");
+        let (ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.5", None);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Yealink signature line.
         assert!(body.contains("account.1.sip_server.1.address = 10.0.0.5"));
@@ -654,13 +685,24 @@ mod tests {
         // The operator's display name lands on the LCD fields.
         assert!(body.contains("account.1.label = Front Desk"));
         assert!(body.contains("account.1.display_name = Front Desk"));
-        // The phone is pointed at the CommOS host for time.
+        // The phone is pointed at the internal NTP source for time.
         assert!(body.contains("local_time.ntp_server1 = 10.0.0.5"));
+        // No timezone configured → no timezone directive emitted.
+        assert!(!body.contains("time_zone_name"));
+    }
+
+    #[test]
+    fn render_yealink_emits_timezone_when_set() {
+        // A dedicated internal NTP server + a POSIX timezone: both flow into the Yealink config.
+        let (_ct, body) = render("yealink", false, "aabbccddeeff", "1001", "Front Desk", "s3cr3t", "10.0.0.5", 5060, "10.0.0.20", Some("PST8PDT"));
+        // NTP points at the configured internal appliance, not the registrar.
+        assert!(body.contains("local_time.ntp_server1 = 10.0.0.20"));
+        assert!(body.contains("local_time.time_zone_name = PST8PDT"));
     }
 
     #[test]
     fn render_grandstream_emits_real_pvalues() {
-        let (ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6");
+        let (ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None);
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Real Grandstream plain-text P-values the handset consumes — not the old readable block.
         assert!(body.contains("P271 = 1")); // account active
@@ -670,25 +712,36 @@ mod tests {
         assert!(body.contains("P47 = 10.0.0.6")); // SIP Server (signature line)
         assert!(body.contains("P270 = Room 101")); // account name (LCD label)
         assert!(body.contains("P3 = Room 101")); // display name
-        assert!(body.contains("P30 = 10.0.0.6")); // NTP time server → the CommOS host
+        assert!(body.contains("P30 = 10.0.0.6")); // NTP time server → the internal source
         // A standard 5060 is left bare (no host:port) on P47.
         assert!(!body.contains("P47 = 10.0.0.6:5060"));
+        // No timezone configured → no P64 emitted.
+        assert!(!body.contains("P64"));
         // Must not regress to the old, non-consumable account.1.* block.
         assert!(!body.contains("account.1."));
     }
 
     #[test]
+    fn render_grandstream_emits_p64_timezone_when_set() {
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.20", Some("CET-1CEST"));
+        assert!(body.contains("P30 = 10.0.0.20")); // NTP → configured internal appliance
+        assert!(body.contains("P64 = CET-1CEST")); // self-defined timezone
+    }
+
+    #[test]
     fn render_grandstream_appends_nonstandard_port_to_p47() {
-        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5070, "10.0.0.6");
+        let (_ct, body) = render("grandstream", false, "aabbccddeeff", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5070, "10.0.0.6", None);
         // A non-default SIP port rides on the server field as host:port.
         assert!(body.contains("P47 = 10.0.0.6:5070"));
     }
 
     #[test]
     fn render_grandstream_xml_wraps_the_same_pvalues() {
-        let (ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6");
+        let (ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "Room 101", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", Some("GMT0"));
         // Served as XML so the handset parses it as its cfg<mac>.xml document.
         assert_eq!(ct, "text/xml; charset=utf-8");
+        // Timezone flows through as an XML P64 element when configured.
+        assert!(body.contains("<P64>GMT0</P64>"));
         assert!(body.starts_with("<?xml"));
         assert!(body.contains("<gs_provision version=\"1\">"));
         // The MAC element lets the phone validate the file is for it.
@@ -705,7 +758,7 @@ mod tests {
     #[test]
     fn grandstream_xml_escapes_special_characters() {
         // A display name with XML metacharacters must not break the document.
-        let (_ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "A&B <Front>", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6");
+        let (_ct, body) = render("grandstream", true, "000b82a1b2c3", "1002", "A&B <Front>", "s3cr3t", "10.0.0.6", 5060, "10.0.0.6", None);
         assert!(body.contains("<P270>A&amp;B &lt;Front&gt;</P270>"));
         assert!(!body.contains("<Front>"));
     }
@@ -720,23 +773,26 @@ mod tests {
 
     #[test]
     fn render_polycom_falls_back_to_generic() {
-        let (ct, body) = render("polycom", false, "aabbccddeeff", "1003", "Ext 1003", "s3cr3t", "10.0.0.7", 5060, "10.0.0.7");
+        let (ct, body) = render("polycom", false, "aabbccddeeff", "1003", "Ext 1003", "s3cr3t", "10.0.0.7", 5060, "10.0.0.7", Some("EST5EDT"));
         assert_eq!(ct, "text/plain; charset=utf-8");
         // Generic signature: INI [account] section, not vendor-specific keys.
         assert!(body.contains("[account]"));
         assert!(body.contains("username=1003"));
         assert!(body.contains("password=s3cr3t"));
         assert!(!body.contains("account.1."));
-        // Time source flows into the generic block too.
+        // Time source + timezone flow into the generic block too.
         assert!(body.contains("ntp_server=10.0.0.7"));
+        assert!(body.contains("timezone=EST5EDT"));
     }
 
     #[test]
     fn render_unknown_vendor_falls_back_to_generic() {
-        let (_ct, body) = render("unknown", false, "aabbccddeeff", "1004", "Warehouse", "s3cr3t", "10.0.0.8", 5060, "10.0.0.8");
+        let (_ct, body) = render("unknown", false, "aabbccddeeff", "1004", "Warehouse", "s3cr3t", "10.0.0.8", 5060, "10.0.0.8", None);
         assert!(body.contains("[account]"));
         assert!(body.contains("registrar=10.0.0.8"));
         // Display name flows into the generic block too.
         assert!(body.contains("display_name=Warehouse"));
+        // No timezone configured → no timezone directive.
+        assert!(!body.contains("timezone="));
     }
 }

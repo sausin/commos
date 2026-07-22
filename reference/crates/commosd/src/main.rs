@@ -278,6 +278,7 @@ async fn run(cfg: Config) -> i32 {
             cfg.record_calls,
             recordings.clone(),
             cfg.voicemail_enabled,
+            cfg.no_answer_rings,
             voicemails.clone(),
             ivrs.clone(),
             objects.clone(),
@@ -294,7 +295,10 @@ async fn run(cfg: Config) -> i32 {
             tracing::info!("call recording: ENABLED (caller audio stored as-is on hangup)");
         }
         if cfg.voicemail_enabled {
-            tracing::info!("voicemail: ENABLED (record-on-no-answer for internal extensions; MWI via SIP NOTIFY)");
+            tracing::info!(
+                no_answer_rings = cfg.no_answer_rings,
+                "voicemail: ENABLED (record-on-no-answer for internal extensions; MWI via SIP NOTIFY)"
+            );
         } else {
             tracing::info!("voicemail: DISABLED (no-answer falls back to the echo path)");
         }
@@ -390,6 +394,8 @@ async fn run(cfg: Config) -> i32 {
         admin,
         cfg.media_ip,
         cfg.sip_listen.map(|a| a.port()).unwrap_or(5060),
+        cfg.ntp_server.clone(),
+        cfg.timezone.clone(),
         describe_storage(&cfg),
         bus.clone(),
         recent,
