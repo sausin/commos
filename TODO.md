@@ -5,13 +5,17 @@ graduates to a proper spec/ADR + branch when started.
 
 ## Feature-parity roadmap (vs FreePBX / small-office PBX)
 
-Positioning: CommOS is a well-architected core engine at roughly **30–40% of small-office PBX
-parity**. The spine (SIP/RTP, provisioning, voicemail, IVR/CallFlow, trunking, ACD, CDR/billing,
-REST API + events) is real and modern; the gaps are the classic PBX *feature surface*. The FreePBX
+Positioning: CommOS is a well-architected core engine at roughly **~50% of small-office PBX
+parity** (up from ~30–40% after the 2026-07 cycle closed 5 of the top-10 gaps below — ring
+groups, call-forward/follow-me, music-on-hold, voicemail-to-email, and queue caller experience).
+The spine (SIP/RTP, provisioning, voicemail, IVR/CallFlow, trunking, ACD, CDR/billing, REST API +
+events) is real and modern; the remaining gaps are the classic PBX *feature surface*. The FreePBX
 **module / AGI / dialplan ecosystem is a deliberate non-goal** (spec N-1/N-4) — not a gap to close.
 
-Top gaps to reach "usable small-office PBX", ordered by impact. Size: S ≈ days, M ≈ weeks,
-L ≈ multi-week.
+Top gaps to reach "usable small-office PBX", ordered by impact (✅ = landed). Size: S ≈ days,
+M ≈ weeks, L ≈ multi-week. **Remaining open:** #2 (time conditions), #3 (conferences),
+#4 (transfer/B2BUA hardening), #8 (more feature codes — now cheap on the forwarding spine),
+#10 (WebRTC).
 
 | # | Gap | Size | Why |
 |---|-----|------|-----|

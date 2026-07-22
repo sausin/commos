@@ -446,7 +446,7 @@ mod tests {
             .await
             .expect("MoH should reach the held leg")
             .expect("recv MoH");
-        assert!(n >= RTP_HEADER_LEN + 1);
+        assert!(n > RTP_HEADER_LEN, "MoH packet carries an RTP header + payload");
         assert!(
             buf[RTP_HEADER_LEN..n].iter().all(|&b| b == 0xAB),
             "the held leg hears the music-on-hold payload"
