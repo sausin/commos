@@ -56,6 +56,13 @@ impl Responder {
             Responder::Stream { peer, .. } => *peer,
         }
     }
+
+    /// Whether this transport is confidential. The stream transport is SIP-over-TLS (SIPS); plain
+    /// UDP is not. Used to gate SDES SRTP keying, which sends the media key inside the SDP and is
+    /// therefore only meaningful when the signalling channel itself is encrypted.
+    pub fn is_secure(&self) -> bool {
+        matches!(self, Responder::Stream { .. })
+    }
 }
 
 /// Largest single SIP message accepted on a stream transport, so a peer can't grow the reassembly
@@ -118,10 +125,12 @@ impl StreamFramer {
             // handler's own parse can reject it, rather than stalling the connection.
             Err(_) => 0,
         };
-        let total = head_end + content_length;
-        if total > MAX_STREAM_MESSAGE {
-            return Frame::Overflow;
-        }
+        // Guard the addition itself: a header-supplied Content-Length near `usize::MAX` would
+        // otherwise wrap and slip a small `total` past the size check below.
+        let total = match head_end.checked_add(content_length) {
+            Some(t) if t <= MAX_STREAM_MESSAGE => t,
+            _ => return Frame::Overflow,
+        };
         if self.buf.len() < total {
             return Frame::Incomplete;
         }

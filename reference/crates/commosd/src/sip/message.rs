@@ -398,27 +398,26 @@ pub fn request(
         out.push_str(&format!("{name}: {value}\r\n"));
     }
 
-    // A deterministic-but-unique seed for generated branch/tag/Call-ID values.
-    let seed = format!("{method}{request_uri}{}", headers.len());
-
     if !has_via {
-        // A magic-cookie branch (RFC 3261 §8.1.1.7) so the response routes back.
+        // A magic-cookie branch (RFC 3261 §8.1.1.7) so the response routes back. CSPRNG-random
+        // (not derived from public inputs) so an off-path attacker cannot predict the branch and
+        // forge a matching response for a locally-originated request.
         out.push_str(&format!(
             "Via: SIP/2.0/UDP commos.invalid;branch=z9hG4bK{}\r\n",
-            dialog_tag(&format!("via{seed}"))
+            rand_tag()
         ));
     }
     if !has_from {
         out.push_str(&format!(
             "From: <sip:commos@commos.invalid>;tag={}\r\n",
-            dialog_tag(&format!("from{seed}"))
+            rand_tag()
         ));
     }
     if !has_to {
         out.push_str(&format!("To: <{request_uri}>\r\n"));
     }
     if !has_call_id {
-        out.push_str(&format!("Call-ID: {}@commos.invalid\r\n", dialog_tag(&format!("cid{seed}"))));
+        out.push_str(&format!("Call-ID: {}@commos.invalid\r\n", rand_tag()));
     }
     if !has_cseq {
         out.push_str(&format!("CSeq: 1 {method}\r\n"));
@@ -586,12 +585,30 @@ fn find_param(value: &str, key: &str) -> Option<String> {
     None
 }
 
-/// A stable, opaque dialog tag derived from a seed (Call-ID + To). Deterministic per dialog
-/// — good enough for the reference ingress; a production stack uses a CSPRNG.
+/// A stable, opaque dialog tag derived from a seed (Call-ID + To). Deterministic **on purpose**:
+/// a 2xx response's To-tag must be identical across retransmissions of that response so the peer
+/// keeps matching the same dialog. Because it labels *our* side of an already-established dialog
+/// (not a value an attacker must fail to guess to inject a request), determinism here is safe —
+/// unpredictability is required only for locally-originated request branches/tags, which use
+/// [`rand_tag`].
 fn dialog_tag(seed: &str) -> String {
     let mut h = DefaultHasher::new();
     seed.hash(&mut h);
     format!("cmos{:016x}", h.finish())
+}
+
+/// A CSPRNG-backed opaque token (128 bits, hex) for a locally-originated request's Via branch,
+/// From tag, and Call-ID. Unpredictable so an off-path attacker cannot guess the transaction
+/// identifiers and forge a matching response or in-dialog request over UDP.
+fn rand_tag() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("OS CSPRNG available for SIP tag generation");
+    let mut s = String::with_capacity(4 + 32);
+    s.push_str("cmos");
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
 }
 
 #[cfg(test)]

@@ -155,6 +155,18 @@ pub struct CreateTrunk {
     pub auth: Option<serde_json::Value>,
 }
 
+/// Strip the carrier credentials from a Trunk before it leaves the API. The plaintext
+/// `{username,password}` used to authenticate to the carrier must never be serialized back to a
+/// client — leaking it enables direct carrier registration and toll fraud. When auth is present
+/// it is replaced with a non-secret marker so callers can still tell that credentials are
+/// configured without seeing them.
+fn redact_trunk(mut t: Trunk) -> Trunk {
+    if t.auth.is_some() {
+        t.auth = Some(serde_json::json!({ "configured": true }));
+    }
+    t
+}
+
 /// `GET /v1/trunks`
 pub async fn list_trunks(
     State(st): State<AppState>,
@@ -163,7 +175,8 @@ pub async fn list_trunks(
 ) -> Result<Json<Page<Trunk>>, Problem> {
     let limit = p.limit.unwrap_or(50).clamp(1, 200);
     let page = st.trunking.list_trunks(t.tenant_id, limit, p.cursor).await.map_err(terr)?;
-    Ok(Json(Page { items: page.items, next_cursor: page.next_cursor }))
+    let items = page.items.into_iter().map(redact_trunk).collect();
+    Ok(Json(Page { items, next_cursor: page.next_cursor }))
 }
 /// `POST /v1/trunks`
 pub async fn create_trunk(
@@ -177,11 +190,12 @@ pub async fn create_trunk(
         .create_trunk(admin.tenant_id, carrier, b.channels_max, b.codecs, b.auth)
         .await
         .map_err(terr)?;
-    Ok((StatusCode::CREATED, Json(t)))
+    Ok((StatusCode::CREATED, Json(redact_trunk(t))))
 }
 /// `GET /v1/trunks/{id}`
 pub async fn get_trunk(State(st): State<AppState>, t: TenantContext, Path(id): Path<String>) -> Result<Json<Trunk>, Problem> {
-    Ok(Json(st.trunking.get_trunk(t.tenant_id, tid(&id)?).await.map_err(terr)?))
+    let trunk = st.trunking.get_trunk(t.tenant_id, tid(&id)?).await.map_err(terr)?;
+    Ok(Json(redact_trunk(trunk)))
 }
 /// `DELETE /v1/trunks/{id}`
 pub async fn delete_trunk(State(st): State<AppState>, admin: AdminContext, Path(id): Path<String>) -> Result<StatusCode, Problem> {

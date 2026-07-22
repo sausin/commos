@@ -144,6 +144,16 @@ impl S3ObjectStore {
             .with_virtual_hosted_style_request(!path_style);
         if let Some(ep) = endpoint {
             let allow_http = ep.starts_with("http://");
+            if allow_http {
+                // Plaintext object transport sends tenant recordings/voicemail and the S3
+                // credentials over an unencrypted link. Allowed (some on-box MinIO setups use it)
+                // but never silently — surface it so a typo'd/tampered endpoint is noticed.
+                tracing::warn!(
+                    endpoint = %ep,
+                    "S3 object storage endpoint is http:// — blobs and credentials will traverse \
+                     the network UNENCRYPTED; use https:// unless this is a trusted local link"
+                );
+            }
             b = b.with_endpoint(ep).with_allow_http(allow_http);
         }
         let inner = b.build().map_err(|e| ObjectStoreError::Backend(e.to_string()))?;

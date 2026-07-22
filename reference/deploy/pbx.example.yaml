@@ -38,11 +38,16 @@ record_calls:      false   # capture call audio as stored objects on hangup.
 voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-require_sip_auth: false     # true → phones must present SIP digest credentials. Enable before exposing SIP.
+# Secure-by-default with zero setup: security is gated by the *source address*, not by flags you
+# have to remember. From loopback/private-LAN peers the dev bearer, dashboard, introspection, and
+# phone provisioning just work; from a PUBLIC address those are refused (a signed JWT is required
+# for /v1, an admin session for privileged routes, and SIP auth is auto-required). A JWT signing
+# secret is auto-generated at {data_dir}/secrets/jwt.key if `jwt_secret` is unset.
+require_sip_auth: false     # true → ALWAYS require SIP digest auth. Even when false, auth is auto-required for any non-LAN source.
 sip_realm:        "commos"  # digest realm presented in the auth challenge.
-dev_tokens:       true      # accept the `tenant:<uuid>` dev bearer for /v1. Set false in production once jwt_secret is set.
-# jwt_secret:     { ref_uri: "env://COMMOS_JWT_SECRET" }            # HS256 signing key for /v1 bearer tokens.
-# admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # gate privileged admin routes.
+dev_tokens:       true      # accept the `tenant:<uuid>` dev bearer — honoured from LAN/loopback peers only, never from a public address.
+# jwt_secret:     { ref_uri: "env://COMMOS_JWT_SECRET" }            # override the auto-generated HS256 signing key for /v1 bearer tokens.
+# admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # required for admin from a public address; LAN admin works without it.
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 data_dir: "."   # SQLite DB (commos.db) + local object store live here. Use an absolute path in production.

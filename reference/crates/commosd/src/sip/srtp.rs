@@ -76,6 +76,12 @@ pub struct SrtpContext {
     s_l: u16,
     /// Whether any packet has been processed yet (seeds `s_l` on the first one).
     started: bool,
+    /// Anti-replay state (RFC 3711 §3.3.2), receiver side. `replay_top` is the highest 48-bit
+    /// index accepted; `replay_mask` bit *i* marks index `replay_top - i` as already seen, over a
+    /// 64-packet window. A replayed or too-old index is dropped.
+    replay_top: u64,
+    replay_mask: u64,
+    replay_started: bool,
 }
 
 impl SrtpContext {
@@ -87,7 +93,17 @@ impl SrtpContext {
         prf_fill(master_key, kdf_iv(master_salt, LABEL_SALT), &mut session_salt);
         let mut auth_key = [0u8; AUTH_KEY_LEN];
         prf_fill(master_key, kdf_iv(master_salt, LABEL_AUTH), &mut auth_key);
-        SrtpContext { session_key, session_salt, auth_key, roc: 0, s_l: 0, started: false }
+        SrtpContext {
+            session_key,
+            session_salt,
+            auth_key,
+            roc: 0,
+            s_l: 0,
+            started: false,
+            replay_top: 0,
+            replay_mask: 0,
+            replay_started: false,
+        }
     }
 
     /// Build the AES-CM keystream IV for one packet (RFC 3711 §4.1.1):
@@ -155,6 +171,42 @@ impl SrtpContext {
         }
     }
 
+    /// Anti-replay window (RFC 3711 §3.3.2). Given the authenticated packet `index`, return
+    /// `true` and record it if it is fresh (never seen and within the 64-packet window); return
+    /// `false` if it is a replay or falls below the window. Must be called only *after* the auth
+    /// tag verifies, so a forged packet cannot poison the window.
+    const REPLAY_WINDOW: u64 = 64;
+    fn replay_admit(&mut self, index: u64) -> bool {
+        if !self.replay_started {
+            self.replay_started = true;
+            self.replay_top = index;
+            self.replay_mask = 1; // bit 0 = the top index itself
+            return true;
+        }
+        if index > self.replay_top {
+            let delta = index - self.replay_top;
+            if delta >= Self::REPLAY_WINDOW {
+                self.replay_mask = 1;
+            } else {
+                self.replay_mask = (self.replay_mask << delta) | 1;
+            }
+            self.replay_top = index;
+            true
+        } else {
+            let delta = self.replay_top - index;
+            if delta >= Self::REPLAY_WINDOW {
+                return false; // too old to tell — drop
+            }
+            let bit = 1u64 << delta;
+            if self.replay_mask & bit != 0 {
+                false // already seen — replay
+            } else {
+                self.replay_mask |= bit;
+                true
+            }
+        }
+    }
+
     /// Encrypt-and-authenticate one plaintext RTP packet into an SRTP packet
     /// (`header || AES-CM(payload) || tag`). Returns `None` if `rtp` is not a well-formed RTP
     /// packet. Advances this (sending) stream's index state.
@@ -195,6 +247,12 @@ impl SrtpContext {
         // Constant-time tag comparison before touching the ciphertext.
         let expected = self.auth_tag(body, (index >> 16) as u32);
         if !constant_time_eq(&expected, tag) {
+            return None;
+        }
+
+        // Anti-replay (RFC 3711 §3.3.2): drop a replayed or too-old (but validly-tagged) packet so
+        // a captured frame cannot be re-injected. Checked only after the tag verifies.
+        if !self.replay_admit(index) {
             return None;
         }
 
@@ -331,6 +389,25 @@ mod tests {
         assert_ne!(&protected[12..12 + 19], &clear[12..]);
         let recovered = recv.unprotect(&protected).unwrap();
         assert_eq!(recovered, clear);
+    }
+
+    #[test]
+    fn replayed_packet_is_dropped() {
+        let (k, s) = split_key_salt(&random_key_salt());
+        let mut send = SrtpContext::new(&k, &s);
+        let mut recv = SrtpContext::new(&k, &s);
+        let p1 = send.protect(&rtp(100, 0xabcd, b"one")).unwrap();
+        let p2 = send.protect(&rtp(101, 0xabcd, b"two")).unwrap();
+        // First receipt of each succeeds.
+        assert!(recv.unprotect(&p1).is_some());
+        assert!(recv.unprotect(&p2).is_some());
+        // A byte-for-byte replay of an already-accepted packet is dropped (validly tagged, but
+        // its index was already seen).
+        assert!(recv.unprotect(&p1).is_none(), "replay of p1 must be dropped");
+        assert!(recv.unprotect(&p2).is_none(), "replay of p2 must be dropped");
+        // A fresh, later packet is still accepted.
+        let p3 = send.protect(&rtp(102, 0xabcd, b"three")).unwrap();
+        assert!(recv.unprotect(&p3).is_some());
     }
 
     #[test]

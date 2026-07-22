@@ -20,6 +20,7 @@ pub mod introspect;
 pub mod messages;
 pub mod objects;
 pub mod onboarding;
+pub mod peer;
 pub mod presence;
 pub mod problem;
 pub mod provision;
@@ -32,7 +33,7 @@ pub mod video_rooms;
 pub mod voicemail;
 pub mod webhooks;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -187,6 +188,10 @@ pub fn router(state: AppState) -> Router {
         .route("/_introspect/events", get(introspect::recent_events))
         .route("/_introspect/events/stream", get(introspect::stream_events))
         .layer(middleware::from_fn_with_state(state.clone(), count_request))
+        // Explicit request-body ceiling (was axum's implicit 2 MiB default). Large enough for a
+        // reasonable object upload, small enough that no single request can buffer unbounded
+        // memory; per-field length caps in the handlers bound the JSON surface more tightly.
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

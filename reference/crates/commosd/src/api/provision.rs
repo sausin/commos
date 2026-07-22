@@ -41,7 +41,9 @@
 //! The SIP password is a placeholder (`CHANGEME`): per-device credentials are not stored yet.
 //! Real per-device secrets (and their rotation) come from Volume 9.
 
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -72,9 +74,21 @@ const PAGE_SIZE: usize = 200;
 /// as plain text a phone's log can surface.
 pub async fn provision(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(file): Path<String>,
 ) -> Response {
+    // 0. Phone auto-provisioning hands back the extension's *real* SIP secret in cleartext, so
+    //    it must never be reachable from the public internet — a guessed MAC would otherwise
+    //    leak a working credential (registration hijack / toll fraud). Phones provision from the
+    //    LAN, so restrict this to trusted (loopback/private) peers. An unknown peer fails closed.
+    if !crate::api::peer::is_trusted_ip(&peer.ip()) {
+        return text(
+            StatusCode::FORBIDDEN,
+            "provisioning is restricted to the local/private network\n".to_string(),
+        );
+    }
+
     // The phone identifies itself in the request User-Agent (e.g. "Grandstream GXP2170 …",
     // "Yealink SIP-T46S …"). We use it both to log which handset asked and as a vendor fallback
     // when the bound Device's stored vendor is unknown (e.g. an OUI not yet in the table).

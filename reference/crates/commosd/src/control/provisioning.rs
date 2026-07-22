@@ -575,12 +575,19 @@ impl Provisioning {
     }
 }
 
-/// Generate a SIP shared secret. Derived from two UUIDv7s' random material — ample entropy
-/// for a device secret, hex so it survives any phone's password field. (A production system
-/// would use a dedicated CSPRNG and store only the HA1; documented in the store trait.)
+/// Generate a SIP shared secret: 128 bits from the OS CSPRNG, hex-encoded so it survives any
+/// phone's password field. UUIDv7 is deliberately NOT used here — half its bits are a
+/// predictable millisecond timestamp, and provisioning time is often observable, which would
+/// materially cut the secret's effective entropy. (A production system would additionally store
+/// only the HA1 digest; documented in the store trait.)
 fn gen_secret() -> String {
-    let raw = format!("{}{}", Uuid::now_v7(), Uuid::now_v7());
-    raw.chars().filter(|c| c.is_ascii_hexdigit()).take(24).collect()
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG available for SIP secret generation");
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -86,10 +86,15 @@ pub async fn create_calls(
     if body.from_ref.trim().is_empty() || body.to_ref.trim().is_empty() {
         return Err(Problem::bad_request("from_ref and to_ref are required"));
     }
-    let idempotency_key = headers
-        .get("Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    // Length-bound the client-supplied idempotency key before it becomes a durable primary key,
+    // so a caller cannot pollute the ledger with oversized keys (255 is the conventional cap).
+    let idempotency_key = match headers.get("Idempotency-Key").and_then(|v| v.to_str().ok()) {
+        Some(k) if k.len() > 255 => {
+            return Err(Problem::bad_request("Idempotency-Key must be at most 255 characters"));
+        }
+        Some(k) if !k.trim().is_empty() => Some(k.to_string()),
+        _ => None,
+    };
 
     let call = st
         .routing
@@ -204,6 +209,29 @@ pub async fn transfer_call(
 // --- Optimistic-concurrency update (OpenAPI `update_calls`). ------------------------------
 // `PATCH /v1/calls/{id}` with `If-Match` + RFC 7386 JSON Merge Patch (Volume 4).
 
+/// Fields of a serialized `Call` a generic PATCH may not modify — identity/tenant, the
+/// optimistic-concurrency version, timestamps, routing refs, and the state-machine fields (which
+/// change only via the action verbs). The list is the whole domain surface: `update_calls` is an
+/// optimistic-concurrency envelope, not a way to hand-edit call state. See [`patch_call`].
+const PROTECTED_CALL_FIELDS: &[&str] = &[
+    "id",
+    "tenant_id",
+    "version",
+    "created_at",
+    "updated_at",
+    "correlation_id",
+    "direction",
+    "from_ref",
+    "to_ref",
+    "device_id",
+    "identity_id",
+    "state",
+    "answered_at",
+    "ended_at",
+    "hangup_cause",
+    "media",
+];
+
 /// Apply an RFC 7386 JSON Merge Patch: for an object patch, recurse per key —
 /// a `null` value removes the key, any other value replaces it; a non-object patch
 /// replaces the target wholesale.
@@ -284,13 +312,28 @@ pub async fn patch_call(
     let mut merged = original.clone();
     merge(&mut merged, &patch);
 
-    // 4. Protect server-managed identity/tenant fields: force them back to their originals
-    //    so a patch cannot re-home or re-identify the entity, then re-validate the shape.
-    if let Some(obj) = merged.as_object_mut() {
-        for field in ["id", "tenant_id", "created_at", "correlation_id"] {
-            if let Some(orig) = original.get(field) {
-                obj.insert(field.to_string(), orig.clone());
+    // 4. Mass-assignment guard: a generic merge-patch must not re-home/re-identify the entity or
+    //    drive its state machine. Every domain field of a Call is server-managed — routing refs
+    //    are fixed at origination, and state/answered_at/ended_at/media change only through the
+    //    dedicated action verbs (hold/resume/hangup/transfer), each of which emits its catalogue
+    //    event. So reject (400) any patch that would change a protected field or introduce an
+    //    unknown one, rather than silently applying it.
+    if let (Some(orig_obj), Some(new_obj)) = (original.as_object(), merged.as_object()) {
+        let mut offending: Vec<&str> = Vec::new();
+        for field in PROTECTED_CALL_FIELDS {
+            if orig_obj.get(*field) != new_obj.get(*field) {
+                offending.push(field);
             }
+        }
+        if new_obj.keys().any(|k| !orig_obj.contains_key(k)) {
+            offending.push("<unknown field>");
+        }
+        if !offending.is_empty() {
+            return Err(Problem::bad_request(format!(
+                "these fields are not modifiable via PATCH (use the call action verbs for state \
+                 changes): {}",
+                offending.join(", ")
+            )));
         }
     }
     call = serde_json::from_value(merged)

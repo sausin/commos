@@ -315,7 +315,22 @@ pub fn verify(creds: &Credentials, method: &str, password: &str) -> bool {
         creds.nc.as_deref(),
         creds.cnonce.as_deref(),
     );
-    expected.eq_ignore_ascii_case(&creds.response)
+    // Constant-time comparison of the two hex digests (lower-cased first, since a client may send
+    // upper- or lower-case hex). Avoids leaking, via timing, how many leading nibbles matched.
+    ct_eq_ignore_ascii_case(&expected, &creds.response)
+}
+
+/// Constant-time, case-insensitive equality for ASCII-hex strings of equal length.
+fn ct_eq_ignore_ascii_case(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
+    }
+    diff == 0
 }
 
 #[cfg(test)]

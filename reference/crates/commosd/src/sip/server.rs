@@ -147,6 +147,16 @@ struct Dialog {
 }
 
 /// The UDP SIP server. [`Self::run`] takes ownership and drives the receive loop.
+/// Per-nonce replay-protection state: expiry plus the highest digest nonce-count (`nc`) we have
+/// already accepted for it. A captured, validly-signed request cannot be replayed because its
+/// `nc` is no longer strictly greater than what we have seen (or, for clients that send no
+/// `nc`, the nonce is consumed single-use on first success).
+#[derive(Clone, Copy)]
+struct NonceState {
+    exp: i64,
+    highest_nc: u32,
+}
+
 pub struct SipServer {
     registrations: RegistrationRegistry,
     routing: Routing,
@@ -163,12 +173,14 @@ pub struct SipServer {
     bye_aliases: Arc<Mutex<HashMap<String, String>>>,
     /// The durable store, for SIP digest credential lookup.
     store: Arc<dyn Store>,
-    /// Require SIP digest auth on REGISTER/INVITE (Volume 9).
+    /// Require SIP digest auth on REGISTER/INVITE (Volume 9). Auth is *additionally* required
+    /// for any request from an untrusted (public) source address regardless of this flag, so an
+    /// internet-reachable SIP port is never open to unauthenticated REGISTER/INVITE.
     require_auth: bool,
     /// Digest realm advertised in the auth challenge.
     realm: String,
-    /// Nonces we have issued → their expiry (unix seconds). In-memory; a restart re-challenges.
-    nonces: Arc<Mutex<HashMap<String, i64>>>,
+    /// Nonces we have issued → their replay-protection state. In-memory; a restart re-challenges.
+    nonces: Arc<Mutex<HashMap<String, NonceState>>>,
     /// Record calls (Volume 7): capture the caller's RTP audio and persist it on hangup.
     record_calls: bool,
     /// Recording service used to store captured audio when `record_calls` is on.
@@ -238,8 +250,12 @@ impl SipServer {
     /// How long a challenge nonce stays valid (seconds).
     const NONCE_TTL: i64 = 300;
 
-    /// Issue a fresh nonce, remember it, and return it.
+    /// Issue a fresh nonce, remember it (with a zero nonce-count baseline for the replay guard),
+    /// and return it.
     fn issue_nonce(&self) -> String {
+        // CSPRNG-backed via UUIDv7's random component. (Predictable dialog tags — a separate,
+        // lower-severity item — are tracked elsewhere; the nonce here is not guessable in a way
+        // that matters because it is also validated against this server-side set.)
         let nonce: String = format!("{}{}", Uuid::now_v7(), Uuid::now_v7())
             .chars()
             .filter(|c| c.is_ascii_hexdigit())
@@ -247,34 +263,80 @@ impl SipServer {
             .collect();
         let exp = now_unix() + Self::NONCE_TTL;
         let mut g = self.nonces.lock().expect("nonces mutex");
-        g.retain(|_, &mut e| e > now_unix());
-        g.insert(nonce.clone(), exp);
+        g.retain(|_, s| s.exp > now_unix());
+        g.insert(nonce.clone(), NonceState { exp, highest_nc: 0 });
         nonce
     }
 
-    /// Whether `nonce` is one we issued and it hasn't expired.
-    fn nonce_known(&self, nonce: &str) -> bool {
+    /// Validate that `nonce` is one we issued and unexpired, and that `nc` (if the client sent a
+    /// nonce-count) is strictly greater than the highest we have already accepted for it — the
+    /// replay guard. Read-only: it does not advance state (that happens in [`nonce_commit`] only
+    /// after the digest response itself verifies, so a wrong-password attempt can't burn state).
+    ///
+    /// [`nonce_commit`]: Self::nonce_commit
+    fn nonce_check(&self, nonce: &str, nc: Option<&str>) -> bool {
         let now = now_unix();
         let mut g = self.nonces.lock().expect("nonces mutex");
-        g.retain(|_, &mut e| e > now);
-        g.get(nonce).is_some_and(|&e| e > now)
+        g.retain(|_, s| s.exp > now);
+        let Some(state) = g.get(nonce) else { return false };
+        match nc.and_then(parse_nc) {
+            Some(n) => n > state.highest_nc,
+            // No nc (client didn't use qop): the nonce is single-use — allowed once while present.
+            None => true,
+        }
+    }
+
+    /// Commit a successful authentication against `nonce`: advance the highest accepted `nc`, or,
+    /// when the client sent no `nc`, consume the nonce outright (single-use). Called only after
+    /// the digest response has verified.
+    fn nonce_commit(&self, nonce: &str, nc: Option<&str>) {
+        let mut g = self.nonces.lock().expect("nonces mutex");
+        match nc.and_then(parse_nc) {
+            Some(n) => {
+                if let Some(state) = g.get_mut(nonce) {
+                    state.highest_nc = state.highest_nc.max(n);
+                }
+            }
+            None => {
+                g.remove(nonce);
+            }
+        }
     }
 
     /// Verify the request's `Authorization` digest for `method` against the stored per-device
-    /// secret. Returns true only when the nonce is ours, the username has a credential, and the
-    /// response hash matches.
-    async fn digest_ok(&self, msg: &SipMessage, method: &str) -> bool {
-        let creds = match msg.header("Authorization").and_then(super::digest::Credentials::parse) {
-            Some(c) => c,
-            None => return false,
+    /// secret. On success returns the authenticated **username** so the caller can bind it to the
+    /// request's claimed identity (REGISTER AoR / INVITE From); `None` on any failure. Enforces
+    /// nonce validity and replay protection.
+    async fn digest_ok(&self, msg: &SipMessage, method: &str) -> Option<String> {
+        let creds = msg
+            .header("Authorization")
+            .and_then(super::digest::Credentials::parse)?;
+        if !self.nonce_check(&creds.nonce, creds.nc.as_deref()) {
+            return None;
+        }
+        let secret = match self
+            .store
+            .get_sip_credential(self.default_tenant, &creds.username)
+            .await
+        {
+            Ok(Some(secret)) => secret,
+            _ => return None,
         };
-        if !self.nonce_known(&creds.nonce) {
-            return false;
+        if !super::digest::verify(&creds, method, &secret) {
+            return None;
         }
-        match self.store.get_sip_credential(self.default_tenant, &creds.username).await {
-            Ok(Some(secret)) => super::digest::verify(&creds, method, &secret),
-            _ => false,
-        }
+        // Authentication succeeded — advance/consume the nonce so this exact request can't be
+        // replayed within the nonce's lifetime.
+        self.nonce_commit(&creds.nonce, creds.nc.as_deref());
+        Some(creds.username)
+    }
+
+    /// Whether digest auth must be enforced for a request from `src`. Always enforced when
+    /// `require_auth` is configured; additionally enforced (regardless of the flag) for any
+    /// **untrusted (public) source address**, so an internet-exposed SIP port never accepts an
+    /// unauthenticated REGISTER/INVITE even in a zero-config deployment.
+    fn auth_required_from(&self, src: SocketAddr) -> bool {
+        self.require_auth || !crate::net::is_trusted_ip(&src.ip())
     }
 
     /// Send a `401 Unauthorized` with a fresh digest challenge, prompting the phone to
@@ -377,11 +439,18 @@ impl SipServer {
         let src = resp.peer();
         // Digest auth gate (Volume 9): an unauthenticated REGISTER is challenged with 401 +
         // WWW-Authenticate; the phone re-sends with credentials we verify against its stored
-        // per-device secret.
-        if self.require_auth && !self.digest_ok(msg, "REGISTER").await {
-            tracing::info!(%src, "SIP REGISTER challenged (digest auth required)");
-            return self.send_challenge(resp, msg).await;
-        }
+        // per-device secret. Auth is enforced when configured, and always for a public source.
+        let authed_user = if self.auth_required_from(src) {
+            match self.digest_ok(msg, "REGISTER").await {
+                Some(user) => Some(user),
+                None => {
+                    tracing::info!(%src, "SIP REGISTER challenged (digest auth required)");
+                    return self.send_challenge(resp, msg).await;
+                }
+            }
+        } else {
+            None
+        };
 
         let aor = match msg.register_aor() {
             Some(a) if !a.is_empty() => a,
@@ -390,6 +459,20 @@ impl SipServer {
                 return self.reply(resp, msg, 400, "Bad Request").await;
             }
         };
+
+        // Identity binding: a device authenticated as `user` may only register its own AoR. This
+        // stops a device that holds one extension's credential from hijacking another extension's
+        // registration (and thus its calls/voicemail) by putting a different AoR in To/From.
+        if let Some(user) = &authed_user {
+            let aor_user = user_part(&aor);
+            if aor_user.map(|u| !u.eq_ignore_ascii_case(user)).unwrap_or(true) {
+                tracing::warn!(
+                    %src, authed = %user, aor = %aor,
+                    "SIP REGISTER rejected: authenticated user does not own the registered AoR"
+                );
+                return self.reply(resp, msg, 403, "Forbidden").await;
+            }
+        }
         let expires = msg.expires();
         let contact = msg.contact_uri().unwrap_or_else(|| format!("sip:{}", src));
         let user_agent = msg.user_agent().map(str::to_string);
@@ -456,10 +539,28 @@ impl SipServer {
 
         // Digest auth gate: an unauthenticated INVITE is challenged with 401 before any Call is
         // created; the phone re-sends with credentials. (REGISTER auth already limits who is
-        // reachable; challenging INVITE too stops direct unauthenticated dialing.)
-        if self.require_auth && !self.digest_ok(msg, "INVITE").await {
-            tracing::info!(%src, "SIP INVITE challenged (digest auth required)");
-            return self.send_challenge(resp, msg).await;
+        // reachable; challenging INVITE too stops direct unauthenticated dialing.) Enforced when
+        // configured, and always for a public source address.
+        if self.auth_required_from(src) {
+            match self.digest_ok(msg, "INVITE").await {
+                Some(user) => {
+                    // Caller-identity binding: the From user-part must match the authenticated
+                    // user, so a device cannot originate calls (CDRs, trunk/PSTN caller-ID) under
+                    // a spoofed identity.
+                    let from_user = user_part(&from_ref);
+                    if from_user.map(|u| !u.eq_ignore_ascii_case(&user)).unwrap_or(true) {
+                        tracing::warn!(
+                            %src, authed = %user, from = %from_ref,
+                            "SIP INVITE rejected: From identity does not match the authenticated user"
+                        );
+                        return self.reply(resp, msg, 403, "Forbidden").await;
+                    }
+                }
+                None => {
+                    tracing::info!(%src, "SIP INVITE challenged (digest auth required)");
+                    return self.send_challenge(resp, msg).await;
+                }
+            }
         }
 
         // Provisional response.
@@ -528,9 +629,19 @@ impl SipServer {
         let reflect = offer.preferred_audio().unwrap_or_else(default_codec);
         tracing::info!(%call_id, endpoint_codec = %g711.sdp_name(), reflect_codec = %reflect.name, te_pt, "codecs negotiated");
 
-        // The caller's SDES key, if it offered SRTP — used to key the caller (leg A) side of a
-        // bridge/trunk and to answer the caller over RTP/SAVP.
-        let caller_crypto = self.caller_crypto(&body);
+        // Whether the INVITE arrived over a confidential (TLS) transport. SDES SRTP keying is
+        // only honoured on a secure transport — see `caller_crypto` — so the media key is never
+        // exposed in cleartext SDP over plain UDP.
+        let secure = resp.is_secure();
+        if !secure && self.srtp_enabled && sdes::offers_savp(&body) {
+            tracing::warn!(%call_id, %src,
+                "caller offered SRTP/SAVP over a non-TLS transport; answering plain RTP (SDES key \
+                 would otherwise be exposed in cleartext SDP). Use SIPS to enable SRTP.");
+        }
+
+        // The caller's SDES key, if it offered SRTP over a secure transport — used to key the
+        // caller (leg A) side of a bridge/trunk and to answer the caller over RTP/SAVP.
+        let caller_crypto = self.caller_crypto(&body, secure);
 
         // Inbound DID: an INVITE from a carrier to a provisioned external number is routed to its
         // `destination_ref`. The effective target is that DID destination if matched, else the
@@ -663,7 +774,7 @@ impl SipServer {
             let vm_capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
             // Encrypt the voicemail media path when the caller offers SRTP: the capture stores the
             // decrypted G.711 (as before), only the wire is protected.
-            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body) {
+            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body, secure) {
                 Some((c, s)) => (Some(c), Some(s)),
                 None => (None, None),
             };
@@ -702,7 +813,7 @@ impl SipServer {
         // Echo path: non-mailbox destination (PSTN-style / +E.164), or a no-answer with
         // voicemail disabled. One UDP socket reflecting RTP back to the caller — decrypting then
         // re-encrypting each packet when the caller negotiated SRTP.
-        let (echo_crypto, echo_srtp) = match self.negotiate_srtp(&body) {
+        let (echo_crypto, echo_srtp) = match self.negotiate_srtp(&body, secure) {
             Some((c, s)) => (Some(c), Some(s)),
             None => (None, None),
         };
@@ -1488,15 +1599,18 @@ impl SipServer {
     /// `a=crypto` line to advertise back (a fresh CommOS key) and the [`srtp::SrtpSession`] that
     /// keys the media task — `inbound` from the caller's key, `outbound` from ours. `None` when
     /// SRTP is off or the caller offered plain RTP (which is then answered in the clear).
-    fn negotiate_srtp(&self, body: &str) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
-        Some(srtp_answer(&self.caller_crypto(body)?))
+    fn negotiate_srtp(&self, body: &str, secure: bool) -> Option<(sdes::CryptoAttr, srtp::SrtpSession)> {
+        Some(srtp_answer(&self.caller_crypto(body, secure)?))
     }
 
-    /// The caller's SDES key from its SDP `body`, when SRTP is enabled and the caller offered the
-    /// secure profile — the basis for keying the caller (leg A) side of a bridge/trunk or an
-    /// endpoint path. `None` for a plain-RTP caller (answered in the clear).
-    fn caller_crypto(&self, body: &str) -> Option<sdes::CryptoAttr> {
-        (self.srtp_enabled && sdes::offers_savp(body))
+    /// The caller's SDES key from its SDP `body`, when SRTP is enabled, the caller offered the
+    /// secure profile, AND the signalling arrived over a confidential (TLS) transport. SDES puts
+    /// the master key in the SDP, so accepting it over plaintext UDP would hand the key to any
+    /// passive observer of the signalling — no real confidentiality. Over cleartext transports we
+    /// therefore decline SRTP and answer plain RTP rather than pretend to encrypt. `None` for a
+    /// plain-RTP caller or an insecure transport.
+    fn caller_crypto(&self, body: &str, secure: bool) -> Option<sdes::CryptoAttr> {
+        (self.srtp_enabled && secure && sdes::offers_savp(body))
             .then(|| sdes::CryptoAttr::from_sdp(body))
             .flatten()
     }
@@ -1549,6 +1663,16 @@ impl SipServer {
 
 /// The user-part of a SIP URI: `sip:200@example.com` → `200`. Tolerates a leading `<` and
 /// the `sip:`/`sips:`/`tel:` schemes. Returns `None` for a domain-only URI (no `@`).
+/// Parse a digest `nc` (nonce-count) value — up to 8 hex digits per RFC 2617 — into a number
+/// for the replay guard. Returns `None` for a missing/malformed value (treated as "no nc").
+fn parse_nc(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 8 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(t, 16).ok()
+}
+
 fn user_part(uri: &str) -> Option<&str> {
     let s = uri
         .trim()
@@ -2043,6 +2167,17 @@ mod tests {
         assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
         assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
         assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    #[test]
+    fn parse_nc_accepts_hex_and_rejects_junk() {
+        assert_eq!(parse_nc("00000001"), Some(1));
+        assert_eq!(parse_nc("0000000a"), Some(10));
+        assert_eq!(parse_nc("ffffffff"), Some(u32::MAX));
+        // Malformed / overlong / non-hex → None (treated as "no nc").
+        assert_eq!(parse_nc(""), None);
+        assert_eq!(parse_nc("zzzz"), None);
+        assert_eq!(parse_nc("100000000"), None); // 9 hex digits
     }
 
     #[test]

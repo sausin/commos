@@ -104,14 +104,52 @@ pub async fn get_object(
 }
 
 /// `GET /v1/objects/{id}/content` — download the stored bytes with the recorded MIME type.
+///
+/// The stored `Content-Type` is attacker-controlled (set on upload), so serving it inline would
+/// let an uploaded `text/html`/`image/svg+xml` blob execute as script in the daemon's own origin
+/// (the same origin as `/dashboard`) — stored XSS. Defend on the way out: force a safe MIME for
+/// active types, always send `X-Content-Type-Options: nosniff` so the browser cannot re-sniff a
+/// benign type into an active one, and `Content-Disposition: attachment` so content is downloaded
+/// rather than rendered.
 pub async fn get_object_content(
     State(st): State<AppState>,
     t: TenantContext,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     let (obj, bytes) = st.objects.get_bytes(t.tenant_id, oid(&id)?).await.map_err(oerr)?;
-    let ct = obj.content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    Ok(([(header::CONTENT_TYPE, ct)], bytes))
+    let ct = sanitized_content_type(obj.content_type.as_deref());
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_DISPOSITION, "attachment".to_string()),
+        ],
+        bytes,
+    ))
+}
+
+/// Coerce a stored MIME type to something safe to serve. Anything that a browser could execute in
+/// our origin (HTML, SVG, XML, or a script/`javascript:` type) is downgraded to
+/// `application/octet-stream`; absent/other types pass through (and `nosniff` +
+/// `attachment` on the response prevent inline rendering regardless).
+fn sanitized_content_type(stored: Option<&str>) -> String {
+    let raw = stored.unwrap_or("application/octet-stream").trim();
+    let base = raw.split(';').next().unwrap_or(raw).trim().to_ascii_lowercase();
+    let dangerous = matches!(
+        base.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/xml"
+            | "application/xml"
+            | "application/javascript"
+            | "text/javascript"
+    );
+    if base.is_empty() || dangerous {
+        "application/octet-stream".to_string()
+    } else {
+        base
+    }
 }
 
 /// `DELETE /v1/objects/{id}` — remove the blob and its metadata.
@@ -122,4 +160,30 @@ pub async fn delete_object(
 ) -> Result<StatusCode, Problem> {
     st.objects.delete(t.tenant_id, oid(&id)?).await.map_err(oerr)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitized_content_type;
+
+    #[test]
+    fn active_types_are_downgraded() {
+        for ct in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "IMAGE/SVG+XML",
+            "application/javascript",
+            "application/xhtml+xml",
+        ] {
+            assert_eq!(sanitized_content_type(Some(ct)), "application/octet-stream", "{ct}");
+        }
+    }
+
+    #[test]
+    fn benign_types_pass_through_normalised() {
+        assert_eq!(sanitized_content_type(Some("audio/basic")), "audio/basic");
+        assert_eq!(sanitized_content_type(Some("image/png")), "image/png");
+        assert_eq!(sanitized_content_type(Some("application/pdf; x=1")), "application/pdf");
+        assert_eq!(sanitized_content_type(None), "application/octet-stream");
+    }
 }
