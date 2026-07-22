@@ -71,7 +71,9 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
 - **Control plane** — `control/routing.rs` (Call state machine, driven by `MediaFact`s + CDRs),
   `control/voicemail.rs`, `control/onboarding.rs`, `control/provisioning.rs`, `control/trunking.rs`.
 - **Provisioning** — `api/provision.rs` (per-vendor phone configs: Yealink/Grandstream/generic,
-  incl. NTP + timezone).
+  incl. NTP + timezone, voicemail Message-key code `*97`, Grandstream TR-069 off (`P1409=0`, kills
+  the "CPE connection failed" warning), and optional web-UI lockdown via `phone_admin_password`
+  SecretRef — Yealink `static.security.user_password`, Grandstream `P2`).
 - **State / wiring** — `state.rs` (`AppState`), `main.rs` (`run()` wires everything;
   `SipServer::new` and `AppState::new` are the big constructors).
 
