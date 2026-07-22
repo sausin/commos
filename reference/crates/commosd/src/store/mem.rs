@@ -973,6 +973,15 @@ impl Store for MemStore {
         let g = self.inner.lock().expect("store mutex not poisoned");
         Ok(page_from(&g.voicemail_order, |k| g.voicemails.get(k).cloned(), tenant, limit, cursor))
     }
+    async fn delete_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.voicemails.remove(&key).is_some();
+        if removed {
+            g.voicemail_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
 
     async fn put_sip_credential(&self, tenant: Uuid, username: &str, secret: &str) -> Result<(), StoreError> {
         let mut g = self.inner.lock().expect("store mutex not poisoned");

@@ -30,6 +30,10 @@
 #   --sip-tls-port <port>  SIPS (SIP/TLS) port (default: 5061)
 #   --bin <path>           Path to the commosd binary (default: auto-locate on PATH / target dir)
 #   --config <path>        Where to write pbx.yaml (default: <data-dir>/pbx.yaml)
+#   --sounds               Download the FreePBX audio prompt pack without prompting (voicemail
+#                          greeting, retrieval menu). Files are fetched to <data-dir>/sounds and
+#                          remain the property of FreePBX/Sangoma. Skipped if already present.
+#   --no-sounds            Do not download the audio prompt pack (voicemail falls back to a beep).
 #   --build                Build the binary from source with cargo if none is found
 #   --systemd              Install and enable a systemd service (needs root)
 #   --force                Overwrite an existing pbx.yaml
@@ -52,6 +56,12 @@ DO_TLS=0
 TLS_CERT=""
 TLS_KEY=""
 FORCE=0
+# Sounds: "" = ask (interactive) / attempt (non-interactive), 1 = yes, 0 = no.
+DO_SOUNDS=""
+# FreePBX's publicly-downloadable G.711 μ-law core sound pack. These prompts are the work of
+# FreePBX/Sangoma; we only fetch them onto the operator's system (we do not redistribute them).
+# See https://www.freepbx.org/ and https://github.com/FreePBX. Override the mirror if needed.
+SOUNDS_URL="${SOUNDS_URL:-https://downloads.freepbx.org/sounds/core-sounds-en-ulaw.tar.gz}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # the `reference/` workspace
@@ -77,6 +87,8 @@ while [ $# -gt 0 ]; do
     --sip-tls-port) SIP_TLS_PORT="$2"; shift 2;;
     --bin) BIN="$2"; shift 2;;
     --config) CONFIG="$2"; shift 2;;
+    --sounds) DO_SOUNDS=1; shift;;
+    --no-sounds) DO_SOUNDS=0; shift;;
     --build) DO_BUILD=1; shift;;
     --systemd) DO_SYSTEMD=1; shift;;
     --force) FORCE=1; shift;;
@@ -145,6 +157,53 @@ ok "using binary: $BIN"
 # ---- create data dir --------------------------------------------------------------------
 mkdir -p "$DATA_DIR"
 ok "data dir: $DATA_DIR"
+
+# ---- audio prompts (voicemail greeting + retrieval menu) --------------------------------
+# CommOS ships no audio of its own. The voicemail "please leave a message after the tone"
+# greeting and the *97/*98 retrieval menu use FreePBX's publicly-downloadable prompts, fetched
+# here onto this system. They remain the property of FreePBX/Sangoma — we credit them and only
+# download (never redistribute). If skipped, voicemail still works with a synthesized beep.
+SOUNDS_DIR="$DATA_DIR/sounds"
+download_sounds() {
+  # Idempotent: if the pack is already present, do nothing (upgrades don't re-download).
+  if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ] && [ "$FORCE" != "1" ]; then
+    ok "audio prompts already installed at $SOUNDS_DIR (skipping download; --force to refresh)"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || { warn "curl not found; skipping audio prompt download (voicemail will use a beep)."; return 0; }
+  echo
+  log "Audio prompts (voicemail greeting + *97/*98 menu):"
+  echo "    These prompts are the work of FreePBX / Sangoma (https://www.freepbx.org/,"
+  echo "    https://github.com/FreePBX) and remain their property. CommOS only downloads them"
+  echo "    onto this machine — it does not bundle or redistribute them."
+  echo "    Source: $SOUNDS_URL"
+  # Prompt when interactive and the operator hasn't already decided via a flag.
+  if [ -z "$DO_SOUNDS" ] && [ -t 0 ]; then
+    printf '    Download the FreePBX audio prompt pack now? [Y/n] '
+    read -r _ans || _ans=""
+    case "$_ans" in [Nn]*) DO_SOUNDS=0;; *) DO_SOUNDS=1;; esac
+  fi
+  # Non-interactive with no flag → default to downloading (voicemail is a core feature).
+  [ -z "$DO_SOUNDS" ] && DO_SOUNDS=1
+  if [ "$DO_SOUNDS" != "1" ]; then
+    warn "skipping audio prompt download — voicemail will use a synthesized beep. Re-run with --sounds to add them."
+    return 0
+  fi
+  mkdir -p "$SOUNDS_DIR/en"
+  log "downloading FreePBX audio prompts to $SOUNDS_DIR/en …"
+  # Non-fatal: a failure (offline install, bad mirror) must not abort the whole install.
+  if curl -fsSL "$SOUNDS_URL" | tar -xz -C "$SOUNDS_DIR/en" 2>/dev/null; then
+    if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
+      ok "audio prompts installed at $SOUNDS_DIR/en (courtesy of FreePBX / Sangoma)"
+    else
+      warn "audio pack downloaded but vm-intro.ulaw is missing — voicemail will use a beep. Check $SOUNDS_URL layout."
+    fi
+  else
+    warn "could not download audio prompts (offline, or mirror unreachable). Voicemail will use a beep."
+    warn "You can add them later: re-run with --sounds, or set SOUNDS_URL to a reachable mirror."
+  fi
+}
+download_sounds
 
 # ---- admin password (as a file-referenced secret, never inline) -------------------------
 ADMIN_YAML=""
@@ -291,7 +350,12 @@ echo
 log "Test the call path:"
 echo "    • Dial your own number  → echo test (you hear yourself = signalling + audio OK)"
 echo "    • Dial another phone's extension → two-way call"
+echo "    • Dial *97 → listen to your voicemail (7 delete, 9 save, # next)"
 echo
+if [ -f "$SOUNDS_DIR/en/vm-intro.ulaw" ]; then
+  log "Voicemail prompts: $SOUNDS_DIR/en  (audio courtesy of FreePBX / Sangoma — https://www.freepbx.org/)"
+  echo
+fi
 log "Security posture (secure-by-default — no extra config needed):"
 echo "    • The API auto-generates a JWT signing secret at $DATA_DIR/secrets/jwt.key on first boot."
 echo "    • From the LAN/loopback, the tenant:<uuid> dev token, dashboard, introspection, and phone"

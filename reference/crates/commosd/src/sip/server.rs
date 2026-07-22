@@ -50,9 +50,14 @@ const MAX_DATAGRAM: usize = 65_535;
 /// record forever; a graceful hangup (BYE) stops it sooner.
 const IVR_VOICEMAIL_MAX: Duration = Duration::from_secs(120);
 
-/// How long we wait for a registered callee to answer our outbound INVITE before falling
-/// back to the echo path so the caller's dial still completes.
-const CALLEE_ANSWER_TIMEOUT: Duration = Duration::from_secs(4);
+/// Wall-clock length of one "ring" of the standard ringback cadence (~2 s on + ~4 s off). The
+/// configured `no_answer_rings` is multiplied by this to get the no-answer timeout, so the
+/// operator can reason in rings while the wait is measured in time.
+const SECONDS_PER_RING: u64 = 6;
+
+/// How long the `*97`/`*98` retrieval menu waits for the caller's per-message action key
+/// (7 delete / 9 save / # next) after playing a message before advancing.
+const VM_MENU_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// RFC 3261 §17.1.1 initial retransmit interval (T1). Requests are re-sent at T1, 2·T1, 4·T1 …
 /// (capped at [`T2`]) until a response arrives, so a lost request on UDP is recovered.
@@ -90,11 +95,13 @@ impl Media {
     }
 }
 
-/// The callee leg of a bridged (B2BUA) call — the dialog identifiers we need to send a
-/// mid-dialog BYE toward the callee when the caller hangs up.
+/// One leg of a bridged (B2BUA) call — the dialog identifiers we need to send a mid-dialog BYE
+/// toward that leg's endpoint. Used for the **callee** leg (BYE it when the caller hangs up) and,
+/// symmetrically, for the **caller** leg (BYE it when the callee hangs up), so hanging up on
+/// either phone tears the other one down.
 ///
 /// TODO(B2BUA): this is best-effort. We reconstruct a BYE from the identifiers captured when
-/// the callee answered, but full RFC 3261 mid-dialog correctness (route sets, contact
+/// the leg was set up, but full RFC 3261 mid-dialog correctness (route sets, contact
 /// refresh, robust CSeq accounting) is not implemented.
 struct CalleeLeg {
     /// Where to send requests toward the callee (its Contact's host:port).
@@ -109,6 +116,28 @@ struct CalleeLeg {
     call_id: String,
     /// The CSeq number used for the outbound INVITE; the BYE uses `cseq + 1`.
     cseq: u32,
+}
+
+/// Preloaded audio prompts for the `*97`/`*98` retrieval session, already transcoded to the
+/// negotiated codec. An empty buffer means the file is not installed — playback simply skips it,
+/// so retrieval still works (via DTMF) with no sound pack. Preloaded in the request context (which
+/// has `&self`) and moved into the spawned driver.
+#[derive(Default)]
+struct RetrievalPrompts {
+    /// "You have"
+    youhave: Vec<u8>,
+    /// "messages" (plural)
+    messages: Vec<u8>,
+    /// "message" (singular)
+    message: Vec<u8>,
+    /// "No more messages."
+    no_more: Vec<u8>,
+    /// "Message deleted."
+    deleted: Vec<u8>,
+    /// "Please enter the mailbox number" (for *98).
+    enter_mailbox: Vec<u8>,
+    /// Spoken digits 0–9 (index = digit) for the count announcement.
+    digits: Vec<Vec<u8>>,
 }
 
 /// The mailbox a voicemail dialog is recording for. Set on the no-answer / offline-callee
@@ -130,6 +159,10 @@ struct Dialog {
     media: Media,
     /// Present only for bridged (internal) calls; `None` for the echo path.
     callee: Option<CalleeLeg>,
+    /// The caller leg's dialog identifiers, for a bridged/trunked call — so a BYE from the
+    /// *callee* can be propagated to the caller and hang its phone up too. `None` for
+    /// echo/voicemail/IVR dialogs (there is no second party to originate a BYE).
+    caller: Option<CalleeLeg>,
     /// Shared RTP capture buffer when recording is on; `None` when the call is not recorded.
     /// On hangup the buffer's bytes are persisted as a [`Recording`] — or, when `voicemail`
     /// is set, as a [`Voicemail`].
@@ -187,6 +220,9 @@ pub struct SipServer {
     recordings: RecordingService,
     /// Take a voicemail when an internal callee does not answer / is offline (Volume 7).
     voicemail_enabled: bool,
+    /// How long a called extension rings before an unanswered call diverts to voicemail/echo.
+    /// Derived from the configured `no_answer_rings` (× [`SECONDS_PER_RING`]).
+    no_answer_timeout: Duration,
     /// Voicemail service used to store captured audio and drive the MWI summary.
     voicemails: VoicemailService,
     /// IVR service — resolve an `ivr:<id>` routing target to its menu definition.
@@ -202,6 +238,14 @@ pub struct SipServer {
     /// Also offer SRTP toward an outbound carrier trunk (default off — carrier SRTP support is
     /// inconsistent and an `RTP/SAVP` offer a carrier can't answer would fail the call).
     trunk_srtp: bool,
+    /// Absolute directory of audio prompt files (`<sounds_dir>/en/<name>.ulaw`), resolved once at
+    /// boot from config (`{data_dir}/sounds` by default). Used for the voicemail greeting and the
+    /// `*97`/`*98` retrieval menu; a missing file falls back to a synthesized tone.
+    sounds_dir: String,
+    /// Path to the operator's phone display-name file (`{data_dir}/display_name.txt` by default):
+    /// the text a called phone shows as the calling party instead of the bare "commos". Re-read
+    /// per call so edits apply live; absent/empty → the default "commos".
+    display_name_file: String,
 }
 
 impl SipServer {
@@ -217,12 +261,15 @@ impl SipServer {
         record_calls: bool,
         recordings: RecordingService,
         voicemail_enabled: bool,
+        no_answer_rings: u32,
         voicemails: VoicemailService,
         ivrs: IvrService,
         objects: ObjectService,
         default_cc: impl Into<String>,
         srtp_enabled: bool,
         trunk_srtp: bool,
+        sounds_dir: impl Into<String>,
+        display_name_file: impl Into<String>,
     ) -> Self {
         SipServer {
             registrations,
@@ -238,12 +285,15 @@ impl SipServer {
             record_calls,
             recordings,
             voicemail_enabled,
+            no_answer_timeout: Duration::from_secs(no_answer_rings.max(1) as u64 * SECONDS_PER_RING),
             voicemails,
             ivrs,
             objects,
             default_cc: default_cc.into(),
             srtp_enabled,
             trunk_srtp,
+            sounds_dir: sounds_dir.into(),
+            display_name_file: display_name_file.into(),
         }
     }
 
@@ -567,10 +617,11 @@ impl SipServer {
         let trying = message::response(msg, 100, "Trying");
         resp.send(trying.as_bytes()).await?;
 
-        // Create the inbound Call in the control plane.
+        // Create the inbound Call in the control plane. Clone `from_ref` so the caller's identity
+        // remains available below (e.g. to resolve the caller's own mailbox for `*97`).
         let call = match self
             .routing
-            .create_inbound_call(self.default_tenant, from_ref, to_ref)
+            .create_inbound_call(self.default_tenant, from_ref.clone(), to_ref)
             .await
         {
             Ok(c) => c,
@@ -590,20 +641,17 @@ impl SipServer {
             None
         };
 
-        // SIP is the media plane here: report ring then answer as facts. Applied
-        // synchronously (we hold the Routing handle) so the Call is ANSWERED before we send
-        // 200 OK — a fast BYE then always finds an answered Call to hang up.
-        for fact in [
-            MediaFact::Rang { tenant_id: self.default_tenant, call_id },
-            MediaFact::Answered {
-                tenant_id: self.default_tenant,
-                call_id,
-                answered_at: Timestamp::now(),
-            },
-        ] {
-            if let Err(e) = self.routing.apply_fact(fact).await {
-                tracing::warn!(error = %e, %call_id, "applying SIP media fact failed");
-            }
+        // SIP is the media plane here: report the ring now. The Call goes to RINGING (a fast BYE
+        // while ringing is still a legal hang-up: Ringing → Ended). The ANSWERED fact is applied
+        // later, at the moment CommOS actually answers the caller with 200 OK — for a bridged call
+        // that is when the callee really picks up, so `answered_at` (and the billed duration) is
+        // the true connect time, not the INVITE-receipt time.
+        if let Err(e) = self
+            .routing
+            .apply_fact(MediaFact::Rang { tenant_id: self.default_tenant, call_id })
+            .await
+        {
+            tracing::warn!(error = %e, %call_id, "applying SIP ring fact failed");
         }
 
         // Route the dialled number through the Extension→Route table (control-plane routing,
@@ -652,6 +700,18 @@ impl SipServer {
         }
         let target: String = did_dest.clone().unwrap_or_else(|| effective_uri.to_string());
 
+        // Feature codes for voicemail retrieval (the "voicemail button" / dial-in). Handled here
+        // in the SIP layer like `ivr:`/`voicemail` targets — no dialplan entry needed:
+        //   *97 — listen to your OWN mailbox (the caller's extension),
+        //   *98 — listen to ANOTHER mailbox (the extension is entered via DTMF).
+        let dialed = user_part(request_uri).unwrap_or("");
+        if dialed == "*97" || dialed == "*98" {
+            let own_mailbox = if dialed == "*97" { user_part(&from_ref).map(str::to_string) } else { None };
+            return self
+                .answer_with_voicemail_retrieval(resp, msg, call_id, &call_id_hdr, g711, te_pt, own_mailbox)
+                .await;
+        }
+
         // The target (from a DID or an extension route) may name an `ivr:<id>` menu: run the IVR
         // runtime (answer with SDP, play the prompt, collect DTMF).
         if let Some(ivr_id) = match ivr_id_of(&target) {
@@ -673,6 +733,9 @@ impl SipServer {
         // offline) diverts to voicemail.
         if voicemail_target.is_none() {
             if let Some(callee_reg) = find_registered(&self.registrations, self.default_tenant, &target) {
+                // Tell the caller's phone the callee is ringing (early dialog) so it shows a
+                // "ringing" state instead of dead air while we ring the callee for real.
+                let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
                 match self.try_bridge(&callee_reg, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
                     Some((bridge, callee_leg, sel_codec, sel_te, leg_a_crypto)) => {
                         let leg_a_port = bridge.leg_a_port;
@@ -687,6 +750,7 @@ impl SipServer {
                                     call_id,
                                     media: Media::Bridge(bridge),
                                     callee: Some(callee_leg),
+                                    caller: Some(self.caller_leg(msg, call_id, src)),
                                     capture: capture.clone(),
                                     voicemail: None,
                                     info_tx: None,
@@ -701,6 +765,8 @@ impl SipServer {
                         } else {
                             bridge.abort();
                         }
+                        // The callee actually picked up: this is the true connect time.
+                        self.mark_answered(call_id).await;
                         let ok = self.build_invite_ok(msg, &sdp, call_id);
                         tracing::info!(%call_id, leg_a_port, callee = %callee_reg.contact,
                             codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE bridged to registered callee");
@@ -735,6 +801,8 @@ impl SipServer {
         // dialling a real phone number reaches it. Falls through to echo if the trunk fails.
         if voicemail_target.is_none() {
             if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
+                // Signal ringing to the caller while we place the outbound leg to the carrier.
+                let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
                 if let Some((bridge, leg, sel_codec, sel_te, leg_a_crypto)) = self.try_trunk(&gateway, &e164, call_id, capture.clone(), &offer, caller_crypto.as_ref()).await {
                     let leg_a_port = bridge.leg_a_port;
                     // Answer the caller with the carrier's selected codec (transparent relay),
@@ -748,6 +816,7 @@ impl SipServer {
                                 call_id,
                                 media: Media::Bridge(bridge),
                                 callee: Some(leg),
+                                caller: Some(self.caller_leg(msg, call_id, src)),
                                 capture: capture.clone(),
                                 voicemail: None,
                                 info_tx: None,
@@ -758,6 +827,8 @@ impl SipServer {
                     } else {
                         bridge.abort();
                     }
+                    // The carrier answered: true connect time.
+                    self.mark_answered(call_id).await;
                     let ok = self.build_invite_ok(msg, &sdp, call_id);
                     tracing::info!(%call_id, %e164, gateway = ?gateway.address, codec = %sel_codec.name, srtp = leg_a_crypto.is_some(), "SIP INVITE routed outbound via trunk");
                     return resp.send(ok.as_bytes()).await;
@@ -766,47 +837,64 @@ impl SipServer {
             }
         }
 
-        // Voicemail path: answer the caller and capture their audio — stored as a Voicemail on
-        // hangup — regardless of `record_calls` (a voicemail is always captured). Greeting/beep
-        // prompt playback is future work (it ties into the IVR prompt runtime); for now the
-        // caller is connected to a capturing echo, exactly as the recording path is.
+        // Voicemail deposit path: answer the caller, play a greeting ("please leave your message
+        // after the tone") and a beep, then capture ONLY the audio after the beep — stored as a
+        // Voicemail on hangup, with an MWI pushed to the mailbox. This reuses the IVR prompt
+        // runtime, so — like the IVR menu path — the media is plaintext G.711 (SRTP for
+        // prompt-bearing media is future work); a phone that offered SRTP is answered plain RTP.
         if let Some(vmbox) = voicemail_target {
-            let vm_capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
-            // Encrypt the voicemail media path when the caller offers SRTP: the capture stores the
-            // decrypted G.711 (as before), only the wire is protected.
-            let (vm_crypto, vm_srtp) = match self.negotiate_srtp(&body, secure) {
-                Some((c, s)) => (Some(c), Some(s)),
-                None => (None, None),
-            };
-            let (rtp_port, task) = match rtp::bind_echo(Some(vm_capture.clone()), vm_srtp).await {
-                Ok((port, task)) => (port, Some(task)),
+            let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "could not bind RTP for voicemail; answering without media");
-                    (0, None)
+                    // Answer anyway so the caller isn't left hanging; no capture is possible.
+                    self.mark_answered(call_id).await;
+                    let sdp = self.build_sdp(0, &g711_codec, te_pt, None);
+                    let ok = self.build_invite_ok(msg, &sdp, call_id);
+                    return resp.send(ok.as_bytes()).await;
                 }
             };
-            // Answer with G.711 so the captured voicemail is a storable/playable codec.
-            let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, vm_crypto.as_ref());
-            if let Some(task) = task {
-                if !call_id_hdr.is_empty() {
-                    self.dialogs.lock().expect("dialogs mutex").insert(
-                        call_id_hdr,
-                        Dialog {
-                            call_id,
-                            media: Media::Echo(task),
-                            callee: None,
-                            capture: Some(vm_capture),
-                            voicemail: Some(vmbox),
-                            info_tx: None,
-                            answer_sdp: sdp.clone(),
-                        },
-                    );
-                } else {
-                    task.abort();
-                }
+            let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            // Greeting = the recorded "leave a message after the tone" prompt (when the sound pack
+            // is installed) followed by a 250 ms beep. With no prompt installed it is just the beep.
+            let greeting = self.voicemail_greeting(g711).await;
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn(Self::voicemail_deposit_driver(
+                sock,
+                g711,
+                te_pt,
+                greeting,
+                self.default_tenant,
+                call_id,
+                vmbox,
+                self.voicemails.clone(),
+                self.media_ip,
+                stop_rx,
+            ));
+            // Answer plaintext G.711 (prompt-bearing media path, like the IVR menu).
+            let sdp = self.build_sdp(rtp_port, &g711_codec, te_pt, None);
+            if !call_id_hdr.is_empty() {
+                self.dialogs.lock().expect("dialogs mutex").insert(
+                    call_id_hdr,
+                    Dialog {
+                        call_id,
+                        // Media::Ivr tears down gracefully on BYE (signals `stop` so the deposit
+                        // driver saves whatever was recorded before exiting).
+                        media: Media::Ivr { task, stop: stop_tx },
+                        callee: None,
+                        caller: None,
+                        capture: None,
+                        voicemail: None,
+                        info_tx: None,
+                        answer_sdp: sdp.clone(),
+                    },
+                );
+            } else {
+                let _ = stop_tx.send(true);
             }
+            self.mark_answered(call_id).await;
             let ok = self.build_invite_ok(msg, &sdp, call_id);
-            tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, srtp = vm_crypto.is_some(), "SIP INVITE answered (voicemail)");
+            tracing::info!(%call_id, rtp_port, codec = %g711_codec.name, "SIP INVITE answered (voicemail deposit)");
             return resp.send(ok.as_bytes()).await;
         }
 
@@ -835,6 +923,7 @@ impl SipServer {
                         call_id,
                         media: Media::Echo(task),
                         callee: None,
+                        caller: None,
                         capture: capture.clone(),
                         voicemail: None,
                         info_tx: None,
@@ -845,6 +934,8 @@ impl SipServer {
                 task.abort();
             }
         }
+        // CommOS answers the caller directly (echo/PSTN-style): connect time is now.
+        self.mark_answered(call_id).await;
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, rtp_port, codec = %reflect.name, srtp = echo_crypto.is_some(), "SIP INVITE answered (RTP echo)");
         resp.send(ok.as_bytes()).await
@@ -988,6 +1079,8 @@ impl SipServer {
 
         let (info_tx, info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        // The display name to present if this IVR session transfers the caller to an extension.
+        let display = self.call_display_name(call_id).await;
         let task = tokio::spawn(Self::ivr_driver(
             sock,
             cfg,
@@ -996,6 +1089,8 @@ impl SipServer {
             self.voicemails.clone(),
             self.registrations.clone(),
             self.media_ip,
+            self.no_answer_timeout,
+            display,
             info_rx,
             stop_rx,
         ));
@@ -1009,6 +1104,7 @@ impl SipServer {
                     call_id,
                     media: Media::Ivr { task, stop: stop_tx },
                     callee: None,
+                    caller: None,
                     capture: None,
                     voicemail: None,
                     info_tx: Some(info_tx),
@@ -1019,6 +1115,8 @@ impl SipServer {
             let _ = stop_tx.send(true); // no dialog key to track it → stop the session
         }
 
+        // The caller is connected to the IVR menu: answered.
+        self.mark_answered(call_id).await;
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         tracing::info!(%call_id, %ivr_id, rtp_port, codec = %g711.sdp_name(), "SIP INVITE answered (IVR menu)");
         resp.send(ok.as_bytes()).await
@@ -1037,6 +1135,8 @@ impl SipServer {
         voicemails: VoicemailService,
         registrations: RegistrationRegistry,
         media_ip: IpAddr,
+        no_answer_timeout: Duration,
+        display: Option<String>,
         mut info_rx: tokio::sync::mpsc::UnboundedReceiver<char>,
         mut stop_rx: tokio::sync::watch::Receiver<bool>,
     ) {
@@ -1072,7 +1172,7 @@ impl SipServer {
                 if let (Some(peer), Some(callee)) =
                     (result.peer, find_registered(&registrations, tenant, &destination))
                 {
-                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, cfg.codec, cfg.te_pt, &mut stop_rx).await {
+                    if ivr_transfer(&sock, peer, &callee, media_ip, call_id, cfg.codec, cfg.te_pt, no_answer_timeout, display.clone(), &mut stop_rx).await {
                         return; // relayed until the caller hung up
                     }
                 } else {
@@ -1086,6 +1186,260 @@ impl SipServer {
                 let _ = stop_rx.changed().await;
             }
         }
+    }
+
+    /// Load an audio prompt (`<sounds_dir>/en/<name>.ulaw`, raw G.711 μ-law) and transcode it to
+    /// `codec`. Returns `None` when the file is missing/empty — the caller falls back to a
+    /// synthesized tone, so the system works with no sound pack installed. `name` may include a
+    /// subdirectory (e.g. `digits/5`).
+    async fn load_prompt(&self, name: &str, codec: g711::G711) -> Option<Vec<u8>> {
+        let path = format!("{}/en/{}.ulaw", self.sounds_dir, name);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) if !bytes.is_empty() => Some(g711::transcode_ulaw(&bytes, codec)),
+            _ => None,
+        }
+    }
+
+    /// The voicemail deposit greeting: the recorded "please leave your message after the tone"
+    /// prompt (`vm-intro`) when the sound pack is installed, followed by a 250 ms beep. Only audio
+    /// after the beep is captured. With no sound pack it is the beep alone.
+    async fn voicemail_greeting(&self, codec: g711::G711) -> Vec<u8> {
+        let mut greeting = self.load_prompt("vm-intro", codec).await.unwrap_or_default();
+        greeting.extend_from_slice(&g711::beep(250, codec));
+        greeting
+    }
+
+    /// Preload the retrieval prompt buffers (transcoded to `codec`) so the spawned driver — which
+    /// has no `&self` handle — can voice the count/feedback. Missing files become empty buffers.
+    async fn load_retrieval_prompts(&self, codec: g711::G711) -> RetrievalPrompts {
+        let mut digits: Vec<Vec<u8>> = Vec::with_capacity(10);
+        for d in 0..10 {
+            digits.push(self.load_prompt(&format!("digits/{d}"), codec).await.unwrap_or_default());
+        }
+        RetrievalPrompts {
+            youhave: self.load_prompt("vm-youhave", codec).await.unwrap_or_default(),
+            messages: self.load_prompt("vm-messages", codec).await.unwrap_or_default(),
+            message: self.load_prompt("vm-message", codec).await.unwrap_or_default(),
+            no_more: self.load_prompt("vm-nomore", codec).await.unwrap_or_default(),
+            deleted: self.load_prompt("vm-deleted", codec).await.unwrap_or_default(),
+            enter_mailbox: self.load_prompt("vm-extension", codec).await.unwrap_or_default(),
+            digits,
+        }
+    }
+
+    /// Answer a `*97`/`*98` retrieval call: bind RTP, answer `200 OK` (plaintext G.711, like the
+    /// IVR menu path), and spawn the retrieval session (announce the count, play each message,
+    /// handle the DTMF menu). `own_mailbox` is the caller's own extension for `*97`; for `*98` it
+    /// is `None` and the driver prompts for the mailbox number over DTMF. Falls back to the echo
+    /// path if the media socket cannot bind.
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_with_voicemail_retrieval(
+        &self,
+        resp: &Responder,
+        msg: &SipMessage,
+        call_id: Uuid,
+        call_id_hdr: &str,
+        g711: g711::G711,
+        te_pt: u8,
+        own_mailbox: Option<String>,
+    ) -> std::io::Result<()> {
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not bind RTP for voicemail retrieval; echo fallback");
+                return self.answer_with_echo(resp, msg, call_id, call_id_hdr).await;
+            }
+        };
+        let rtp_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+        let prompts = self.load_retrieval_prompts(g711).await;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(Self::voicemail_retrieval_driver(
+            sock,
+            g711,
+            te_pt,
+            own_mailbox,
+            prompts,
+            self.voicemails.clone(),
+            self.registrations.clone(),
+            self.default_tenant,
+            self.media_ip,
+            stop_rx,
+        ));
+        let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
+        let sdp = self.build_sdp(rtp_port, &audio, te_pt, None);
+        if !call_id_hdr.is_empty() {
+            self.dialogs.lock().expect("dialogs mutex").insert(
+                call_id_hdr.to_string(),
+                Dialog {
+                    call_id,
+                    media: Media::Ivr { task, stop: stop_tx },
+                    callee: None,
+                    caller: None,
+                    capture: None,
+                    voicemail: None,
+                    info_tx: None,
+                    answer_sdp: sdp.clone(),
+                },
+            );
+        } else {
+            let _ = stop_tx.send(true);
+        }
+        self.mark_answered(call_id).await;
+        let ok = self.build_invite_ok(msg, &sdp, call_id);
+        tracing::info!(%call_id, rtp_port, "SIP INVITE answered (voicemail retrieval *97/*98)");
+        resp.send(ok.as_bytes()).await
+    }
+
+    /// Play the greeting/beep, then record the caller until they hang up (graceful `stop`) or the
+    /// recording cap, and store the captured audio as a Voicemail with an MWI push. Reuses the IVR
+    /// media primitives so only post-tone audio is captured.
+    #[allow(clippy::too_many_arguments)]
+    async fn voicemail_deposit_driver(
+        sock: UdpSocket,
+        codec: g711::G711,
+        te_pt: u8,
+        greeting: Vec<u8>,
+        tenant: Uuid,
+        call_id: Uuid,
+        vmbox: VoicemailBox,
+        voicemails: VoicemailService,
+        media_ip: IpAddr,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let (_info_tx, mut info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
+        let mut peer: Option<SocketAddr> = None;
+        // Play the greeting (latching the caller). The window is the greeting's own length plus a
+        // small margin (G.711 is 8 bytes/ms); a DTMF keypress skips straight to recording.
+        let window = Duration::from_millis((greeting.len() as u64 / 8) + 400);
+        tokio::select! {
+            _ = ivr::play_and_collect(&sock, &greeting, codec.payload_type(), te_pt, window, &mut info_rx, &mut peer) => {}
+            _ = stop_rx.changed() => return, // hung up during the greeting
+        }
+        // Record only what comes after the tone, until hangup or the cap.
+        let capture: rtp::Capture = Arc::new(Mutex::new(Vec::new()));
+        ivr::record_until_stop(&sock, te_pt, &capture, &mut stop_rx, IVR_VOICEMAIL_MAX).await;
+        let audio = std::mem::take(&mut *capture.lock().expect("capture mutex"));
+        if audio.is_empty() {
+            tracing::info!(%call_id, "voicemail deposit: nothing recorded after the tone");
+            return;
+        }
+        match voicemails.save(tenant, call_id, None, &audio).await {
+            Ok(vm) => {
+                tracing::info!(%call_id, voicemail_id = %vm.base.id, bytes = audio.len(), mailbox = %vmbox.aor,
+                    "voicemail saved (after greeting)");
+                if let Some((addr, contact)) = &vmbox.notify {
+                    let number = user_part(&vmbox.aor).unwrap_or("");
+                    let (new, old) = voicemails.mailbox_summary(tenant, number).await.unwrap_or((1, 0));
+                    send_mwi_notify(*addr, contact, &vmbox.aor, media_ip, new, old).await;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, %call_id, "saving voicemail failed"),
+        }
+    }
+
+    /// Drive a `*97`/`*98` retrieval session: (optionally prompt for a mailbox number), announce
+    /// the message count, then play each message and act on the DTMF menu — `7` delete, `9` save,
+    /// `#`/timeout next. Playing a message marks it read (heard). On exit, push a fresh MWI so the
+    /// phone's lamp reflects what remains. All playback is interruptible by hangup.
+    #[allow(clippy::too_many_arguments)]
+    async fn voicemail_retrieval_driver(
+        sock: UdpSocket,
+        codec: g711::G711,
+        te_pt: u8,
+        own_mailbox: Option<String>,
+        prompts: RetrievalPrompts,
+        voicemails: VoicemailService,
+        registrations: RegistrationRegistry,
+        tenant: Uuid,
+        media_ip: IpAddr,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let audio_pt = codec.payload_type();
+        let (_info_tx, mut info_rx) = tokio::sync::mpsc::unbounded_channel::<char>();
+        let mut peer: Option<SocketAddr> = None;
+
+        // Resolve the mailbox: *97 already knows it (the caller); *98 collects it via DTMF.
+        let mailbox = match own_mailbox {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                let entered = tokio::select! {
+                    e = collect_digits(&sock, &prompts.enter_mailbox, audio_pt, te_pt, &mut info_rx, &mut peer) => e,
+                    _ = stop_rx.changed() => return,
+                };
+                match entered {
+                    Some(m) if !m.is_empty() => m,
+                    _ => return,
+                }
+            }
+        };
+
+        let msgs = match voicemails.list_for_mailbox(tenant, &mailbox).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, mailbox = %mailbox, "voicemail retrieval: list failed");
+                return;
+            }
+        };
+        let new_count = msgs.iter().filter(|m| !m.read).count();
+        tracing::info!(mailbox = %mailbox, total = msgs.len(), new = new_count, "voicemail retrieval started");
+
+        // "You have N message(s)."
+        let count_prompt = build_count_prompt(&prompts, new_count);
+        if !count_prompt.is_empty() {
+            let window = Duration::from_millis((count_prompt.len() as u64 / 8) + 400);
+            tokio::select! {
+                _ = ivr::play_and_collect(&sock, &count_prompt, audio_pt, te_pt, window, &mut info_rx, &mut peer) => {}
+                _ = stop_rx.changed() => return,
+            }
+        }
+
+        for vm in &msgs {
+            // Fetch + transcode the stored message audio (voicemails are stored as μ-law).
+            let audio = match voicemails.get_audio(tenant, vm.base.id).await {
+                Ok((_v, raw)) => g711::transcode_ulaw(&raw, codec),
+                Err(e) => {
+                    tracing::warn!(error = %e, "voicemail retrieval: audio fetch failed");
+                    continue;
+                }
+            };
+            if let Some(p) = peer {
+                tokio::select! {
+                    _ = ivr::play(&sock, p, audio_pt, &audio) => {}
+                    _ = stop_rx.changed() => return,
+                }
+            }
+            // Per-message menu: 7 = delete, anything else (9/#/timeout) = keep & mark read.
+            let digit = tokio::select! {
+                d = ivr::play_and_collect(&sock, &[], audio_pt, te_pt, VM_MENU_TIMEOUT, &mut info_rx, &mut peer) => d,
+                _ = stop_rx.changed() => return,
+            };
+            match digit {
+                Some('7') => {
+                    if let Err(e) = voicemails.delete(tenant, vm.base.id).await {
+                        tracing::warn!(error = %e, "voicemail retrieval: delete failed");
+                    } else if let (Some(p), false) = (peer, prompts.deleted.is_empty()) {
+                        ivr::play(&sock, p, audio_pt, &prompts.deleted).await;
+                    }
+                }
+                _ => {
+                    let _ = voicemails.mark_read(tenant, vm.base.id).await;
+                }
+            }
+        }
+
+        // "No more messages."
+        if let (Some(p), false) = (peer, prompts.no_more.is_empty()) {
+            ivr::play(&sock, p, audio_pt, &prompts.no_more).await;
+        }
+
+        // Refresh the MWI lamp to whatever remains for this mailbox.
+        if let Some(reg) = find_registered(&registrations, tenant, &mailbox) {
+            if let Some(addr) = resolve_contact_addr(&reg.contact).await {
+                let (new, old) = voicemails.mailbox_summary(tenant, &mailbox).await.unwrap_or((0, 0));
+                send_mwi_notify(addr, &reg.contact, &reg.aor, media_ip, new, old).await;
+            }
+        }
+        tracing::info!(mailbox = %mailbox, "voicemail retrieval finished");
     }
 
     /// Answer an INVITE with a plain RTP echo path (the IVR fallback). One UDP socket
@@ -1117,6 +1471,7 @@ impl SipServer {
                         call_id,
                         media: Media::Echo(task),
                         callee: None,
+                        caller: None,
                         capture: None,
                         voicemail: None,
                         info_tx: None,
@@ -1127,6 +1482,7 @@ impl SipServer {
                 task.abort();
             }
         }
+        self.mark_answered(call_id).await;
         let ok = self.build_invite_ok(msg, &sdp, call_id);
         resp.send(ok.as_bytes()).await
     }
@@ -1135,7 +1491,7 @@ impl SipServer {
     ///
     /// Binds a two-leg [`rtp::Bridge`], sends an INVITE offering leg B to the callee's
     /// contact over a **dedicated** UDP socket (so it never contends with the main ingress
-    /// loop), waits (skipping 1xx) for a 2xx up to [`CALLEE_ANSWER_TIMEOUT`], ACKs it, and
+    /// loop), waits (skipping 1xx) for a 2xx up to the configured no-answer timeout, ACKs it, and
     /// returns the live bridge plus the callee-leg dialog state. Returns `None` — after
     /// aborting the bridge — on any failure (unresolvable contact, no answer, rejection).
     ///
@@ -1189,7 +1545,9 @@ impl SipServer {
         // Outbound-leg dialog identifiers, derived from the CommOS Call id.
         let leg_call_id = format!("{}@commos", call_id.to_string().replace('-', ""));
         let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
-        let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
+        // Present the operator's configurable display name (or the bare "commos") to the callee.
+        let display = self.call_display_name(call_id).await;
+        let from_hdr = commos_from_header(self.media_ip, display.as_deref(), &from_tag);
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cseq_num: u32 = 1;
 
@@ -1212,7 +1570,7 @@ impl SipServer {
 
         // Send the INVITE and wait for the callee's final answer, retransmitting until it responds
         // (RFC 3261 client transaction); a non-2xx (or no answer) falls back to voicemail/echo.
-        let resp = match send_invite_await_final(&sock, invite.as_bytes(), addr, CALLEE_ANSWER_TIMEOUT).await {
+        let resp = match send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await {
             Some(r) if (200..300).contains(&r.status().unwrap_or(0)) => r,
             _ => return None,
         };
@@ -1356,7 +1714,7 @@ impl SipServer {
                 headers.push((name, value.clone()));
             }
             let invite = message::request("INVITE", &request_uri, &headers, Some(("application/sdp", &sdp)));
-            let msg = match send_invite_await_final(&sock, invite.as_bytes(), addr, CALLEE_ANSWER_TIMEOUT).await {
+            let msg = match send_invite_await_final(&sock, invite.as_bytes(), addr, self.no_answer_timeout).await {
                 Some(m) => m,
                 None => return None,
             };
@@ -1435,28 +1793,29 @@ impl SipServer {
         Some((bridge, leg, sel_codec, sel_te, leg_a_crypto))
     }
 
-    /// Mid-dialog BYE toward the callee leg of a bridged call, sent as a reliable non-INVITE
-    /// transaction: retransmitted until the callee confirms with a final response (or the
-    /// transaction times out), so a lost BYE still tears the callee leg down.
+    /// Mid-dialog BYE toward one leg of a bridged call, sent as a reliable non-INVITE
+    /// transaction: retransmitted until the endpoint confirms with a final response (or the
+    /// transaction times out), so a lost BYE still tears that leg down. Used for both directions —
+    /// the callee leg (caller hung up) and the caller leg (callee hung up).
     ///
     /// TODO(B2BUA): this reconstructs the BYE from captured identifiers only; full RFC 3261
     /// mid-dialog correctness (route sets, contact refresh) is still out of scope.
-    async fn send_bye_to_callee(&self, callee: &CalleeLeg) {
+    async fn send_bye_to_leg(&self, leg: &CalleeLeg) {
         let bye = message::request(
             "BYE",
-            &callee.request_uri,
+            &leg.request_uri,
             &[
-                ("From", callee.from.clone()),
-                ("To", callee.to.clone()),
-                ("Call-ID", callee.call_id.clone()),
-                ("CSeq", format!("{} BYE", callee.cseq + 1)),
+                ("From", leg.from.clone()),
+                ("To", leg.to.clone()),
+                ("Call-ID", leg.call_id.clone()),
+                ("CSeq", format!("{} BYE", leg.cseq + 1)),
             ],
             None,
         );
-        if send_request_reliable(bye.as_bytes(), callee.addr).await {
-            tracing::info!(addr = %callee.addr, "callee leg BYE confirmed");
+        if send_request_reliable(bye.as_bytes(), leg.addr).await {
+            tracing::info!(addr = %leg.addr, "bridged leg BYE confirmed");
         } else {
-            tracing::debug!(addr = %callee.addr, "callee leg BYE unconfirmed (no final response)");
+            tracing::debug!(addr = %leg.addr, "bridged leg BYE unconfirmed (no final response)");
         }
     }
 
@@ -1552,10 +1911,16 @@ impl SipServer {
                             .lock()
                             .expect("aliases mutex")
                             .remove(&callee.call_id);
-                        // If the CALLER hung up, tear the callee leg down with a BYE. If the
-                        // callee originated this BYE, it is already gone — do not echo one back.
-                        if !from_callee {
-                            self.send_bye_to_callee(callee).await;
+                        if from_callee {
+                            // The CALLEE hung up: propagate the BYE to the CALLER so its phone
+                            // disconnects too (otherwise it stays "up" with dead air). The callee
+                            // is already gone, so we do not echo a BYE back to it.
+                            if let Some(caller) = &d.caller {
+                                self.send_bye_to_leg(caller).await;
+                            }
+                        } else {
+                            // The CALLER hung up: tear the callee leg down with a BYE.
+                            self.send_bye_to_leg(callee).await;
                         }
                     }
                     d.media.abort();
@@ -1613,6 +1978,106 @@ impl SipServer {
         (self.srtp_enabled && secure && sdes::offers_savp(body))
             .then(|| sdes::CryptoAttr::from_sdp(body))
             .flatten()
+    }
+
+    /// Mark the Call ANSWERED at the instant CommOS answers the caller with 200 OK — the true
+    /// connect time. Called from every answer path (bridge, trunk, voicemail, echo, IVR) just
+    /// before the 200 OK goes out. Best-effort: a failure is logged, never fatal to the call
+    /// (an already-answered Call — e.g. an IVR that then bridges — simply logs an illegal
+    /// transition, which is harmless).
+    async fn mark_answered(&self, call_id: Uuid) {
+        if let Err(e) = self
+            .routing
+            .apply_fact(MediaFact::Answered {
+                tenant_id: self.default_tenant,
+                call_id,
+                answered_at: Timestamp::now(),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, %call_id, "marking call answered failed");
+        }
+    }
+
+    /// Capture the caller leg's dialog identifiers from its INVITE, so a callee-originated BYE can
+    /// be propagated back to the caller (tearing its phone down too). CommOS is the UAS on this
+    /// leg: our local identity is the caller's `To` plus the tag we answered with, the remote is
+    /// the caller's `From`, and the BYE is sent to the caller's actual socket (`src`) — reliable on
+    /// UDP even behind NAT. Uses the caller's `Contact` as the request-URI, falling back to `From`.
+    fn caller_leg(&self, msg: &SipMessage, call_id: Uuid, src: SocketAddr) -> CalleeLeg {
+        let our_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
+        let from = match msg.header("To") {
+            Some(to) if msg.to_tag().is_some() => to.to_string(),
+            Some(to) => format!("{to};tag={our_tag}"),
+            None => format!("<sip:commos@{}>;tag={our_tag}", self.media_ip),
+        };
+        let to = msg
+            .header("From")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("<sip:{src}>"));
+        let request_uri = msg
+            .header("Contact")
+            .and_then(extract_uri)
+            .or_else(|| msg.header("From").and_then(extract_uri))
+            .unwrap_or_else(|| format!("sip:{src}"));
+        CalleeLeg {
+            addr: src,
+            request_uri,
+            from,
+            to,
+            call_id: msg.call_id().unwrap_or("").to_string(),
+            cseq: 1,
+        }
+    }
+
+    /// The display name a called phone should show as the calling party for this call — the
+    /// operator's configurable text, read from `display_name_file`. One non-empty line → that text
+    /// on every call; multiple lines → one selected per call (varied by `call_id`). `None` when the
+    /// file is absent or empty, so callers fall back to the bare "commos" identity. Re-read per
+    /// call so edits to the file apply without a restart (the file is tiny and local).
+    async fn call_display_name(&self, call_id: Uuid) -> Option<String> {
+        let content = tokio::fs::read_to_string(&self.display_name_file).await.ok()?;
+        let lines: Vec<&str> = content.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let line = match lines.len() {
+            0 => return None,
+            1 => lines[0],
+            n => lines[display_line_index(call_id, n)],
+        };
+        let sanitized = sip_display_name(line);
+        (!sanitized.is_empty()).then_some(sanitized)
+    }
+
+    /// Build a `180 Ringing` provisional for the caller's INVITE, establishing the early dialog
+    /// with the same To-tag the eventual 200 OK will carry (so the phone treats them as one
+    /// dialog and shows a ringing indication while CommOS rings the callee). No SDP.
+    fn build_ringing(&self, msg: &SipMessage, call_id: Uuid) -> String {
+        let mut out = String::with_capacity(256);
+        out.push_str("SIP/2.0 180 Ringing\r\n");
+        for via in msg.header_all("Via") {
+            out.push_str(&format!("Via: {via}\r\n"));
+        }
+        if let Some(from) = msg.header("From") {
+            out.push_str(&format!("From: {from}\r\n"));
+        }
+        if let Some(to) = msg.header("To") {
+            if msg.to_tag().is_some() {
+                out.push_str(&format!("To: {to}\r\n"));
+            } else {
+                // Same tag derivation as `build_invite_ok`, so 180 and 200 share one dialog.
+                let tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
+                out.push_str(&format!("To: {to};tag={tag}\r\n"));
+            }
+        }
+        if let Some(cid) = msg.call_id() {
+            out.push_str(&format!("Call-ID: {cid}\r\n"));
+        }
+        if let Some(cseq) = msg.header("CSeq") {
+            out.push_str(&format!("CSeq: {cseq}\r\n"));
+        }
+        out.push_str(&format!("Contact: <sip:commos@{}>\r\n", self.media_ip));
+        out.push_str("Server: commosd\r\n");
+        out.push_str("Content-Length: 0\r\n\r\n");
+        out
     }
 
     /// Build a `200 OK` for an INVITE with an SDP body, echoing the dialog headers. (The
@@ -1685,6 +2150,44 @@ fn user_part(uri: &str) -> Option<&str> {
         None
     } else {
         Some(user)
+    }
+}
+
+/// Pick which display-name line to use for a call when the file has several, varied per call so
+/// the messages rotate. Derived from the call id's random bits (UUIDv7), so it is stable for a
+/// given call but differs between calls without needing an RNG.
+fn display_line_index(call_id: Uuid, n: usize) -> usize {
+    let sum: u32 = call_id.to_string().bytes().map(u32::from).sum();
+    (sum as usize) % n.max(1)
+}
+
+/// Sanitise operator-provided text into a SIP display-name **quoted-string** payload (without the
+/// surrounding quotes): drop control characters (so it can't inject headers), escape `\` and `"`
+/// per RFC 3261, and cap the length so a stray huge line can't bloat every INVITE.
+fn sip_display_name(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Build a CommOS outbound-leg `From` header value, prefixing the configurable display name (the
+/// text a called phone shows as the calling party) when one is set. `tag` is the leg's from-tag.
+/// With no display name it is the bare `<sip:commos@host>;tag=…` as before.
+fn commos_from_header(media_ip: IpAddr, display: Option<&str>, tag: &str) -> String {
+    match display {
+        Some(d) if !d.is_empty() => format!("\"{d}\" <sip:commos@{media_ip}>;tag={tag}"),
+        _ => format!("<sip:commos@{media_ip}>;tag={tag}"),
     }
 }
 
@@ -1819,6 +2322,58 @@ fn find_registered(
         .find(|r| user_part(&r.aor).is_some_and(|u| u.eq_ignore_ascii_case(want)))
 }
 
+/// Compose the "you have N message(s)" announcement from preloaded prompt pieces: "You have" +
+/// the spoken digit + "message"/"messages". Any missing piece is simply skipped; if nothing is
+/// installed the result is empty and the caller hears no count (the menu still works via DTMF).
+fn build_count_prompt(prompts: &RetrievalPrompts, count: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&prompts.youhave);
+    if let Some(digit) = prompts.digits.get(count) {
+        buf.extend_from_slice(digit);
+    }
+    buf.extend_from_slice(if count == 1 { &prompts.message } else { &prompts.messages });
+    buf
+}
+
+/// Play `prompt` and collect a string of DTMF digits terminated by `#` (or a timeout), for the
+/// `*98` "enter mailbox number" step. Returns the digits entered (without the `#`), or `None` if
+/// nothing was entered. Latches the caller's RTP `peer` (persisted across the collection).
+async fn collect_digits(
+    sock: &UdpSocket,
+    prompt: &[u8],
+    audio_pt: u8,
+    te_pt: u8,
+    info_rx: &mut tokio::sync::mpsc::UnboundedReceiver<char>,
+    peer: &mut Option<SocketAddr>,
+) -> Option<String> {
+    let mut entered = String::new();
+    // First digit: play the prompt while collecting. Subsequent digits: short inter-digit window.
+    let mut this_prompt: &[u8] = prompt;
+    loop {
+        let window = if entered.is_empty() {
+            Duration::from_millis((prompt.len() as u64 / 8) + 5000)
+        } else {
+            Duration::from_secs(4)
+        };
+        match ivr::play_and_collect(sock, this_prompt, audio_pt, te_pt, window, info_rx, peer).await {
+            Some('#') => break,
+            Some(d) if d.is_ascii_digit() => {
+                entered.push(d);
+                this_prompt = &[]; // only play the prompt once
+                if entered.len() >= 12 {
+                    break; // guard against runaway input
+                }
+            }
+            // A non-digit, non-# key is ignored; a timeout ends collection.
+            Some(_) => {
+                this_prompt = &[];
+            }
+            None => break,
+        }
+    }
+    (!entered.is_empty()).then_some(entered)
+}
+
 /// Bridge an in-progress IVR caller to a registered `callee`, mid-call, with no re-INVITE to the
 /// caller: the IVR's own socket `sock_a` (caller already latched at `peer_a`) becomes leg A, and
 /// a fresh leg-B socket is offered to the callee via an outbound INVITE. Once the callee answers,
@@ -1839,6 +2394,8 @@ async fn ivr_transfer(
     call_id: Uuid,
     g711: g711::G711,
     te_pt: u8,
+    no_answer_timeout: Duration,
+    display: Option<String>,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let addr = match resolve_contact_addr(&callee.contact).await {
@@ -1864,7 +2421,7 @@ async fn ivr_transfer(
     // Outbound-leg dialog identifiers, derived from the CommOS Call id (mirrors try_bridge).
     let leg_call_id = format!("{}@commos-ivr", call_id.to_string().replace('-', ""));
     let from_tag: String = call_id.to_string().chars().filter(|c| *c != '-').take(16).collect();
-    let from_hdr = format!("<sip:commos@{media_ip}>;tag={from_tag}");
+    let from_hdr = commos_from_header(media_ip, display.as_deref(), &from_tag);
     // Offer the callee the IVR caller's negotiated codec (the caller is already on it).
     let audio = codec::Codec { pt: g711.payload_type(), name: g711.sdp_name().to_string(), clock: 8000 };
     let sdp = media_sdp(media_ip, leg_b_port, &audio, te_pt, None);
@@ -1894,7 +2451,7 @@ async fn ivr_transfer(
     let mut rb_ts: u32 = 0;
     let mut rb_first = true;
     let mut ticker = tokio::time::interval(Duration::from_millis(20));
-    let ring_deadline = tokio::time::sleep(CALLEE_ANSWER_TIMEOUT);
+    let ring_deadline = tokio::time::sleep(no_answer_timeout);
     tokio::pin!(ring_deadline);
     let resp = loop {
         tokio::select! {
@@ -2167,6 +2724,43 @@ mod tests {
         assert_eq!(user_part("<sip:alice@host:5060>"), Some("alice"));
         assert_eq!(user_part("tel:+15551230000@carrier"), Some("+15551230000"));
         assert_eq!(user_part("sip:example.com"), None);
+    }
+
+    #[test]
+    fn commos_from_header_carries_optional_display_name() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        // No display name → the bare identity, exactly as before.
+        assert_eq!(
+            commos_from_header(ip, None, "abc"),
+            "<sip:commos@10.0.0.5>;tag=abc"
+        );
+        // With a display name → a quoted display-name prefix the phone renders as the caller.
+        assert_eq!(
+            commos_from_header(ip, Some("Front Desk"), "abc"),
+            "\"Front Desk\" <sip:commos@10.0.0.5>;tag=abc"
+        );
+        // An empty display name is treated as absent.
+        assert_eq!(commos_from_header(ip, Some(""), "abc"), "<sip:commos@10.0.0.5>;tag=abc");
+    }
+
+    #[test]
+    fn sip_display_name_sanitizes_and_bounds() {
+        // Control characters (incl. CRLF header-injection attempts) are dropped.
+        assert_eq!(sip_display_name("Sales\r\nInjected: x"), "SalesInjected: x");
+        // Quotes and backslashes are escaped per RFC 3261 quoted-string rules.
+        assert_eq!(sip_display_name("A \"B\" \\C"), "A \\\"B\\\" \\\\C");
+        // Length is bounded so a huge line can't bloat every INVITE.
+        assert!(sip_display_name(&"x".repeat(500)).len() <= 64);
+    }
+
+    #[test]
+    fn display_line_index_is_stable_per_call_and_in_range() {
+        let id = Uuid::now_v7();
+        // Deterministic for a given call, and always a valid index.
+        assert_eq!(display_line_index(id, 3), display_line_index(id, 3));
+        for n in 1..=5 {
+            assert!(display_line_index(id, n) < n);
+        }
     }
 
     #[test]

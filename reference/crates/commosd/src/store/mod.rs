@@ -324,6 +324,10 @@ pub trait Store: Send + Sync {
         limit: usize,
         cursor: Option<String>,
     ) -> Result<Page<Voicemail>, StoreError>;
+    /// Remove a voicemail's metadata row (its audio Object is deleted separately via
+    /// [`Store::delete_object`]). Returns whether a row was removed. Used by dial-in retrieval
+    /// (`*97`) when the mailbox owner presses delete.
+    async fn delete_voicemail(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
     /// SIP shared-secret credentials (Volume 9), keyed by `(tenant, sip username)`. Not a
     /// frozen contract entity — a per-device secret used to authenticate SIP digest and served

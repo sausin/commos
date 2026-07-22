@@ -53,10 +53,33 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub voicemail_enabled: bool,
 
+    /// How many times a called extension rings before an unanswered call is diverted to
+    /// voicemail (or the echo fallback when voicemail is off). Default `5` (~30 s — a standard
+    /// PBX ring). One "ring" is the ~6 s ring cadence, so the effective no-answer timeout is
+    /// `no_answer_rings × 6 s`. Raise it if callers are being sent to voicemail before people
+    /// can reach the phone; lower it for a snappier fallback.
+    #[serde(default = "default_no_answer_rings")]
+    pub no_answer_rings: u32,
+
     /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
     /// echo test); set to the server's LAN/public address for real phones.
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
+
+    /// NTP time server written into provisioned phone configs, so handsets on an isolated
+    /// network (no Internet) sync their clock from an internal source. `None` (the default)
+    /// points phones at the CommOS host itself (`media_ip`) — run an NTP service there (e.g.
+    /// chrony with `allow`). Set it to a dedicated internal NTP appliance's address/hostname
+    /// to use that instead. Only affects what phones are told at provisioning time.
+    #[serde(default)]
+    pub ntp_server: Option<String>,
+
+    /// Timezone written into provisioned phone configs so handsets show the correct *local*
+    /// time (NTP only supplies UTC). A POSIX TZ string, e.g. `PST8PDT`, `GMT-5`, `CET-1CEST`.
+    /// `None` (the default) emits no timezone directive — phones keep their own/UTC setting.
+    /// On an isolated network this is usually the real fix for a wrong clock display.
+    #[serde(default)]
+    pub timezone: Option<String>,
 
     /// Encrypt the RTP media path with SRTP (RFC 3711) when a caller offers it — the secure
     /// `RTP/SAVP` profile keyed by an SDES `a=crypto` line (RFC 4568, `AES_CM_128_HMAC_SHA1_80`).
@@ -119,6 +142,23 @@ pub struct Config {
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
+    /// Directory holding audio prompt files (voicemail greeting, retrieval menu, etc.) as raw
+    /// G.711 μ-law `.ulaw` files, organised by language (`<sounds_dir>/en/<name>.ulaw`). `None`
+    /// (the default) resolves to `{data_dir}/sounds` — where the installer downloads the public
+    /// FreePBX sound pack. A missing file falls back to a synthesized tone, so the system still
+    /// works with no sounds installed; set this only to point at a shared/custom prompt library.
+    #[serde(default)]
+    pub sounds_dir: Option<String>,
+
+    /// Path to a plain-text file whose contents become the **display name** shown on a phone when
+    /// CommOS places the call (the identity the called handset renders — otherwise the bare
+    /// "commos"). One non-empty line → that text on every call; multiple lines → one picked per
+    /// call (varied by call id), so you can rotate through friendly/rotating messages. `None` (the
+    /// default) resolves to `{data_dir}/display_name.txt`; if that file is absent or empty, phones
+    /// see the default "commos". Re-read per call, so edits apply without a restart.
+    #[serde(default)]
+    pub display_name_file: Option<String>,
+
     /// Object-storage backend. `None` (default) stores blobs on the local filesystem under
     /// `{data_dir}/objects`. Set to `s3://<bucket>` to use S3-compatible storage (requires a
     /// build with `--features s3`); credentials come from the environment
@@ -166,6 +206,26 @@ impl Config {
     /// Path to the embedded SQLite database used when no `database_url` is configured.
     pub fn default_sqlite_path(&self) -> String {
         format!("{}/commos.db", self.data_dir.trim_end_matches('/'))
+    }
+
+    /// Directory holding audio prompt files. Explicit `sounds_dir` wins; otherwise it is
+    /// `{data_dir}/sounds` — the same `data_dir`-relative convention as the DB, object store,
+    /// and JWT secret, so an installed binary always resolves it against the state it owns
+    /// (never the current working directory).
+    pub fn sounds_dir(&self) -> String {
+        match &self.sounds_dir {
+            Some(dir) if !dir.trim().is_empty() => dir.trim_end_matches('/').to_string(),
+            _ => format!("{}/sounds", self.data_dir.trim_end_matches('/')),
+        }
+    }
+
+    /// Path to the phone display-name file. Explicit `display_name_file` wins; otherwise it is
+    /// `{data_dir}/display_name.txt` — the same `data_dir`-relative convention as everything else.
+    pub fn display_name_file(&self) -> String {
+        match &self.display_name_file {
+            Some(p) if !p.trim().is_empty() => p.clone(),
+            _ => format!("{}/display_name.txt", self.data_dir.trim_end_matches('/')),
+        }
     }
 }
 
@@ -236,7 +296,10 @@ impl Default for Config {
             sip_realm: default_sip_realm(),
             record_calls: false,
             voicemail_enabled: true,
+            no_answer_rings: default_no_answer_rings(),
             media_ip: default_media_ip(),
+            ntp_server: None,
+            timezone: None,
             srtp: true,
             trunk_srtp: false,
             sips_listen: None,
@@ -246,6 +309,8 @@ impl Default for Config {
             dev_tokens: default_true(),
             database_url: None,
             data_dir: default_data_dir(),
+            sounds_dir: None,
+            display_name_file: None,
             object_storage: None,
             s3_endpoint: None,
             s3_region: default_s3_region(),
@@ -265,6 +330,10 @@ fn default_true() -> bool {
 
 fn default_media_ip() -> IpAddr {
     IpAddr::from([127, 0, 0, 1])
+}
+
+fn default_no_answer_rings() -> u32 {
+    5
 }
 
 fn default_data_dir() -> String {

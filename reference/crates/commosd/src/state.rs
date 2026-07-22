@@ -65,6 +65,12 @@ pub struct AppState {
     /// SIP registrar address advertised to phones (for auto-provisioning configs).
     pub media_ip: std::net::IpAddr,
     pub sip_port: u16,
+    /// NTP time server written into provisioned phone configs. `None` → phones are pointed at
+    /// the CommOS host (`media_ip`); set to a dedicated internal NTP appliance to override.
+    pub ntp_server: Option<String>,
+    /// Timezone (POSIX TZ string) written into provisioned phone configs so handsets show the
+    /// correct local time. `None` → no timezone directive is emitted.
+    pub timezone: Option<String>,
     /// Human-readable description of the system of record (e.g. the SQLite file path), surfaced
     /// to the operator at the end of onboarding so they know where their configuration lives.
     pub storage_location: String,
@@ -101,6 +107,8 @@ impl AppState {
         admin: AdminAuth,
         media_ip: std::net::IpAddr,
         sip_port: u16,
+        ntp_server: Option<String>,
+        timezone: Option<String>,
         storage_location: String,
         bus: EventBus,
         recent: RecentEvents,
@@ -126,6 +134,8 @@ impl AppState {
             admin,
             media_ip,
             sip_port,
+            ntp_server,
+            timezone,
             storage_location,
             bus,
             recent,
