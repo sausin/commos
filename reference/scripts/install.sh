@@ -16,6 +16,10 @@
 #
 # Options:
 #   --media-ip <ip>        RTP/SDP address phones send audio to (default: auto-detected LAN IP)
+#   --timezone <tz>        POSIX/IANA timezone phones display local time in, e.g. "America/New_York"
+#                          (default: this host's timezone; phones show UTC without one)
+#   --ntp-server <host>    Time source phones sync their clock from (default: the CommOS host, which
+#                          must then run an NTP service reachable by the phones; or a public pool)
 #   --http-port <port>     API + dashboard port (default: 8080)
 #   --sip-port <port>      SIP UDP port (default: 5060)
 #   --data-dir <path>      State dir for the SQLite DB, objects, config (default: /var/lib/commos
@@ -46,6 +50,8 @@ HTTP_PORT=8080
 SIP_PORT=5060
 SIP_TLS_PORT=5061
 MEDIA_IP=""
+TIMEZONE=""
+NTP_SERVER=""
 ADMIN_PASSWORD=""
 BIN=""
 CONFIG=""
@@ -71,12 +77,14 @@ ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ---- args -------------------------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
     --media-ip) MEDIA_IP="$2"; shift 2;;
+    --timezone) TIMEZONE="$2"; shift 2;;
+    --ntp-server) NTP_SERVER="$2"; shift 2;;
     --http-port) HTTP_PORT="$2"; shift 2;;
     --sip-port) SIP_PORT="$2"; shift 2;;
     --data-dir) DATA_DIR="$2"; shift 2;;
@@ -106,28 +114,93 @@ fi
 [ -z "$CONFIG" ] && CONFIG="$DATA_DIR/pbx.yaml"
 
 # ---- detect LAN IP ----------------------------------------------------------------------
-detect_ip() {
-  local ip=""
-  # Best: the source address the kernel would use to reach the internet.
-  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -n1)"
-  [ -n "$ip" ] && { echo "$ip"; return; }
-  # Fallback: first non-loopback address hostname knows about.
-  ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^127\.' | head -n1)"
-  [ -n "$ip" ] && { echo "$ip"; return; }
-  echo ""
+# `media_ip` is the address phones send RTP to and reach the registrar on. Getting it wrong is the
+# #1 cause of trouble: a loopback address gives "call connects but no audio", and — on a box with
+# more than one NIC — the kernel's Internet-facing source is the *upstream/WAN* NIC, not the phone
+# LAN. Advertising the wrong subnet makes calls ring but never truly answer (the callee's SIP
+# responses and RTP have no route home), so on a multi-homed host we ask which interface to use.
+
+# The kernel's preferred source toward the Internet: a fine default on a single-NIC box, but the
+# wrong NIC when a separate phone LAN also exists. Used only as the suggested default below.
+default_route_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -n1
+}
+
+# All global (non-loopback, non-link-local) IPv4 addresses as "iface ip" lines.
+list_lan_ips() {
+  ip -4 -o addr show scope global 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $2, $4 }'
 }
 
 if [ -z "$MEDIA_IP" ]; then
-  MEDIA_IP="$(detect_ip)"
-  if [ -n "$MEDIA_IP" ]; then
+  DEF_IP="$(default_route_ip)"
+  CANDIDATES=()
+  while IFS= read -r _line; do [ -n "$_line" ] && CANDIDATES+=("$_line"); done < <(list_lan_ips)
+
+  if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+    # No global address enumerated (unusual NIC config) — fall back to the old heuristic.
+    MEDIA_IP="${DEF_IP:-$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^127\.' | head -n1)}"
+    [ -n "$MEDIA_IP" ] || die "could not auto-detect a LAN IP — pass one with --media-ip <ip>"
     ok "detected LAN IP: $MEDIA_IP  (phones will send audio here)"
+  elif [ "${#CANDIDATES[@]}" -eq 1 ]; then
+    MEDIA_IP="$(awk '{print $2}' <<<"${CANDIDATES[0]}")"
+    ok "detected LAN IP: $MEDIA_IP on $(awk '{print $1}' <<<"${CANDIDATES[0]}")  (phones will send audio here)"
   else
-    die "could not auto-detect a LAN IP — pass one with --media-ip <ip>"
+    # Multi-homed: the phones live on exactly one of these subnets. Let the operator choose.
+    warn "this host has multiple network interfaces — media_ip must be the NIC your phones are on:"
+    _i=1
+    for _c in "${CANDIDATES[@]}"; do
+      _ifc="$(awk '{print $1}' <<<"$_c")"; _ipa="$(awk '{print $2}' <<<"$_c")"
+      _mark=""; [ "$_ipa" = "$DEF_IP" ] && _mark="  (default route / likely upstream — NOT the phone LAN unless your phones are here)"
+      printf '      %d) %-10s %s%s\n' "$_i" "$_ifc" "$_ipa" "$_mark" >&2
+      _i=$((_i + 1))
+    done
+    if [ -t 0 ]; then
+      printf '    Which interface are the phones on? [1-%d] ' "${#CANDIDATES[@]}" >&2
+      read -r _sel || _sel=""
+      if [[ "$_sel" =~ ^[0-9]+$ ]] && [ "$_sel" -ge 1 ] && [ "$_sel" -le "${#CANDIDATES[@]}" ]; then
+        MEDIA_IP="$(awk '{print $2}' <<<"${CANDIDATES[$((_sel - 1))]}")"
+      fi
+    fi
+    if [ -z "$MEDIA_IP" ]; then
+      # Non-interactive, or no valid choice: guess the default-route IP but make the guess loud.
+      MEDIA_IP="${DEF_IP:-$(awk '{print $2}' <<<"${CANDIDATES[0]}")}"
+      warn "guessed media_ip=$MEDIA_IP. If your phones are on a different NIC, re-run with"
+      warn "  --media-ip <ip>  (or edit media_ip in pbx.yaml) — else calls ring but never connect."
+    fi
+    ok "using media_ip: $MEDIA_IP  (phones must be able to reach this address)"
   fi
 fi
 case "$MEDIA_IP" in
   127.*|::1|localhost) warn "media_ip is loopback ($MEDIA_IP): real phones will get NO AUDIO. Pass --media-ip <LAN-IP>.";;
 esac
+
+# ---- phone clock: timezone + NTP source -------------------------------------------------
+# Provisioned phones sync their clock over NTP (UTC) and apply a timezone for local display.
+# Without a timezone they show UTC; without a reachable NTP source they show a bogus/"random"
+# time. Default the timezone to this host's, so a freshly-onboarded phone shows the right local
+# time with no extra step.
+host_timezone() {
+  # systemd hosts: the authoritative answer.
+  if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl show -p Timezone --value 2>/dev/null && return
+  fi
+  # Debian/Ubuntu keep it here; otherwise resolve the /etc/localtime symlink to a zoneinfo name.
+  [ -f /etc/timezone ] && { cat /etc/timezone; return; }
+  if [ -L /etc/localtime ]; then
+    readlink -f /etc/localtime 2>/dev/null | sed -n 's#.*/zoneinfo/##p'
+  fi
+}
+if [ -z "$TIMEZONE" ]; then
+  TIMEZONE="$(host_timezone | head -n1 | tr -d '[:space:]')"
+  [ -n "$TIMEZONE" ] && ok "phones will use this host's timezone: $TIMEZONE  (override with --timezone)"
+fi
+[ -z "$TIMEZONE" ] && warn "no timezone detected — phones will display UTC. Pass --timezone <IANA-TZ> (e.g. America/New_York)."
+# The phone's NTP source defaults (in the daemon) to the CommOS host. That only keeps time if the
+# host actually serves NTP to the phone LAN; flag it so the operator isn't surprised by wrong clocks.
+if [ -z "$NTP_SERVER" ]; then
+  warn "phones will sync time from the CommOS host ($MEDIA_IP) by default — ensure it runs an NTP"
+  warn "  service reachable by the phones (e.g. chrony with 'allow'), or pass --ntp-server <host>."
+fi
 
 # ---- locate / build the binary ----------------------------------------------------------
 if [ -z "$BIN" ]; then
@@ -273,6 +346,9 @@ fi
   echo "# media_ip is the address phones send RTP audio to — MUST be reachable from the phones."
   echo "media_ip: \"$MEDIA_IP\""
   echo "data_dir: \"$DATA_DIR\""
+  # Phone clock (provisioning): timezone for local-time display, and the NTP source to sync from.
+  [ -n "$TIMEZONE" ] && echo "timezone: \"$TIMEZONE\"   # phones display local time in this zone"
+  [ -n "$NTP_SERVER" ] && echo "ntp_server: \"$NTP_SERVER\"   # phones sync their clock from here"
   if [ "$DO_TLS" = "1" ]; then
     echo "# SIP-over-TLS (SIPS): protects SDES SRTP keys + call metadata in transit."
     echo "$SIPS_YAML"
