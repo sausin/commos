@@ -197,3 +197,26 @@ impl SipServer {
         out
     }
 }
+
+/// Pick which display-name line to use for a call when the file has several, varied per call so
+/// the messages rotate. Derived from the call id's random bits (UUIDv7), so it is stable for a
+/// given call but differs between calls without needing an RNG.
+fn display_line_index(call_id: Uuid, n: usize) -> usize {
+    let sum: u32 = call_id.to_string().bytes().map(u32::from).sum();
+    (sum as usize) % n.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_line_index_is_stable_per_call_and_in_range() {
+        let id = Uuid::now_v7();
+        // Deterministic for a given call, and always a valid index.
+        assert_eq!(display_line_index(id, 3), display_line_index(id, 3));
+        for n in 1..=5 {
+            assert!(display_line_index(id, n) < n);
+        }
+    }
+}

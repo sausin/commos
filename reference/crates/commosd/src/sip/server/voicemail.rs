@@ -337,3 +337,60 @@ impl SipServer {
         });
     }
 }
+
+/// Compose the "you have N message(s)" announcement from preloaded prompt pieces: "You have" +
+/// the spoken digit + "message"/"messages". Any missing piece is simply skipped; if nothing is
+/// installed the result is empty and the caller hears no count (the menu still works via DTMF).
+fn build_count_prompt(prompts: &RetrievalPrompts, count: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&prompts.youhave);
+    if let Some(digit) = prompts.digits.get(count) {
+        buf.extend_from_slice(digit);
+    }
+    buf.extend_from_slice(if count == 1 {
+        &prompts.message
+    } else {
+        &prompts.messages
+    });
+    buf
+}
+
+/// Play `prompt` and collect a string of DTMF digits terminated by `#` (or a timeout), for the
+/// `*98` "enter mailbox number" step. Returns the digits entered (without the `#`), or `None` if
+/// nothing was entered. Latches the caller's RTP `peer` (persisted across the collection).
+async fn collect_digits(
+    sock: &UdpSocket,
+    prompt: &[u8],
+    audio_pt: u8,
+    te_pt: u8,
+    info_rx: &mut tokio::sync::mpsc::UnboundedReceiver<char>,
+    peer: &mut Option<SocketAddr>,
+) -> Option<String> {
+    let mut entered = String::new();
+    // First digit: play the prompt while collecting. Subsequent digits: short inter-digit window.
+    let mut this_prompt: &[u8] = prompt;
+    loop {
+        let window = if entered.is_empty() {
+            Duration::from_millis((prompt.len() as u64 / 8) + 5000)
+        } else {
+            Duration::from_secs(4)
+        };
+        match ivr::play_and_collect(sock, this_prompt, audio_pt, te_pt, window, info_rx, peer).await
+        {
+            Some('#') => break,
+            Some(d) if d.is_ascii_digit() => {
+                entered.push(d);
+                this_prompt = &[]; // only play the prompt once
+                if entered.len() >= 12 {
+                    break; // guard against runaway input
+                }
+            }
+            // A non-digit, non-# key is ignored; a timeout ends collection.
+            Some(_) => {
+                this_prompt = &[];
+            }
+            None => break,
+        }
+    }
+    (!entered.is_empty()).then_some(entered)
+}

@@ -715,3 +715,182 @@ impl SipServer {
         });
     }
 }
+
+/// Send an INVITE on `sock` to `dst` and return its **final** response, retransmitting per RFC
+/// 3261 §17.1.1 (a client INVITE transaction over UDP): re-send at T1, 2·T1 … until the first
+/// response arrives, then stop retransmitting and wait for the final one (skipping provisional
+/// 1xx) up to `overall`. Returns `None` if nothing final arrives in time — so a lost INVITE is
+/// retried rather than silently failing the call setup.
+async fn send_invite_await_final(
+    sock: &UdpSocket,
+    invite: &[u8],
+    dst: SocketAddr,
+    overall: Duration,
+) -> Option<SipMessage> {
+    if sock.send_to(invite, dst).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::sleep(overall);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    let mut retransmit = true; // stops once any response (even 1xx) is seen
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return None,
+            _ = retx, if retransmit => {
+                let _ = sock.send_to(invite, dst).await; // retransmit until first response
+                interval = (interval * 2).min(T2);
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = r else { return None };
+                let Ok(m) = message::parse(&buf[..n]) else { continue };
+                match m.status() {
+                    Some(s) if (100..200).contains(&s) => retransmit = false, // provisional: keep waiting
+                    Some(_) => return Some(m),                                 // final response
+                    None => continue,                                          // stray request
+                }
+            }
+        }
+    }
+}
+
+/// Like [`send_invite_await_final`], but also watches a `cancel` signal: when it fires (or the
+/// sender is dropped) while the callee is still ringing, this sends the pre-built `cancel_req`
+/// (a `CANCEL` for the INVITE transaction) to `dst` and returns `None`. This is what stops the
+/// losing legs of a simultaneous ring-all fork once another member answers. A cancel that
+/// arrives after a 2xx is a no-op here (the 2xx is already returned); the forking caller BYEs
+/// that late-answering leg instead.
+async fn send_invite_await_final_cancellable(
+    sock: &UdpSocket,
+    invite: &[u8],
+    dst: SocketAddr,
+    overall: Duration,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    cancel_req: Vec<u8>,
+) -> Option<SipMessage> {
+    if sock.send_to(invite, dst).await.is_err() {
+        return None;
+    }
+    let deadline = tokio::time::sleep(overall);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut interval = T1;
+    let mut retransmit = true;
+    loop {
+        let retx = tokio::time::sleep(interval);
+        tokio::select! {
+            _ = &mut deadline => return None,
+            _ = retx, if retransmit => {
+                let _ = sock.send_to(invite, dst).await;
+                interval = (interval * 2).min(T2);
+            }
+            changed = cancel.changed() => {
+                // A change to `true` (or a dropped sender) means a sibling won the race: CANCEL
+                // this still-ringing INVITE and give up.
+                if changed.is_err() || *cancel.borrow() {
+                    let _ = sock.send_to(&cancel_req, dst).await;
+                    return None;
+                }
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, _)) = r else { return None };
+                let Ok(m) = message::parse(&buf[..n]) else { continue };
+                match m.status() {
+                    Some(s) if (100..200).contains(&s) => retransmit = false,
+                    Some(_) => return Some(m),
+                    None => continue,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The outbound INVITE transaction retransmits until the callee responds, then returns the
+    /// final response (skipping provisional 1xx).
+    #[tokio::test]
+    async fn invite_retransmits_then_returns_final() {
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+        let callee_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let _ = callee.recv_from(&mut buf).await; // first INVITE — "lost"
+            let (_, from) = callee.recv_from(&mut buf).await.unwrap(); // retransmit
+                                                                       // Provisional first (stops retransmission), then the final 200.
+            callee
+                .send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from)
+                .await
+                .unwrap();
+            callee
+                .send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", from)
+                .await
+                .unwrap();
+        });
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite =
+            b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let resp =
+            send_invite_await_final(&sock, invite, callee_addr, Duration::from_secs(3)).await;
+        assert_eq!(
+            resp.and_then(|m| m.status()),
+            Some(200),
+            "should return the final 200"
+        );
+        callee_task.await.unwrap();
+    }
+
+    /// A losing leg of a ring-all fork: while the callee is ringing (180), a cancel signal makes
+    /// the await send a `CANCEL` for the INVITE transaction and give up (`None`) — this is what
+    /// stops the other members' phones once one answers.
+    #[tokio::test]
+    async fn cancellable_await_sends_cancel_when_signalled() {
+        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let callee_addr = callee.local_addr().unwrap();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        // The awaiter runs concurrently; it will INVITE, see the 180, then observe the cancel.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite =
+            b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+        let cancel_req =
+            b"CANCEL sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 CANCEL\r\nContent-Length: 0\r\n\r\n"
+                .to_vec();
+        let awaiter = tokio::spawn(async move {
+            send_invite_await_final_cancellable(
+                &sock,
+                &invite,
+                callee_addr,
+                Duration::from_secs(5),
+                cancel_rx,
+                cancel_req,
+            )
+            .await
+        });
+
+        let mut buf = [0u8; 2048];
+        // Receive the INVITE and answer 180 (so retransmits stop and the leg is "ringing").
+        let (n, from) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"INVITE"));
+        callee
+            .send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from)
+            .await
+            .unwrap();
+
+        // A sibling won → cancel this leg. The next datagram the callee sees must be a CANCEL.
+        cancel_tx.send(true).unwrap();
+        let (n2, _) = callee.recv_from(&mut buf).await.unwrap();
+        assert!(
+            buf[..n2].starts_with(b"CANCEL"),
+            "cancelled leg must send a SIP CANCEL"
+        );
+
+        // And the await resolves to None (this leg did not win).
+        assert!(awaiter.await.unwrap().is_none());
+    }
+}

@@ -114,3 +114,34 @@ impl SipServer {
         resp.send(reply.as_bytes()).await
     }
 }
+
+/// Current unix time in seconds (for nonce expiry).
+fn now_unix() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Parse a digest `nc` (nonce-count) value — up to 8 hex digits per RFC 2617 — into a number
+/// for the replay guard. Returns `None` for a missing/malformed value (treated as "no nc").
+fn parse_nc(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 8 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(t, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nc_accepts_hex_and_rejects_junk() {
+        assert_eq!(parse_nc("00000001"), Some(1));
+        assert_eq!(parse_nc("0000000a"), Some(10));
+        assert_eq!(parse_nc("ffffffff"), Some(u32::MAX));
+        // Malformed / overlong / non-hex → None (treated as "no nc").
+        assert_eq!(parse_nc(""), None);
+        assert_eq!(parse_nc("zzzz"), None);
+        assert_eq!(parse_nc("100000000"), None); // 9 hex digits
+    }
+}

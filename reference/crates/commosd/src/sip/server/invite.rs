@@ -661,3 +661,57 @@ impl SipServer {
         resp.send(ok.as_bytes()).await
     }
 }
+
+/// Classify an SDP body's media direction for hold detection: `Some(true)` = the offerer put
+/// the call on hold (`a=sendonly` / `a=inactive`), `Some(false)` = active/resume
+/// (`a=sendrecv` / `a=recvonly`), `None` = no direction attribute at all (a plain retransmit,
+/// so the hold state is left unchanged). The check is idempotent — a retransmitted hold or
+/// resume re-INVITE re-asserts the same state.
+fn hold_direction(sdp: &str) -> Option<bool> {
+    if sdp.contains("a=sendonly") || sdp.contains("a=inactive") {
+        Some(true)
+    } else if sdp.contains("a=sendrecv") || sdp.contains("a=recvonly") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Map a decline final status to the `(status, reason)` CommOS relays back to the caller in the
+/// `on_decline = busy` policy.
+fn decline_status(code: u16) -> (u16, &'static str) {
+    match code {
+        486 => (486, "Busy Here"),
+        600 => (600, "Busy Everywhere"),
+        _ => (603, "Decline"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decline_status_maps_final_codes_to_relayable_status() {
+        assert_eq!(decline_status(486), (486, "Busy Here"));
+        assert_eq!(decline_status(600), (600, "Busy Everywhere"));
+        assert_eq!(decline_status(603), (603, "Decline"));
+        // Any other declined code collapses to a generic 603 Decline.
+        assert_eq!(decline_status(488), (603, "Decline"));
+    }
+
+    #[test]
+    fn hold_direction_classifies_sdp() {
+        // Hold: sendonly / inactive.
+        assert_eq!(hold_direction("v=0\r\na=sendonly\r\n"), Some(true));
+        assert_eq!(
+            hold_direction("m=audio 5004 RTP/AVP 0\r\na=inactive\r\n"),
+            Some(true)
+        );
+        // Resume / active: sendrecv / recvonly.
+        assert_eq!(hold_direction("a=sendrecv\r\n"), Some(false));
+        assert_eq!(hold_direction("a=recvonly\r\n"), Some(false));
+        // No direction attribute → unchanged (plain retransmit).
+        assert_eq!(hold_direction("v=0\r\nm=audio 5004 RTP/AVP 0\r\n"), None);
+    }
+}

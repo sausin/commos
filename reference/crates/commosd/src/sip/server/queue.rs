@@ -238,3 +238,63 @@ impl SipServer {
         tracing::info!(%call_id, waited_s = start.elapsed().as_secs(), "queue wait ended");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue-wait driver latches the caller, plays treatment audio, and — with no member to
+    /// answer — overflows and exits cleanly once `max_wait` elapses (never hangs on hold music).
+    #[tokio::test]
+    async fn queue_wait_driver_overflows_and_exits_with_no_members() {
+        use crate::control::registrations::RegistrationRegistry;
+
+        let driver_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let driver_addr = driver_sock.local_addr().unwrap();
+        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The caller sends one RTP-sized packet so the driver latches its address.
+        caller.send_to(&[0u8; 172], driver_addr).await.unwrap();
+
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let moh = Arc::new(crate::sip::moh::MohSource::synth());
+        let wait = crate::sip::queuewait::WaitConfig {
+            max_wait: Some(Duration::from_millis(300)),
+            announce_every: Duration::from_secs(30),
+            poll_every: Duration::from_millis(50),
+        };
+        let beep = g711::beep(20, g711::G711::Ulaw);
+        let driver = tokio::spawn(SipServer::queue_wait_driver(
+            driver_sock,
+            g711::G711::Ulaw,
+            dtmf::TELEPHONE_EVENT_PT,
+            "127.0.0.1".parse().unwrap(),
+            Uuid::now_v7(),
+            moh,
+            true,
+            RegistrationRegistry::new(),
+            Vec::new(), // no members → nobody to place the caller with
+            Uuid::now_v7(),
+            wait,
+            None, // no overflow target
+            Duration::from_secs(1),
+            beep.clone(),
+            beep,
+            None,
+            stop_rx,
+        ));
+
+        // The caller receives treatment audio (greeting / hold music).
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), caller.recv_from(&mut buf))
+                .await
+                .is_ok(),
+            "caller should hear queue treatment audio"
+        );
+        // The driver overflows shortly after max_wait and finishes (does not hang on MoH).
+        tokio::time::timeout(Duration::from_secs(3), driver)
+            .await
+            .expect("driver should finish after overflow")
+            .unwrap();
+    }
+}

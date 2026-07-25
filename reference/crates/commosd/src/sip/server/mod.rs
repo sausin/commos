@@ -35,11 +35,6 @@ use crate::control::voicemail::VoicemailService;
 use crate::media::MediaFact;
 use crate::store::Store;
 
-/// Current unix time in seconds (for nonce expiry).
-fn now_unix() -> i64 {
-    time::OffsetDateTime::now_utc().unix_timestamp()
-}
-
 use super::message::{self, SipMessage};
 use super::transport::Responder;
 use super::{codec, dtmf, g711, ivr, rtp, sdes, srtp};
@@ -458,16 +453,6 @@ impl SipServer {
 
 /// The user-part of a SIP URI: `sip:200@example.com` → `200`. Tolerates a leading `<` and
 /// the `sip:`/`sips:`/`tel:` schemes. Returns `None` for a domain-only URI (no `@`).
-/// Parse a digest `nc` (nonce-count) value — up to 8 hex digits per RFC 2617 — into a number
-/// for the replay guard. Returns `None` for a missing/malformed value (treated as "no nc").
-fn parse_nc(s: &str) -> Option<u32> {
-    let t = s.trim();
-    if t.is_empty() || t.len() > 8 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u32::from_str_radix(t, 16).ok()
-}
-
 fn user_part(uri: &str) -> Option<&str> {
     let s = uri
         .trim()
@@ -481,14 +466,6 @@ fn user_part(uri: &str) -> Option<&str> {
     } else {
         Some(user)
     }
-}
-
-/// Pick which display-name line to use for a call when the file has several, varied per call so
-/// the messages rotate. Derived from the call id's random bits (UUIDv7), so it is stable for a
-/// given call but differs between calls without needing an RNG.
-fn display_line_index(call_id: Uuid, n: usize) -> usize {
-    let sum: u32 = call_id.to_string().bytes().map(u32::from).sum();
-    (sum as usize) % n.max(1)
 }
 
 /// Sanitise operator-provided text into a SIP display-name **quoted-string** payload (without the
@@ -714,63 +691,6 @@ fn find_registered(regs: &RegistrationRegistry, tenant: Uuid, dest: &str) -> Opt
         .find(|r| user_part(&r.aor).is_some_and(|u| u.eq_ignore_ascii_case(want)))
 }
 
-/// Compose the "you have N message(s)" announcement from preloaded prompt pieces: "You have" +
-/// the spoken digit + "message"/"messages". Any missing piece is simply skipped; if nothing is
-/// installed the result is empty and the caller hears no count (the menu still works via DTMF).
-fn build_count_prompt(prompts: &RetrievalPrompts, count: usize) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&prompts.youhave);
-    if let Some(digit) = prompts.digits.get(count) {
-        buf.extend_from_slice(digit);
-    }
-    buf.extend_from_slice(if count == 1 {
-        &prompts.message
-    } else {
-        &prompts.messages
-    });
-    buf
-}
-
-/// Play `prompt` and collect a string of DTMF digits terminated by `#` (or a timeout), for the
-/// `*98` "enter mailbox number" step. Returns the digits entered (without the `#`), or `None` if
-/// nothing was entered. Latches the caller's RTP `peer` (persisted across the collection).
-async fn collect_digits(
-    sock: &UdpSocket,
-    prompt: &[u8],
-    audio_pt: u8,
-    te_pt: u8,
-    info_rx: &mut tokio::sync::mpsc::UnboundedReceiver<char>,
-    peer: &mut Option<SocketAddr>,
-) -> Option<String> {
-    let mut entered = String::new();
-    // First digit: play the prompt while collecting. Subsequent digits: short inter-digit window.
-    let mut this_prompt: &[u8] = prompt;
-    loop {
-        let window = if entered.is_empty() {
-            Duration::from_millis((prompt.len() as u64 / 8) + 5000)
-        } else {
-            Duration::from_secs(4)
-        };
-        match ivr::play_and_collect(sock, this_prompt, audio_pt, te_pt, window, info_rx, peer).await
-        {
-            Some('#') => break,
-            Some(d) if d.is_ascii_digit() => {
-                entered.push(d);
-                this_prompt = &[]; // only play the prompt once
-                if entered.len() >= 12 {
-                    break; // guard against runaway input
-                }
-            }
-            // A non-digit, non-# key is ignored; a timeout ends collection.
-            Some(_) => {
-                this_prompt = &[];
-            }
-            None => break,
-        }
-    }
-    (!entered.is_empty()).then_some(entered)
-}
-
 /// Bridge an in-progress IVR caller to a registered `callee`, mid-call, with no re-INVITE to the
 /// caller: the IVR's own socket `sock_a` (caller already latched at `peer_a`) becomes leg A, and
 /// a fresh leg-B socket is offered to the callee via an outbound INVITE. Once the callee answers,
@@ -956,21 +876,6 @@ async fn ivr_transfer(
     true
 }
 
-/// Classify an SDP body's media direction for hold detection: `Some(true)` = the offerer put
-/// the call on hold (`a=sendonly` / `a=inactive`), `Some(false)` = active/resume
-/// (`a=sendrecv` / `a=recvonly`), `None` = no direction attribute at all (a plain retransmit,
-/// so the hold state is left unchanged). The check is idempotent — a retransmitted hold or
-/// resume re-INVITE re-asserts the same state.
-fn hold_direction(sdp: &str) -> Option<bool> {
-    if sdp.contains("a=sendonly") || sdp.contains("a=inactive") {
-        Some(true)
-    } else if sdp.contains("a=sendrecv") || sdp.contains("a=recvonly") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 /// Push a message-waiting indication to a phone as an unsolicited SIP `NOTIFY` with an
 /// `application/simple-message-summary` body (RFC 3842). `addr`/`request_uri` are the phone's
 /// contact; `aor` is its mailbox. Fire-and-forget over a throwaway socket — a phone that does
@@ -1016,97 +921,6 @@ async fn send_mwi_notify(
     }
 }
 
-/// Send an INVITE on `sock` to `dst` and return its **final** response, retransmitting per RFC
-/// 3261 §17.1.1 (a client INVITE transaction over UDP): re-send at T1, 2·T1 … until the first
-/// response arrives, then stop retransmitting and wait for the final one (skipping provisional
-/// 1xx) up to `overall`. Returns `None` if nothing final arrives in time — so a lost INVITE is
-/// retried rather than silently failing the call setup.
-async fn send_invite_await_final(
-    sock: &UdpSocket,
-    invite: &[u8],
-    dst: SocketAddr,
-    overall: Duration,
-) -> Option<SipMessage> {
-    if sock.send_to(invite, dst).await.is_err() {
-        return None;
-    }
-    let deadline = tokio::time::sleep(overall);
-    tokio::pin!(deadline);
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut interval = T1;
-    let mut retransmit = true; // stops once any response (even 1xx) is seen
-    loop {
-        let retx = tokio::time::sleep(interval);
-        tokio::select! {
-            _ = &mut deadline => return None,
-            _ = retx, if retransmit => {
-                let _ = sock.send_to(invite, dst).await; // retransmit until first response
-                interval = (interval * 2).min(T2);
-            }
-            r = sock.recv_from(&mut buf) => {
-                let Ok((n, _)) = r else { return None };
-                let Ok(m) = message::parse(&buf[..n]) else { continue };
-                match m.status() {
-                    Some(s) if (100..200).contains(&s) => retransmit = false, // provisional: keep waiting
-                    Some(_) => return Some(m),                                 // final response
-                    None => continue,                                          // stray request
-                }
-            }
-        }
-    }
-}
-
-/// Like [`send_invite_await_final`], but also watches a `cancel` signal: when it fires (or the
-/// sender is dropped) while the callee is still ringing, this sends the pre-built `cancel_req`
-/// (a `CANCEL` for the INVITE transaction) to `dst` and returns `None`. This is what stops the
-/// losing legs of a simultaneous ring-all fork once another member answers. A cancel that
-/// arrives after a 2xx is a no-op here (the 2xx is already returned); the forking caller BYEs
-/// that late-answering leg instead.
-async fn send_invite_await_final_cancellable(
-    sock: &UdpSocket,
-    invite: &[u8],
-    dst: SocketAddr,
-    overall: Duration,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
-    cancel_req: Vec<u8>,
-) -> Option<SipMessage> {
-    if sock.send_to(invite, dst).await.is_err() {
-        return None;
-    }
-    let deadline = tokio::time::sleep(overall);
-    tokio::pin!(deadline);
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut interval = T1;
-    let mut retransmit = true;
-    loop {
-        let retx = tokio::time::sleep(interval);
-        tokio::select! {
-            _ = &mut deadline => return None,
-            _ = retx, if retransmit => {
-                let _ = sock.send_to(invite, dst).await;
-                interval = (interval * 2).min(T2);
-            }
-            changed = cancel.changed() => {
-                // A change to `true` (or a dropped sender) means a sibling won the race: CANCEL
-                // this still-ringing INVITE and give up.
-                if changed.is_err() || *cancel.borrow() {
-                    let _ = sock.send_to(&cancel_req, dst).await;
-                    return None;
-                }
-            }
-            r = sock.recv_from(&mut buf) => {
-                let Ok((n, _)) = r else { return None };
-                let Ok(m) = message::parse(&buf[..n]) else { continue };
-                match m.status() {
-                    Some(s) if (100..200).contains(&s) => retransmit = false,
-                    Some(_) => return Some(m),
-                    None => continue,
-                }
-            }
-        }
-    }
-}
-
 /// Send a mid-dialog `BYE` toward one leg's endpoint, reconstructed from the dialog identifiers
 /// captured when the leg was set up. Binds its own socket so the BYE's `Via` advertises the exact
 /// port the 200-to-BYE is awaited on (an unreachable Via just means the transaction is retried,
@@ -1137,16 +951,6 @@ async fn bye_leg(media_ip: IpAddr, leg: &CalleeLeg) {
         tracing::info!(addr = %leg.addr, "leg BYE confirmed");
     } else {
         tracing::debug!(addr = %leg.addr, "leg BYE unconfirmed (no final response)");
-    }
-}
-
-/// Map a decline final status to the `(status, reason)` CommOS relays back to the caller in the
-/// `on_decline = busy` policy.
-fn decline_status(code: u16) -> (u16, &'static str) {
-    match code {
-        486 => (486, "Busy Here"),
-        600 => (600, "Busy Everywhere"),
-        _ => (603, "Decline"),
     }
 }
 
@@ -1254,15 +1058,6 @@ mod tests {
     }
 
     #[test]
-    fn decline_status_maps_final_codes_to_relayable_status() {
-        assert_eq!(decline_status(486), (486, "Busy Here"));
-        assert_eq!(decline_status(600), (600, "Busy Everywhere"));
-        assert_eq!(decline_status(603), (603, "Decline"));
-        // Any other declined code collapses to a generic 603 Decline.
-        assert_eq!(decline_status(488), (603, "Decline"));
-    }
-
-    #[test]
     fn commos_from_header_carries_optional_display_name() {
         let ip: IpAddr = "10.0.0.5".parse().unwrap();
         // No display name → the bare identity, exactly as before.
@@ -1347,27 +1142,6 @@ mod tests {
         assert_eq!(sip_display_name("A \"B\" \\C"), "A \\\"B\\\" \\\\C");
         // Length is bounded so a huge line can't bloat every INVITE.
         assert!(sip_display_name(&"x".repeat(500)).len() <= 64);
-    }
-
-    #[test]
-    fn display_line_index_is_stable_per_call_and_in_range() {
-        let id = Uuid::now_v7();
-        // Deterministic for a given call, and always a valid index.
-        assert_eq!(display_line_index(id, 3), display_line_index(id, 3));
-        for n in 1..=5 {
-            assert!(display_line_index(id, n) < n);
-        }
-    }
-
-    #[test]
-    fn parse_nc_accepts_hex_and_rejects_junk() {
-        assert_eq!(parse_nc("00000001"), Some(1));
-        assert_eq!(parse_nc("0000000a"), Some(10));
-        assert_eq!(parse_nc("ffffffff"), Some(u32::MAX));
-        // Malformed / overlong / non-hex → None (treated as "no nc").
-        assert_eq!(parse_nc(""), None);
-        assert_eq!(parse_nc("zzzz"), None);
-        assert_eq!(parse_nc("100000000"), None); // 9 hex digits
     }
 
     #[test]
@@ -1499,158 +1273,5 @@ mod tests {
             "should retransmit the lost BYE and observe the 200"
         );
         peer_task.await.unwrap();
-    }
-
-    /// The outbound INVITE transaction retransmits until the callee responds, then returns the
-    /// final response (skipping provisional 1xx).
-    #[tokio::test]
-    async fn invite_retransmits_then_returns_final() {
-        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let callee_addr = callee.local_addr().unwrap();
-        let callee_task = tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            let _ = callee.recv_from(&mut buf).await; // first INVITE — "lost"
-            let (_, from) = callee.recv_from(&mut buf).await.unwrap(); // retransmit
-                                                                       // Provisional first (stops retransmission), then the final 200.
-            callee
-                .send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from)
-                .await
-                .unwrap();
-            callee
-                .send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", from)
-                .await
-                .unwrap();
-        });
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let invite =
-            b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
-        let resp =
-            send_invite_await_final(&sock, invite, callee_addr, Duration::from_secs(3)).await;
-        assert_eq!(
-            resp.and_then(|m| m.status()),
-            Some(200),
-            "should return the final 200"
-        );
-        callee_task.await.unwrap();
-    }
-
-    /// A losing leg of a ring-all fork: while the callee is ringing (180), a cancel signal makes
-    /// the await send a `CANCEL` for the INVITE transaction and give up (`None`) — this is what
-    /// stops the other members' phones once one answers.
-    #[tokio::test]
-    async fn cancellable_await_sends_cancel_when_signalled() {
-        let callee = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let callee_addr = callee.local_addr().unwrap();
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-        // The awaiter runs concurrently; it will INVITE, see the 180, then observe the cancel.
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let invite =
-            b"INVITE sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
-                .to_vec();
-        let cancel_req =
-            b"CANCEL sip:x@127.0.0.1 SIP/2.0\r\nCSeq: 1 CANCEL\r\nContent-Length: 0\r\n\r\n"
-                .to_vec();
-        let awaiter = tokio::spawn(async move {
-            send_invite_await_final_cancellable(
-                &sock,
-                &invite,
-                callee_addr,
-                Duration::from_secs(5),
-                cancel_rx,
-                cancel_req,
-            )
-            .await
-        });
-
-        let mut buf = [0u8; 2048];
-        // Receive the INVITE and answer 180 (so retransmits stop and the leg is "ringing").
-        let (n, from) = callee.recv_from(&mut buf).await.unwrap();
-        assert!(buf[..n].starts_with(b"INVITE"));
-        callee
-            .send_to(b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n", from)
-            .await
-            .unwrap();
-
-        // A sibling won → cancel this leg. The next datagram the callee sees must be a CANCEL.
-        cancel_tx.send(true).unwrap();
-        let (n2, _) = callee.recv_from(&mut buf).await.unwrap();
-        assert!(
-            buf[..n2].starts_with(b"CANCEL"),
-            "cancelled leg must send a SIP CANCEL"
-        );
-
-        // And the await resolves to None (this leg did not win).
-        assert!(awaiter.await.unwrap().is_none());
-    }
-
-    #[test]
-    fn hold_direction_classifies_sdp() {
-        // Hold: sendonly / inactive.
-        assert_eq!(hold_direction("v=0\r\na=sendonly\r\n"), Some(true));
-        assert_eq!(
-            hold_direction("m=audio 5004 RTP/AVP 0\r\na=inactive\r\n"),
-            Some(true)
-        );
-        // Resume / active: sendrecv / recvonly.
-        assert_eq!(hold_direction("a=sendrecv\r\n"), Some(false));
-        assert_eq!(hold_direction("a=recvonly\r\n"), Some(false));
-        // No direction attribute → unchanged (plain retransmit).
-        assert_eq!(hold_direction("v=0\r\nm=audio 5004 RTP/AVP 0\r\n"), None);
-    }
-
-    /// The queue-wait driver latches the caller, plays treatment audio, and — with no member to
-    /// answer — overflows and exits cleanly once `max_wait` elapses (never hangs on hold music).
-    #[tokio::test]
-    async fn queue_wait_driver_overflows_and_exits_with_no_members() {
-        use crate::control::registrations::RegistrationRegistry;
-
-        let driver_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let driver_addr = driver_sock.local_addr().unwrap();
-        let caller = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // The caller sends one RTP-sized packet so the driver latches its address.
-        caller.send_to(&[0u8; 172], driver_addr).await.unwrap();
-
-        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let moh = Arc::new(crate::sip::moh::MohSource::synth());
-        let wait = crate::sip::queuewait::WaitConfig {
-            max_wait: Some(Duration::from_millis(300)),
-            announce_every: Duration::from_secs(30),
-            poll_every: Duration::from_millis(50),
-        };
-        let beep = g711::beep(20, g711::G711::Ulaw);
-        let driver = tokio::spawn(SipServer::queue_wait_driver(
-            driver_sock,
-            g711::G711::Ulaw,
-            dtmf::TELEPHONE_EVENT_PT,
-            "127.0.0.1".parse().unwrap(),
-            Uuid::now_v7(),
-            moh,
-            true,
-            RegistrationRegistry::new(),
-            Vec::new(), // no members → nobody to place the caller with
-            Uuid::now_v7(),
-            wait,
-            None, // no overflow target
-            Duration::from_secs(1),
-            beep.clone(),
-            beep,
-            None,
-            stop_rx,
-        ));
-
-        // The caller receives treatment audio (greeting / hold music).
-        let mut buf = [0u8; 2048];
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), caller.recv_from(&mut buf))
-                .await
-                .is_ok(),
-            "caller should hear queue treatment audio"
-        );
-        // The driver overflows shortly after max_wait and finishes (does not hang on MoH).
-        tokio::time::timeout(Duration::from_secs(3), driver)
-            .await
-            .expect("driver should finish after overflow")
-            .unwrap();
     }
 }
