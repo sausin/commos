@@ -134,18 +134,18 @@ Everything is **multi-tenant** and runs from a **single binary** on either embed
 
 Shipped ✓ · Partial ◐ · Planned ○
 
-| Identity                | Communications            | Platform                     |
-| ----------------------- | ------------------------- | ---------------------------- |
-| Users ✓                 | SIP / RTP ✓               | REST API ✓                   |
-| Multi-tenancy ✓         | Calls & bridging ✓        | Event bus + outbox ✓         |
-| Bearer / HS256 JWT ✓    | Voicemail + MWI ✓         | Webhooks ✓                   |
-| Directory & lifecycle ✓ | IVR / Call Flows ✓        | Object storage (local/S3) ✓  |
-| Attribution chain ✓     | Recording ✓               | Billing / CDR + rating ✓     |
-| Capabilities / RBAC ◐   | Queues / ACD ✓            | Config-as-code ✓             |
-| OIDC / SSO ○            | Messaging · Presence ◐    | Metrics / observability ✓    |
-| WebAuthn / MFA ○        | Video / WebRTC ○          | Event streaming ◐            |
-| Device identity ○       | Conferences ○             | Automation ○                 |
-| PIN / RFID / Bluetooth ○| PSTN / SIP trunking ✓     | WASM plugins ○               |
+| Identity                 | Communications         | Platform                    |
+| ------------------------ | ---------------------- | --------------------------- |
+| Users ✓                  | SIP / RTP ✓            | REST API ✓                  |
+| Multi-tenancy ✓          | Calls & bridging ✓     | Event bus + outbox ✓        |
+| Bearer / HS256 JWT ✓     | Voicemail + MWI ✓      | Webhooks ✓                  |
+| Directory & lifecycle ✓  | IVR / Call Flows ✓     | Object storage (local/S3) ✓ |
+| Attribution chain ✓      | Recording ✓            | Billing / CDR + rating ✓    |
+| Capabilities / RBAC ◐    | Queues / ACD ✓         | Config-as-code ✓            |
+| OIDC / SSO ○             | Messaging · Presence ◐ | Metrics / observability ✓   |
+| WebAuthn / MFA ○         | Video / WebRTC ○       | Event streaming ◐           |
+| Device identity ○        | Conferences ○          | Automation ○                |
+| PIN / RFID / Bluetooth ○ | PSTN / SIP trunking ✓  | WASM plugins ○              |
 
 ## Architecture
 
@@ -288,6 +288,45 @@ python3 conformance/run.py          # validates the contracts + spec consistency
 | [`contracts/`](contracts/) | Machine-readable contracts: JSON Schema (entities + events), OpenAPI (the API). |
 | [`conformance/`](conformance/) | The executable conformance harness — the arbiter of "does this conform". |
 | [`spec/`](spec/) | The specification suite (20 volumes): the normative prose behind the contracts. |
+
+## Repository layout
+
+Spec-first monorepo: the **contract** lives at the top level, the **implementation** in
+`reference/`. The top-level `spec/`, `contracts/`, and `conformance/` are described above; the code
+is a Cargo workspace of two crates under `reference/crates/`.
+
+```
+commos/
+├─ spec/            normative specification (20 volumes) — the prose behind the contracts
+├─ contracts/       frozen JSON Schema (entities + events) + OpenAPI (the API)
+├─ conformance/     executable conformance harness (run.py + scenarios)
+└─ reference/       the commosd reference implementation
+   ├─ ARCHITECTURE.md   contributor onboarding: layers, request lifecycles, feature map
+   ├─ deploy/           pbx.example.yaml · commosd.service (systemd) · docker-compose.yml
+   ├─ scripts/          install.sh (installer) · smoke.sh (call-path smoke test)
+   └─ crates/
+      ├─ commos-core/   the domain model — pure data types, no I/O, no daemon deps
+      │  └─ src/{entities/, events/}   entity structs + event payloads (the shared vocabulary)
+      └─ commosd/       the daemon (single binary)
+         └─ src/
+            ├─ sip/       media plane: SIP/UDP, RTP, SRTP, DTMF, codecs, IVR, MoH.
+            │             sip/server/ is the B2BUA, split into topic submodules
+            ├─ control/   control-plane services: routing, voicemail, ring planning,
+            │             trunking, provisioning, onboarding, billing, webhooks, …
+            ├─ api/       HTTP handlers (one module per resource, mounted in api/mod.rs)
+            ├─ store/     persistence behind the Store trait (sqlite · postgres · mem)
+            ├─ main.rs    run() — wires everything together
+            ├─ state.rs   AppState — shared handles passed to every handler
+            ├─ config.rs  pbx.yaml load/validate + SecretRef resolution
+            ├─ bus.rs     in-process event bus
+            └─ relay.rs   transactional-outbox → bus relay
+```
+
+The four daemon layers — `sip/` (media plane) · `control/` (services) · `api/` (HTTP) · `store/`
+(persistence) — sit over the `commos-core` domain model. A feature is a **vertical slice** across
+them; see [`reference/ARCHITECTURE.md`](reference/ARCHITECTURE.md) for the layer model, request
+lifecycles, and a feature-by-layer map.
+
 
 ## Build & run
 
