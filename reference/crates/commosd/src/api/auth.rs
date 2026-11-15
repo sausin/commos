@@ -202,7 +202,7 @@ fn decode_json(segment: &str) -> Result<Value, ()> {
 #[async_trait]
 impl<S> FromRequestParts<S> for TenantContext
 where
-    S: Send + Sync + HasAuthConfig,
+    S: Send + Sync + HasAuthConfig + super::admin::HasAdminAuth,
 {
     type Rejection = Problem;
 
@@ -213,6 +213,25 @@ where
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Problem::unauthorized("missing Authorization header"))?;
+
+        // An admin console session (`Bearer admin:<token>`, minted by `POST /admin/login`) is
+        // accepted on the tenant-scoped routes too, attributed to the fixed admin tenant — the
+        // same one `AdminContext` uses — so the browser console needs just one credential.
+        if let Some(token) = header
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .and_then(|t| t.strip_prefix("admin:"))
+        {
+            return if state.admin_auth().is_valid(token) {
+                Ok(TenantContext {
+                    tenant_id: Uuid::parse(super::admin::ADMIN_DEV_TENANT)
+                        .expect("ADMIN_DEV_TENANT is a valid UUIDv7"),
+                    subject: None,
+                })
+            } else {
+                Err(Problem::unauthorized("invalid or expired admin session"))
+            };
+        }
 
         verify_bearer(header, state.auth_config(), trusted)
     }

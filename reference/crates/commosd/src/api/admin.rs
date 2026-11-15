@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::async_trait;
@@ -49,6 +50,40 @@ const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 const MAX_LOGIN_FAILS: u32 = 5;
 /// How long a source IP is locked out after [`MAX_LOGIN_FAILS`] failures (seconds).
 const LOGIN_LOCKOUT_SECS: i64 = 300;
+/// Shortest admin password `POST /admin/password` accepts.
+const MIN_PASSWORD_LEN: usize = 8;
+
+/// Why a password change was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PasswordChangeError {
+    /// No admin password is configured (dev mode) — there is nothing to change.
+    DevMode,
+    /// The supplied current password did not match.
+    WrongCurrent,
+    /// The new password failed validation (message is user-presentable).
+    Invalid(String),
+    /// The password comes from a source CommOS cannot rewrite (env var / external store).
+    ManagedExternally,
+    /// Writing the password file failed.
+    Io(String),
+}
+
+/// Atomically replace `path` with `secret` (write a sibling temp file, `chmod 600`, rename).
+fn write_secret_file(path: &Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(secret.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
 
 /// Per-source-IP brute-force state for `/admin/login`.
 #[derive(Clone, Copy)]
@@ -67,7 +102,11 @@ struct LoginAttempts {
 pub struct AdminAuth {
     /// SHA-256 of the configured admin password, or `None` in dev mode. The plaintext is never
     /// retained: login hashes its input and compares digests in constant time.
-    password_sha256: Option<[u8; 32]>,
+    /// Behind a mutex so `POST /admin/password` can replace it at runtime.
+    password_sha256: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Where the password lives when it is a `file://` secret reference we can rewrite. `None`
+    /// when it comes from somewhere we cannot update (env var, external secret store).
+    password_file: Option<PathBuf>,
     /// Live admin sessions: opaque token → expiry (unix seconds). In-memory only.
     sessions: Arc<Mutex<HashMap<String, i64>>>,
     /// Per-source-IP failed-login tracking for brute-force lockout. In-memory only.
@@ -78,15 +117,67 @@ impl AdminAuth {
     /// Construct admin auth. `password: None` ⇒ dev mode (no admin password configured).
     pub fn new(password: Option<String>) -> Self {
         AdminAuth {
-            password_sha256: password.map(|p| Sha256::digest(p.as_bytes()).into()),
+            password_sha256: Arc::new(Mutex::new(password.map(|p| Sha256::digest(p.as_bytes()).into()))),
+            password_file: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Record the file that holds the configured password (a `file://` secret reference), so
+    /// [`change_password`](Self::change_password) can rewrite it.
+    pub fn with_password_file(mut self, path: Option<PathBuf>) -> Self {
+        self.password_file = path;
+        self
+    }
+
+    fn configured_hash(&self) -> Option<[u8; 32]> {
+        *self.password_sha256.lock().expect("admin password mutex")
+    }
+
     /// Whether admin auth is in dev mode (no password configured).
     pub fn is_dev_mode(&self) -> bool {
-        self.password_sha256.is_none()
+        self.configured_hash().is_none()
+    }
+
+    /// Change the admin password: verify `current`, persist `new` to the password file (atomic
+    /// replace, mode 0600), swap the in-memory hash, and drop every session except
+    /// `keep_token` so a leaked old session cannot outlive the change.
+    pub fn change_password(
+        &self,
+        current: &str,
+        new: &str,
+        keep_token: Option<&str>,
+    ) -> Result<(), PasswordChangeError> {
+        if !self.verify_password(current) {
+            return Err(if self.is_dev_mode() {
+                PasswordChangeError::DevMode
+            } else {
+                PasswordChangeError::WrongCurrent
+            });
+        }
+        if new.chars().count() < MIN_PASSWORD_LEN {
+            return Err(PasswordChangeError::Invalid(format!(
+                "the new password must be at least {MIN_PASSWORD_LEN} characters"
+            )));
+        }
+        if new.len() > 256 || new.contains(['\n', '\r']) {
+            return Err(PasswordChangeError::Invalid(
+                "the new password must be a single line of at most 256 characters".into(),
+            ));
+        }
+        if new.trim() != new {
+            return Err(PasswordChangeError::Invalid(
+                "the new password must not start or end with a space".into(),
+            ));
+        }
+        let path = self.password_file.as_ref().ok_or(PasswordChangeError::ManagedExternally)?;
+        write_secret_file(path, new).map_err(|e| PasswordChangeError::Io(e.to_string()))?;
+        *self.password_sha256.lock().expect("admin password mutex") =
+            Some(Sha256::digest(new.as_bytes()).into());
+        let mut sessions = self.sessions.lock().expect("admin session mutex not poisoned");
+        sessions.retain(|t, _| Some(t.as_str()) == keep_token);
+        Ok(())
     }
 
     /// Whether `ip` is currently locked out from logging in. Returns the seconds remaining if so.
@@ -121,9 +212,9 @@ impl AdminAuth {
     /// fresh opaque token, store it with a 12h expiry, and return it. Returns `None` if no
     /// password is configured (dev mode) or the password does not match.
     pub fn login(&self, password: &str) -> Option<String> {
-        let configured = self.password_sha256.as_ref()?;
+        let configured = self.configured_hash()?;
         let presented: [u8; 32] = Sha256::digest(password.as_bytes()).into();
-        if !constant_time_eq_bytes(&presented, configured) {
+        if !constant_time_eq_bytes(&presented, &configured) {
             return None;
         }
         // Opaque 256-bit token from two UUIDv7s (getrandom-backed via the uuid crate);
@@ -141,11 +232,11 @@ impl AdminAuth {
     /// mode (no password configured) and on any mismatch, so a caller can never be admitted when no
     /// credential is set.
     pub fn verify_password(&self, password: &str) -> bool {
-        let Some(configured) = self.password_sha256.as_ref() else {
+        let Some(configured) = self.configured_hash() else {
             return false;
         };
         let presented: [u8; 32] = Sha256::digest(password.as_bytes()).into();
-        constant_time_eq_bytes(&presented, configured)
+        constant_time_eq_bytes(&presented, &configured)
     }
 
     /// Invalidate a session token (idempotent — a no-op if unknown).
@@ -352,6 +443,43 @@ pub async fn whoami(ctx: AdminContext) -> Json<WhoamiResponse> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PasswordRequest {
+    pub current: String,
+    pub new: String,
+}
+
+/// `POST /admin/password` — change the admin password (current + new).
+///
+/// `400` for a weak/invalid new password or dev mode (nothing to change), `401` for a wrong
+/// current password, and `409` when the password is managed outside CommOS (an env var or
+/// external secret store), with a message saying where to change it instead.
+pub async fn change_password<S>(
+    State(state): State<S>,
+    ctx: AdminContext,
+    Json(req): Json<PasswordRequest>,
+) -> Result<Json<serde_json::Value>, Problem>
+where
+    S: HasAdminAuth + Clone + Send + Sync + 'static,
+{
+    use axum::http::StatusCode;
+    match state.admin_auth().change_password(&req.current, &req.new, ctx.token.as_deref()) {
+        Ok(()) => Ok(Json(serde_json::json!({ "changed": true }))),
+        Err(PasswordChangeError::DevMode) => Err(Problem::bad_request(
+            "no admin password is set yet (local-network mode); set admin_password in pbx.yaml first",
+        )),
+        Err(PasswordChangeError::WrongCurrent) => Err(Problem::unauthorized("current password is incorrect")),
+        Err(PasswordChangeError::Invalid(m)) => Err(Problem::bad_request(m)),
+        Err(PasswordChangeError::ManagedExternally) => Err(Problem::new(
+            StatusCode::CONFLICT,
+            "password_managed_externally",
+            "the admin password is managed outside CommOS (an environment variable or external \
+             secret). Change it where it is stored, then restart commosd.",
+        )),
+        Err(PasswordChangeError::Io(e)) => Err(Problem::internal(format!("could not save the password: {e}"))),
+    }
+}
+
 // --- Internals --------------------------------------------------------------------------
 
 /// Current unix time in seconds.
@@ -488,7 +616,7 @@ mod tests {
         // The struct holds only a SHA-256 digest of the password, never the password itself.
         let admin = AdminAuth::new(Some(PASSWORD.to_string()));
         let expected: [u8; 32] = Sha256::digest(PASSWORD.as_bytes()).into();
-        assert_eq!(admin.password_sha256, Some(expected));
+        assert_eq!(admin.configured_hash(), Some(expected));
         // A correct/incorrect password still logs in / is rejected via the hash comparison.
         assert!(admin.login(PASSWORD).is_some());
         assert!(admin.login("nope").is_none());
@@ -509,6 +637,20 @@ mod tests {
         // A success clears the state.
         admin.record_success(ip);
         assert!(admin.lockout_remaining(ip).is_none());
+    }
+
+    #[test]
+    fn change_password_error_paths() {
+        // Dev mode: nothing to change.
+        assert_eq!(AdminAuth::new(None).change_password("", "long-enough-pw", None), Err(PasswordChangeError::DevMode));
+        let a = AdminAuth::new(Some(PASSWORD.to_string()));
+        assert_eq!(a.change_password("bad", "long-enough-pw", None), Err(PasswordChangeError::WrongCurrent));
+        assert!(matches!(a.change_password(PASSWORD, "short", None), Err(PasswordChangeError::Invalid(_))));
+        assert!(matches!(a.change_password(PASSWORD, "multi\nline-password", None), Err(PasswordChangeError::Invalid(_))));
+        assert!(matches!(a.change_password(PASSWORD, " padded-password ", None), Err(PasswordChangeError::Invalid(_))));
+        // Valid new password but no file to write (env:// secret): refused, old password intact.
+        assert_eq!(a.change_password(PASSWORD, "long-enough-pw", None), Err(PasswordChangeError::ManagedExternally));
+        assert!(a.verify_password(PASSWORD));
     }
 
     #[test]

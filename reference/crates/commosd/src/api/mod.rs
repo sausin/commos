@@ -12,6 +12,7 @@ pub mod calls;
 pub mod cdrs;
 pub mod channels;
 pub mod config;
+pub mod console;
 pub mod ivrs;
 pub mod dashboard;
 pub mod directory;
@@ -221,6 +222,7 @@ pub fn router(state: AppState) -> Router {
                 .patch(directory::patch_extension)
                 .delete(directory::delete_extension),
         )
+        .route("/extensions/:id/sip-password", post(console::reset_sip_password))
         .route("/devices", get(directory::list_devices).post(directory::create_device))
         .route(
             "/devices/:id",
@@ -260,6 +262,9 @@ pub fn router(state: AppState) -> Router {
         // Live operations dashboard + setup wizard (self-contained HTML).
         .route("/dashboard", get(dashboard::dashboard))
         .route("/onboarding", get(onboarding::wizard))
+        // The simple admin console (single-page app; people, groups, numbers, hours, history).
+        .route("/admin", get(console::page))
+        .route("/admin/", get(console::page))
         // Operational signals (Volume 15) — info + metrics leak topology/counters.
         .route("/info", get(health::info))
         .route("/metrics", get(health::metrics))
@@ -275,6 +280,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/login", post(admin::login::<AppState>))
         .route("/admin/logout", post(admin::logout::<AppState>))
         .route("/admin/whoami", get(admin::whoami))
+        .route("/admin/password", post(admin::change_password::<AppState>))
         // Liveness/readiness stay unauthenticated so load balancers can probe them.
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
