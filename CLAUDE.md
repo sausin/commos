@@ -105,7 +105,9 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   `SipServer::run_blf`).
 - **Dialing / feature codes** — `control/dialplan.rs::normalize_dialed` (national/intl/outside-line
   → E.164, per-`Gateway` overrides incl. `outbound_caller_id`); `sip/server/outbound.rs`
-  (emergency numbers always go out a trunk); `sip/server/featurecodes.rs` (`*78`/`*79` DND,
+  (emergency numbers — country-aware, `policy::emergency_numbers_for` — always go out a trunk;
+  `vet_external` runs outbound policy + own-DID loop guard on every external leg: SIP calls,
+  REFER targets, forwards, `*72`); `sip/server/featurecodes.rs` (`*78`/`*79` DND,
   `*72<n>`/`*73` forward-always); `sip/server/dnd.rs` (`Extension.dnd` → never rung; busy uses the
   `Busy` forwarding rule).
 - **Business hours** — `control/schedule.rs` (pure `is_open`/`pick_destination`, `jiff` with bundled
