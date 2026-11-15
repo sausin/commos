@@ -78,15 +78,68 @@ fn capture_payload(cap: &Capture, packet: &[u8]) {
 pub struct Bridge {
     /// UDP port facing the caller — advertise this in the SDP answer sent to the caller.
     pub leg_a_port: u16,
+    /// UDP port facing the callee. Tracked so a transfer that swaps the legs keeps both ports
+    /// accurate (it is what a re-answer to the party now on leg A must advertise).
+    pub leg_b_port: u16,
     task: JoinHandle<()>,
     /// Hold control: a re-INVITE handler flips this to start/stop music-on-hold.
     hold: watch::Sender<HoldState>,
+    /// Re-targeting control (call transfer): replace a leg's socket / swap the legs.
+    cmd: tokio::sync::mpsc::UnboundedSender<BridgeCmd>,
+    /// Relays this bridge forwards into after a transfer (the transfer target's own bridge,
+    /// see [`Bridge::retarget`]). Their lifetime is tied to this bridge: aborting one aborts all.
+    chained: Vec<Bridge>,
+}
+
+/// A live re-targeting instruction for the relay task (blind/attended transfer).
+#[allow(clippy::large_enum_variant)] // short-lived control message; boxing buys nothing
+enum BridgeCmd {
+    /// Replace `leg`'s socket (and SRTP context) with `sock`, with its peer pre-set to `peer`
+    /// (or re-latched from the first packet when `None`).
+    Replace {
+        leg: Leg,
+        sock: UdpSocket,
+        peer: Option<SocketAddr>,
+        srtp: Option<SrtpSession>,
+    },
+    /// Exchange leg A and leg B (socket, latched peer and SRTP context).
+    Swap,
 }
 
 impl Bridge {
     /// Tear the relay down (aborts the background task; sockets are then dropped).
     pub fn abort(self) {
         self.task.abort();
+        for b in self.chained {
+            b.abort();
+        }
+    }
+
+    /// Re-target `leg` at a new far end **without** touching the other leg (call transfer).
+    ///
+    /// `sock` becomes the new socket for `leg`; its peer is pre-set to `peer` (no latching wait).
+    /// `chained` is the transfer target's own relay: `peer` is typically that relay's
+    /// caller-facing port on loopback, so the existing relay keeps forwarding into it. The chained
+    /// relay is owned (and aborted) with this one. Plaintext on the new leg (`srtp` = none).
+    pub fn retarget(&mut self, leg: Leg, sock: UdpSocket, peer: Option<SocketAddr>, chained: Option<Bridge>) {
+        let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+        if self.cmd.send(BridgeCmd::Replace { leg, sock, peer, srtp: None }).is_ok() {
+            match leg {
+                Leg::A => self.leg_a_port = port,
+                Leg::B => self.leg_b_port = port,
+            }
+        }
+        if let Some(c) = chained {
+            self.chained.push(c);
+        }
+    }
+
+    /// Exchange the two legs, so the party previously on leg B is on leg A (and vice-versa). Used
+    /// when the *caller* transfers: the surviving callee becomes the dialog's primary leg.
+    pub fn swap_legs(&mut self) {
+        if self.cmd.send(BridgeCmd::Swap).is_ok() {
+            std::mem::swap(&mut self.leg_a_port, &mut self.leg_b_port);
+        }
     }
 
     /// Signal the relay to enter/leave hold. A no-op once the relay task has ended (the caller
@@ -136,8 +189,10 @@ impl PendingBridge {
         srtp_b: Option<SrtpSession>,
         moh: Option<MohLoop>,
     ) -> Bridge {
-        let PendingBridge { leg_a, leg_b, leg_a_port, leg_b_port: _ } = self;
+        let PendingBridge { mut leg_a, mut leg_b, leg_a_port, leg_b_port } = self;
         let (hold_tx, mut hold_rx) = watch::channel(HoldState::Active);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<BridgeCmd>();
+        let mut cmd_open = true;
         let task = tokio::spawn(async move {
             // Each leg's peer address, learned from the first datagram it receives (latching).
             let mut peer_a: Option<SocketAddr> = None;
@@ -168,6 +223,19 @@ impl PendingBridge {
                             hold = *hold_rx.borrow();
                         }
                     }
+                    // A transfer re-targeting a leg (or swapping the two).
+                    cmd = cmd_rx.recv(), if cmd_open => match cmd {
+                        Some(BridgeCmd::Replace { leg, sock, peer, srtp }) => match leg {
+                            Leg::A => { leg_a = sock; peer_a = peer; srtp_a = srtp; }
+                            Leg::B => { leg_b = sock; peer_b = peer; srtp_b = srtp; }
+                        },
+                        Some(BridgeCmd::Swap) => {
+                            std::mem::swap(&mut leg_a, &mut leg_b);
+                            std::mem::swap(&mut peer_a, &mut peer_b);
+                            std::mem::swap(&mut srtp_a, &mut srtp_b);
+                        }
+                        None => cmd_open = false,
+                    },
                     // Packet from the caller side → decrypt (leg A), re-encrypt (leg B), forward.
                     r = leg_a.recv_from(&mut buf_a) => match r {
                         Ok((n, from)) => {
@@ -240,7 +308,7 @@ impl PendingBridge {
                 }
             }
         });
-        Bridge { leg_a_port, task, hold: hold_tx }
+        Bridge { leg_a_port, leg_b_port, task, hold: hold_tx, cmd: cmd_tx, chained: Vec::new() }
     }
 }
 

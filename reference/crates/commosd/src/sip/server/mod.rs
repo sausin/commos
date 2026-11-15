@@ -102,6 +102,7 @@ impl Media {
 /// TODO(B2BUA): this is best-effort. We reconstruct a BYE from the identifiers captured when
 /// the leg was set up, but full RFC 3261 mid-dialog correctness (route sets, contact
 /// refresh, robust CSeq accounting) is not implemented.
+#[derive(Clone)]
 struct CalleeLeg {
     /// Where to send requests toward the callee (its Contact's host:port).
     addr: SocketAddr,
@@ -303,6 +304,7 @@ mod handlers; // non-INVITE methods: REGISTER, INFO, BYE/CANCEL
 mod invite; // the inbound INVITE handler (core routing decision)
 mod ivr_menu; // IVR menu playout + driver
 mod queue; // call-queue answer path + queue-wait driver
+mod refer; // REFER call transfer (blind + attended)
 mod routing; // destination resolution + outbound gateway selection
 mod sdp; // SDP/SRTP negotiation + SIP response construction
 mod subscribe; // SUBSCRIBE/NOTIFY: BLF (dialog), message-summary, presence
@@ -442,6 +444,7 @@ impl SipServer {
             "BYE" | "CANCEL" => self.on_bye(resp, &msg).await,
             "INFO" => self.on_info(resp, &msg).await,
             "SUBSCRIBE" => self.on_subscribe(resp, &msg).await,
+            "REFER" => self.on_refer(resp, &msg).await,
             // In-dialog session refresh without SDP: nothing to renegotiate.
             "UPDATE" if msg.body().is_empty() => self.reply(resp, &msg, 200, "OK").await,
             "PUBLISH" => {

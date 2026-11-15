@@ -19,7 +19,7 @@ use super::*;
 pub(super) const ALLOW_EVENTS: &str = "dialog, message-summary, presence";
 /// Methods we advertise in `Allow`.
 pub(super) const ALLOW_METHODS: &str =
-    "INVITE, ACK, CANCEL, BYE, OPTIONS, REGISTER, INFO, SUBSCRIBE, NOTIFY, UPDATE";
+    "INVITE, ACK, CANCEL, BYE, OPTIONS, REGISTER, INFO, SUBSCRIBE, NOTIFY, UPDATE, REFER";
 
 /// How often expired subscriptions are swept.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10);

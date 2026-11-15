@@ -626,6 +626,124 @@ fn rand_tag() -> String {
     s
 }
 
+/// The `tag` parameter of a From/To header value.
+pub fn header_tag(value: &str) -> Option<String> {
+    find_param(value, "tag")
+}
+
+// --- REFER (call transfer, RFC 3515 / RFC 3891) ---------------------------------------------
+
+/// A parsed `Refer-To` target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferTo {
+    /// The target URI without any `?headers` / `;params` — e.g. `sip:202@host`.
+    pub uri: String,
+    /// The user-part of [`Self::uri`] (the dialled extension/number), if it has one.
+    pub user: Option<String>,
+    /// The `Replaces` header embedded in the URI (`?Replaces=...`), when this is an *attended*
+    /// transfer.
+    pub replaces: Option<Replaces>,
+}
+
+/// An RFC 3891 `Replaces` dialog identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replaces {
+    pub call_id: String,
+    pub to_tag: String,
+    pub from_tag: String,
+    pub early_only: bool,
+}
+
+/// Percent-decode (`%40` → `@`, `%3B` → `;`). Malformed escapes are passed through verbatim.
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a decoded `Replaces` value: `call-id;to-tag=x;from-tag=y[;early-only]`.
+pub fn parse_replaces(decoded: &str) -> Option<Replaces> {
+    let mut parts = decoded.split(';');
+    let call_id = parts.next()?.trim().to_string();
+    if call_id.is_empty() {
+        return None;
+    }
+    let (mut to_tag, mut from_tag, mut early_only) = (None, None, false);
+    for p in parts {
+        let p = p.trim();
+        match p.split_once('=') {
+            Some((k, v)) if k.trim().eq_ignore_ascii_case("to-tag") => to_tag = Some(v.trim().to_string()),
+            Some((k, v)) if k.trim().eq_ignore_ascii_case("from-tag") => from_tag = Some(v.trim().to_string()),
+            None if p.eq_ignore_ascii_case("early-only") => early_only = true,
+            _ => {}
+        }
+    }
+    Some(Replaces { call_id, to_tag: to_tag?, from_tag: from_tag?, early_only })
+}
+
+/// Parse a `Refer-To` header value: `<sip:202@host>`, `sip:202@host`, or the attended form
+/// `<sip:202@host?Replaces=abc%40host%3Bto-tag%3Dx%3Bfrom-tag%3Dy>`.
+pub fn parse_refer_to(value: &str) -> Option<ReferTo> {
+    let spec = addr_spec(value);
+    let (base, headers) = match spec.split_once('?') {
+        Some((b, h)) => (b, Some(h)),
+        None => (spec, None),
+    };
+    // Drop URI parameters (`;user=phone`) from the base; keep scheme:user@host[:port].
+    let uri = base.split(';').next().unwrap_or(base).trim().to_string();
+    if uri.is_empty() || !(uri.starts_with("sip:") || uri.starts_with("sips:") || uri.starts_with("tel:")) {
+        return None;
+    }
+    let user = uri
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once('@').map(|(u, _)| u).or(if uri.starts_with("tel:") { Some(rest) } else { None }))
+        .filter(|u| !u.is_empty())
+        .map(percent_decode);
+    let replaces = headers.and_then(|h| {
+        h.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            k.trim().eq_ignore_ascii_case("replaces").then(|| parse_replaces(&percent_decode(v))).flatten()
+        })
+    });
+    Some(ReferTo { uri, user, replaces })
+}
+
+impl SipMessage {
+    /// The first header whose raw name matches `long` or the compact form `short`.
+    fn header_either(&self, long: &str, short: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.trim().eq_ignore_ascii_case(long) || n.trim().eq_ignore_ascii_case(short))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The parsed `Refer-To` (compact form `r`) of a REFER.
+    pub fn refer_to(&self) -> Option<ReferTo> {
+        parse_refer_to(self.header_either("Refer-To", "r")?)
+    }
+
+    /// The `Referred-By` (compact form `b`) URI, without parameters.
+    pub fn referred_by(&self) -> Option<String> {
+        let v = self.header_either("Referred-By", "b")?;
+        let u = uri_aor(v);
+        (!u.is_empty()).then_some(u)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,5 +974,52 @@ Expires: 0\r\n\
         let msg = parse(dereg.as_bytes()).unwrap();
         assert_eq!(msg.contact_uri(), None);
         assert_eq!(msg.expires(), 0);
+    }
+
+    #[test]
+    fn refer_to_plain_and_with_params() {
+        let r = parse_refer_to("<sip:202@10.0.0.5:5060;user=phone>").unwrap();
+        assert_eq!(r.uri, "sip:202@10.0.0.5:5060");
+        assert_eq!(r.user.as_deref(), Some("202"));
+        assert!(r.replaces.is_none());
+        let r = parse_refer_to("\"Bob\" <sip:+15551230000@carrier>").unwrap();
+        assert_eq!(r.user.as_deref(), Some("+15551230000"));
+        let r = parse_refer_to("sip:303@host").unwrap();
+        assert_eq!(r.uri, "sip:303@host");
+        assert!(parse_refer_to("http://x").is_none());
+        assert!(parse_refer_to("").is_none());
+    }
+
+    #[test]
+    fn refer_to_attended_decodes_replaces() {
+        let v = "<sip:202@h?Replaces=abc%40phone%3Bto-tag%3Dtt1%3Bfrom-tag%3Dff2%3Bearly-only&X=1>";
+        let r = parse_refer_to(v).unwrap();
+        assert_eq!(r.uri, "sip:202@h");
+        let rep = r.replaces.unwrap();
+        assert_eq!(rep.call_id, "abc@phone");
+        assert_eq!(rep.to_tag, "tt1");
+        assert_eq!(rep.from_tag, "ff2");
+        assert!(rep.early_only);
+        // Missing tag -> not a valid Replaces.
+        assert!(parse_replaces("abc;to-tag=x").is_none());
+    }
+
+    #[test]
+    fn percent_decode_handles_edges() {
+        assert_eq!(percent_decode("a%40b%3Bc"), "a@b;c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
+    fn refer_headers_including_compact_forms() {
+        let raw = "REFER sip:a@h SIP/2.0\r\nr: <sip:202@h>\r\nb: <sip:201@h>;tag=1\r\nCall-ID: x\r\n\r\n";
+        let m = parse(raw.as_bytes()).unwrap();
+        assert_eq!(m.refer_to().unwrap().user.as_deref(), Some("202"));
+        assert_eq!(m.referred_by().as_deref(), Some("sip:201@h"));
+        let raw = "REFER sip:a@h SIP/2.0\r\nRefer-To: sip:300@h\r\nReferred-By: sip:201@h\r\n\r\n";
+        let m = parse(raw.as_bytes()).unwrap();
+        assert_eq!(m.refer_to().unwrap().uri, "sip:300@h");
+        assert_eq!(m.referred_by().as_deref(), Some("sip:201@h"));
     }
 }
