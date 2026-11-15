@@ -15,6 +15,25 @@ use commos_core::entities::gateway::{Gateway, GatewayHealth, GatewayKind};
 use commos_core::entities::trunk::Trunk;
 
 use crate::relay::RelaySignal;
+
+/// Optional per-gateway dialling profile (patchable subset of [`Gateway`]).
+#[derive(Default, Clone, Debug, serde::Deserialize)]
+pub struct GatewayDialing {
+    pub country_code: Option<String>,
+    pub national_prefix: Option<String>,
+    pub international_prefix: Option<String>,
+    pub strip_prefix: Option<String>,
+    pub outbound_caller_id: Option<String>,
+}
+impl GatewayDialing {
+    pub fn is_empty(&self) -> bool {
+        self.country_code.is_none()
+            && self.national_prefix.is_none()
+            && self.international_prefix.is_none()
+            && self.strip_prefix.is_none()
+            && self.outbound_caller_id.is_none()
+    }
+}
 use crate::store::{Page, Store, StoreError, Tx};
 
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +101,11 @@ impl TrunkingService {
             kind,
             address,
             health,
+            country_code: None,
+            national_prefix: None,
+            international_prefix: None,
+            strip_prefix: None,
+            outbound_caller_id: None,
         };
         self.store.commit(Tx { gateways: vec![g.clone()], ..Default::default() }).await?;
         self.signal.wake();
@@ -93,11 +117,29 @@ impl TrunkingService {
     pub async fn list_gateways(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Gateway>, TrunkingError> {
         Ok(self.store.list_gateways(tenant, limit, cursor).await?)
     }
-    /// Update a gateway's health (the one mutable field an operator sets directly). Versions the
-    /// entity forward.
-    pub async fn set_gateway_health(&self, tenant: Uuid, id: Uuid, health: GatewayHealth) -> Result<Gateway, TrunkingError> {
+    /// Patch a gateway's health and/or its dialling profile (country code, prefixes, caller ID).
+    pub async fn update_gateway(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        health: Option<GatewayHealth>,
+        d: GatewayDialing,
+    ) -> Result<Gateway, TrunkingError> {
         let mut g = self.get_gateway(tenant, id).await?;
-        g.health = health;
+        if let Some(h) = health {
+            g.health = h;
+        }
+        // An empty string clears an override.
+        let set = |slot: &mut Option<String>, v: Option<String>| {
+            if let Some(v) = v {
+                *slot = (!v.trim().is_empty()).then(|| v.trim().to_string());
+            }
+        };
+        set(&mut g.country_code, d.country_code);
+        set(&mut g.national_prefix, d.national_prefix);
+        set(&mut g.international_prefix, d.international_prefix);
+        set(&mut g.strip_prefix, d.strip_prefix);
+        set(&mut g.outbound_caller_id, d.outbound_caller_id);
         g.base.touch();
         self.store.commit(Tx { gateways: vec![g.clone()], ..Default::default() }).await?;
         self.signal.wake();
@@ -187,7 +229,7 @@ mod tests {
         assert_eq!(s.get_did(t, did.base.id).await.unwrap().destination_ref, "sip:200@host");
 
         // Health toggle versions the gateway forward.
-        let off = s.set_gateway_health(t, gw.base.id, GatewayHealth::Offline).await.unwrap();
+        let off = s.update_gateway(t, gw.base.id, Some(GatewayHealth::Offline), GatewayDialing::default()).await.unwrap();
         assert_eq!(off.health, GatewayHealth::Offline);
         assert_eq!(off.base.version, 1);
 

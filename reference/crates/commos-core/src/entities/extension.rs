@@ -21,6 +21,10 @@ pub struct Extension {
     pub route_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Do-not-disturb: when `true` the extension is never rung (calls go to its busy
+    /// forwarding rule, else voicemail).
+    #[serde(default)]
+    pub dnd: bool,
 }
 
 impl Extension {
@@ -32,6 +36,7 @@ impl Extension {
             number: number.into(),
             route_id,
             label: None,
+            dnd: false,
         }
     }
 }
@@ -74,5 +79,20 @@ mod tests {
         let ext = Extension::new(Uuid::now_v7(), "1001", Uuid::now_v7());
         let json = serde_json::to_value(&ext).unwrap();
         assert!(json.get("label").is_none());
+    }
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::*;
+
+    #[test]
+    fn dnd_defaults_false_when_absent() {
+        let ext = Extension::new(Uuid::now_v7(), "1001", Uuid::now_v7());
+        let mut j = serde_json::to_value(&ext).unwrap();
+        assert_eq!(j["dnd"], false);
+        j.as_object_mut().unwrap().remove("dnd");
+        let back: Extension = serde_json::from_value(j).unwrap();
+        assert!(!back.dnd);
     }
 }

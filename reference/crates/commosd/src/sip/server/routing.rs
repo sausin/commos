@@ -57,8 +57,24 @@ impl SipServer {
     /// Select an outbound gateway for a **dialled target**: if it is an external E.164 number and
     /// an `ONLINE` `SIP` gateway with an address exists, return `(gateway, e164)` to place the
     /// call to the carrier. `None` for an internal target or when no usable gateway is configured.
+    ///
+    /// The target is normalised **per gateway** under that gateway's dial profile
+    /// ([`outbound::gateway_profile`]: country code, national/international/outside-line
+    /// prefixes), so a user can dial `07700 900123`, `9 07700 900123`, `00…`/`011…` or `+…`.
+    /// A target that is an internal extension is never sent to the PSTN.
     pub(super) async fn select_outbound_gateway(&self, target: &str) -> Option<(Gateway, String)> {
-        let e164 = dialplan::normalize_e164(target, &self.default_cc)?;
+        // Internal extensions win over PSTN interpretation.
+        if let Some(number) = dialed_user(target) {
+            if !number.starts_with('+')
+                && self
+                    .routing
+                    .resolve_extension(self.default_tenant, number)
+                    .await
+                    .is_some()
+            {
+                return None;
+            }
+        }
         let mut cursor = None;
         loop {
             let page = self
@@ -70,7 +86,16 @@ impl SipServer {
                 g.kind == GatewayKind::Sip
                     && g.health == GatewayHealth::Online
                     && g.address.as_deref().is_some_and(|a| !a.is_empty())
+                    && dialplan::normalize_dialed(
+                        target,
+                        &outbound::gateway_profile(g, &self.default_cc),
+                    )
+                    .is_some()
             }) {
+                let e164 = dialplan::normalize_dialed(
+                    target,
+                    &outbound::gateway_profile(gw, &self.default_cc),
+                )?;
                 return Some((gw.clone(), e164));
             }
             match page.next_cursor {
@@ -98,4 +123,16 @@ impl SipServer {
             }
         }
     }
+}
+
+/// The user part of a dialled target (`sip:07700900123@host`, `tel:+44…`, or a bare number).
+fn dialed_user(target: &str) -> Option<&str> {
+    let t = target.trim().trim_start_matches('<');
+    let t = t
+        .strip_prefix("sips:")
+        .or_else(|| t.strip_prefix("sip:"))
+        .or_else(|| t.strip_prefix("tel:"))
+        .unwrap_or(t);
+    let user = t.split('@').next()?.split(';').next()?.trim();
+    (!user.is_empty()).then_some(user)
 }

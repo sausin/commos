@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use commos_core::common::Uuid;
+use commos_core::entities::forwarding::{ForwardMode, Forwarding};
 
 use crate::control::ringplan::{self, DialPlan, PlanOpts};
 use crate::store::Store;
@@ -33,6 +34,7 @@ pub const RING_GROUP_SCHEME: &str = "ringgroup:";
 /// Never fails: a missing/looking-up-empty ring group, or a store error, degrades to the
 /// safest plan (ring the plain extension, or go to voicemail), so a config gap can never wedge
 /// an inbound call.
+#[allow(dead_code)] // the non-DND entry point; production uses `resolve_plan_dnd`
 pub async fn resolve_plan(
     store: &Arc<dyn Store>,
     tenant: Uuid,
@@ -42,6 +44,42 @@ pub async fn resolve_plan(
     rotation: usize,
     registered: impl Fn(&str) -> bool,
 ) -> DialPlan {
+    resolve_plan_dnd(store, tenant, dialled_number, target_ref, opts, rotation, registered, false)
+        .await
+}
+
+/// [`resolve_plan`] with the dialled extension's **do-not-disturb** state. A DND extension is
+/// never rung: an `ALWAYS` forward still applies (it never rings the extension either),
+/// otherwise the call takes its `BUSY` rule (then `UNAVAILABLE`), otherwise voicemail.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_plan_dnd(
+    store: &Arc<dyn Store>,
+    tenant: Uuid,
+    dialled_number: &str,
+    target_ref: &str,
+    opts: PlanOpts,
+    rotation: usize,
+    registered: impl Fn(&str) -> bool,
+    dnd: bool,
+) -> DialPlan {
+    if dnd {
+        if let Some(fwd) = find_forwarding(store, tenant, dialled_number, |f| {
+            f.mode == ForwardMode::Always
+        })
+        .await
+        {
+            return ringplan::plan_with_forwarding(dialled_number, false, &fwd, &opts);
+        }
+        if let Some(fwd) = busy_forwarding(store, tenant, dialled_number, true).await {
+            return ringplan::plan_busy(dialled_number, &fwd, &opts);
+        }
+        return DialPlan::immediate(if opts.voicemail_enabled {
+            ringplan::FinalAction::Voicemail(dialled_number.to_string())
+        } else {
+            ringplan::FinalAction::Hangup
+        });
+    }
+
     // 1. Forwarding rule takes precedence.
     if let Some(fwd) = active_forwarding(store, tenant, dialled_number).await {
         let ext_registered = registered(dialled_number);
@@ -67,19 +105,68 @@ pub async fn resolve_plan(
     ringplan::plan_direct(dialled_number, registered(dialled_number), &opts)
 }
 
-/// Find the first **active** forwarding rule for `number` (a small config scan, like
-/// `Routing::resolve_extension`). Errors and misses both yield `None`. Public so the SIP layer
-/// can cheaply decide whether a dialled number needs the multi-destination plan path at all
-/// (keeping the plain single-extension bridge path untouched when it does not).
+/// The plan for a call whose callee answered **busy** (`486`): the number's active `BUSY`
+/// forwarding rule's targets, or `None` when there is no such rule (the caller then applies its
+/// normal decline handling).
+pub async fn resolve_busy_plan(
+    store: &Arc<dyn Store>,
+    tenant: Uuid,
+    dialled_number: &str,
+    opts: PlanOpts,
+) -> Option<DialPlan> {
+    let fwd = busy_forwarding(store, tenant, dialled_number, false).await?;
+    Some(ringplan::plan_busy(dialled_number, &fwd, &opts))
+}
+
+/// The active `BUSY` rule for `number` (and, with `include_unavailable`, failing that its active
+/// `UNAVAILABLE` rule).
+async fn busy_forwarding(
+    store: &Arc<dyn Store>,
+    tenant: Uuid,
+    number: &str,
+    include_unavailable: bool,
+) -> Option<Forwarding> {
+    if let Some(f) =
+        find_forwarding(store, tenant, number, |f| f.mode == ForwardMode::Busy).await
+    {
+        return Some(f);
+    }
+    if include_unavailable {
+        return find_forwarding(store, tenant, number, |f| f.mode == ForwardMode::Unavailable)
+            .await;
+    }
+    None
+}
+
+/// Find the first **active** forwarding rule for `number` that applies *before/while ringing*
+/// (a small config scan, like `Routing::resolve_extension`). `BUSY` rules are excluded — they
+/// only fire on a busy outcome ([`resolve_busy_plan`]) or DND. Errors and misses both yield
+/// `None`. Public so the SIP layer can cheaply decide whether a dialled number needs the
+/// multi-destination plan path at all (keeping the plain single-extension bridge path untouched
+/// when it does not).
 pub async fn active_forwarding(
     store: &Arc<dyn Store>,
     tenant: Uuid,
     number: &str,
-) -> Option<commos_core::entities::forwarding::Forwarding> {
+) -> Option<Forwarding> {
+    find_forwarding(store, tenant, number, |f| f.mode != ForwardMode::Busy).await
+}
+
+/// The first active rule for `number` satisfying `pred`.
+async fn find_forwarding(
+    store: &Arc<dyn Store>,
+    tenant: Uuid,
+    number: &str,
+    pred: impl Fn(&Forwarding) -> bool,
+) -> Option<Forwarding> {
     let mut cursor = None;
     loop {
         let page = store.list_forwardings(tenant, 200, cursor).await.ok()?;
-        if let Some(f) = page.items.iter().find(|f| f.number == number && f.is_active()) {
+        if let Some(f) = page
+            .items
+            .iter()
+            .find(|f| f.number == number && f.is_active() && pred(f))
+        {
             return Some(f.clone());
         }
         match page.next_cursor {
@@ -94,7 +181,6 @@ mod tests {
     use super::*;
     use crate::control::ringplan::{FinalAction, Treatment};
     use crate::store::{MemStore, Tx};
-    use commos_core::entities::forwarding::{ForwardMode, Forwarding};
     use commos_core::entities::ring_group::{RingGroup, RingStrategy};
     use std::collections::HashSet;
 
@@ -188,5 +274,59 @@ mod tests {
         let plan = resolve_plan(&s, t, "100", "sip:100@host", opts(), 0, regset(&["100"])).await;
         assert_eq!(plan.stages[0].contacts, vec!["sip:100"]);
         assert_eq!(plan.stages[0].treatment, Treatment::Ringback);
+    }
+
+    #[tokio::test]
+    async fn dnd_goes_to_busy_rule_then_unavailable_then_voicemail() {
+        let (s, t) = store();
+        // No rules: voicemail, extension never rung even though registered.
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", opts(), 0, regset(&["100"]), true).await;
+        assert!(p.stages.is_empty());
+        assert_eq!(p.final_action, FinalAction::Voicemail("100".into()));
+
+        // An UNAVAILABLE rule is used when there is no BUSY rule.
+        let mut u = Forwarding::create(t, "100", ForwardMode::Unavailable);
+        u.targets = vec!["sip:200".into()];
+        s.commit(Tx { forwardings: vec![u], ..Default::default() }).await.unwrap();
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", opts(), 0, regset(&["100"]), true).await;
+        assert_eq!(p.stages[0].contacts, vec!["sip:200"]);
+
+        // BUSY wins over UNAVAILABLE.
+        let mut b = Forwarding::create(t, "100", ForwardMode::Busy);
+        b.targets = vec!["external:+14155550100".into()];
+        s.commit(Tx { forwardings: vec![b], ..Default::default() }).await.unwrap();
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", opts(), 0, regset(&["100"]), true).await;
+        assert_eq!(p.stages.len(), 1);
+        assert_eq!(p.stages[0].contacts, vec!["external:+14155550100"]);
+        // ...and without DND the BUSY rule is inert for ringing: plain direct plan.
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", opts(), 0, regset(&["100"]), false).await;
+        assert_eq!(p.stages[0].contacts, vec!["sip:100"]);
+    }
+
+    #[tokio::test]
+    async fn dnd_does_not_override_an_always_forward() {
+        let (s, t) = store();
+        let mut f = Forwarding::create(t, "100", ForwardMode::Always);
+        f.targets = vec!["external:+14155550100".into()];
+        s.commit(Tx { forwardings: vec![f], ..Default::default() }).await.unwrap();
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", opts(), 0, regset(&["100"]), true).await;
+        assert_eq!(p.stages[0].contacts, vec!["external:+14155550100"]);
+    }
+
+    #[tokio::test]
+    async fn busy_plan_only_exists_with_an_active_busy_rule() {
+        let (s, t) = store();
+        assert!(resolve_busy_plan(&s, t, "100", opts()).await.is_none());
+        let mut na = Forwarding::create(t, "100", ForwardMode::NoAnswer);
+        na.targets = vec!["sip:300".into()];
+        s.commit(Tx { forwardings: vec![na], ..Default::default() }).await.unwrap();
+        assert!(resolve_busy_plan(&s, t, "100", opts()).await.is_none(), "no-answer is not busy");
+        let mut b = Forwarding::create(t, "100", ForwardMode::Busy);
+        b.targets = vec!["sip:301".into()];
+        s.commit(Tx { forwardings: vec![b], ..Default::default() }).await.unwrap();
+        let p = resolve_busy_plan(&s, t, "100", opts()).await.unwrap();
+        assert_eq!(p.stages[0].contacts, vec!["sip:301"]);
+        // A BUSY rule does not trigger the up-front forwarding path.
+        assert_eq!(active_forwarding(&s, t, "100").await.unwrap().mode, ForwardMode::NoAnswer);
     }
 }

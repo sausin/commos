@@ -391,6 +391,7 @@ pub struct PatchExtensionBody {
     pub number: Option<String>,
     pub label: Option<String>,
     pub destination_ref: Option<String>,
+    pub dnd: Option<bool>,
 }
 /// `PATCH /v1/extensions/{id}`
 pub async fn patch_extension(
@@ -404,7 +405,7 @@ pub async fn patch_extension(
         .update_extension(
             admin.tenant_id,
             id(&i)?,
-            ExtensionPatch { number: b.number, label: b.label, destination_ref: b.destination_ref },
+            ExtensionPatch { number: b.number, label: b.label, destination_ref: b.destination_ref, dnd: b.dnd },
         )
         .await
         .map_err(prob)?;

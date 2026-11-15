@@ -57,36 +57,28 @@ pub enum DestinationClass {
 ///    `@host`) match [`EMERGENCY_NUMBERS`]. Checked first so an emergency call is never
 ///    mis-classified as a short internal extension.
 /// 2. **Internal** — reuses [`dialplan::is_internal`]: a short all-digit reference or a
-///    non-numeric `sip:` user (an on-net extension) that has no E.164 normalisation.
+///    non-numeric `sip:` user (an on-net extension) that has no E.164 normalisation under
+///    `default_country_code`.
 /// 3. **National vs. International** — [`dialplan::normalize_e164`] yields `+<cc>…`; if
 ///    `<cc>` equals `default_country_code` (digits only) it is National, otherwise
 ///    International.
-/// 4. **Fallback** — a reference that is neither internal, emergency, nor E.164-normalisable
-///    is treated as **International** (conservative — the fraud-safe default).
 pub fn classify(to_ref: &str, default_country_code: &str) -> DestinationClass {
     // 1. Emergency wins over everything, including the "short digits = internal" rule.
     if is_emergency(to_ref) {
         return DestinationClass::Emergency;
     }
 
-    // 2. Internal / on-net: no E.164 normalisation exists for it.
-    if dialplan::is_internal(to_ref) {
+    // 2.-4. Normalise as the user dialled it. No E.164 form → internal / on-net extension
+    // (for this deployment's country code, not a fixed one).
+    let Some(e164) = dialplan::normalize_e164(to_ref, default_country_code) else {
         return DestinationClass::Internal;
-    }
-
-    // 3. Off-net E.164 → National if it carries our country code, else International.
-    match dialplan::normalize_e164(to_ref, default_country_code) {
-        Some(e164) => {
-            let cc = digits_only(default_country_code);
-            let number = e164.trim_start_matches('+');
-            if !cc.is_empty() && number.starts_with(&cc) {
-                DestinationClass::National
-            } else {
-                DestinationClass::International
-            }
-        }
-        // 4. Un-normalisable and not internal/emergency → treat as International.
-        None => DestinationClass::International,
+    };
+    let cc = digits_only(default_country_code);
+    let number = e164.trim_start_matches('+');
+    if !cc.is_empty() && number.starts_with(&cc) {
+        DestinationClass::National
+    } else {
+        DestinationClass::International
     }
 }
 
@@ -265,6 +257,15 @@ pub(crate) fn is_emergency(to_ref: &str) -> bool {
     }
 
     let user = after_scheme.split('@').next().unwrap_or(after_scheme);
+    is_emergency_user(user)
+}
+
+/// `true` when a **dialled user part** (no scheme/host — e.g. what a phone sent in the
+/// request-URI of an INVITE to *this* PBX, where the host is CommOS itself) is exactly an
+/// emergency number. Unlike [`is_emergency`] it performs no `@host` smuggling check because the
+/// caller has already established that the host is ours; the call is only ever routed out via
+/// the operator's own gateways, never to a caller-chosen host.
+pub(crate) fn is_emergency_user(user: &str) -> bool {
     let user = user.split(';').next().unwrap_or(user);
     // Drop visual separators, then compare the significant characters.
     let cleaned: String = user
@@ -294,6 +295,23 @@ mod tests {
             caller_capabilities: capabilities,
             active_calls: 0,
         }
+    }
+
+    #[test]
+    fn dialled_user_part_emergency_ignores_host_but_not_digits() {
+        assert!(is_emergency_user("911"));
+        assert!(is_emergency_user("1 1 2".replace(' ', "").as_str()));
+        assert!(is_emergency_user("999;phone-context=x"));
+        assert!(!is_emergency_user("9111"));
+        assert!(!is_emergency_user("07700900123"));
+    }
+
+    #[test]
+    fn classify_follows_default_country_for_unprefixed_numbers() {
+        assert_eq!(classify("07700900123", "44"), DestinationClass::National);
+        assert_eq!(classify("011442071838750", "1"), DestinationClass::International);
+        assert_eq!(classify("4155550100", "1"), DestinationClass::National);
+        assert_eq!(classify("2001", "44"), DestinationClass::Internal);
     }
 
     #[test]
