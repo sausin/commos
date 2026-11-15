@@ -79,6 +79,12 @@ impl SipServer {
             }
         }
 
+        // Loop guard: a request that has exhausted its hop budget is refused (RFC 3261 s16.3).
+        if msg.max_forwards() == Some(0) {
+            tracing::warn!(%src, to = %to_ref, "SIP INVITE rejected: Max-Forwards exhausted");
+            return self.reply(resp, msg, 483, "Too Many Hops").await;
+        }
+
         // Provisional response.
         let trying = message::response(msg, 100, "Trying");
         resp.send(trying.as_bytes()).await?;
@@ -97,6 +103,7 @@ impl SipServer {
             }
         };
         let call_id = call.base.id;
+        self.note_hops(call_id, msg.max_forwards());
 
         // When recording is on, all RTP payload for this call accumulates in this shared buffer
         // (caller leg, header-stripped, as-is). It is threaded into whichever media path is set
@@ -255,6 +262,14 @@ impl SipServer {
                 .await;
         }
 
+        // The extension that will actually ring: the user part of the *resolved* target (after
+        // DID / schedule / extension-route resolution), not the request-URI. DND, forwarding and
+        // voicemail-off all key on it, so a DID-routed call cannot bypass them.
+        let dialled: String = dnd::target_extension_number(
+            &target,
+            user_part(&to_ref).unwrap_or_default(),
+        );
+
         let mut voicemail_target: Option<VoicemailBox> = None;
         // A direct voicemail target (e.g. a DID → "voicemail").
         if target == "voicemail" || target.starts_with("voicemail:") {
@@ -270,9 +285,6 @@ impl SipServer {
         // genuinely a group or a forwarding rule in play; the plain single-extension bridge path
         // below is left completely untouched otherwise.
         if voicemail_target.is_none() {
-            let dialled = user_part(&to_ref)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
             let is_group = target.starts_with(crate::control::ringresolve::RING_GROUP_SCHEME);
             let has_forwarding = !dialled.is_empty()
                 && crate::control::ringresolve::active_forwarding(
@@ -430,7 +442,7 @@ impl SipServer {
                 // Busy (486): use the extension's BUSY forwarding rule, if any, instead of the
                 // generic decline handling below.
                 if matches!(outcome, BridgeOutcome::Declined(486)) {
-                    let busy_dialled = user_part(&to_ref).unwrap_or("");
+                    let busy_dialled = dialled.as_str();
                     if let Some(result) = self
                         .divert_busy(
                             resp,
@@ -453,7 +465,7 @@ impl SipServer {
                 // never recorded; the caller gets the "unavailable" status instead.
                 if self.voicemail_enabled
                     && !self
-                        .voicemail_on_for(user_part(&to_ref).unwrap_or(""))
+                        .voicemail_on_for(&dialled)
                         .await
                 {
                     match &outcome {
@@ -577,7 +589,7 @@ impl SipServer {
                 }
             } else if self.voicemail_enabled
                 && !self
-                    .voicemail_on_for(user_part(&to_ref).unwrap_or(""))
+                    .voicemail_on_for(&dialled)
                     .await
                 && (routed_uri.is_some() || did_dest.is_some())
             {
@@ -600,6 +612,12 @@ impl SipServer {
         // dialling a real phone number reaches it. Falls through to echo if the trunk fails.
         if voicemail_target.is_none() {
             if let Some((gateway, e164)) = self.select_outbound_gateway(&target).await {
+                // SIP-originated external call: same policy as API origination (international
+                // gating, caps; emergency numbers never reach here) classified under the
+                // gateway's dial profile, plus the own-DID loop guard.
+                if let Err((status, reason)) = self.vet_external(&gateway, &e164).await {
+                    return self.reply(resp, msg, status, reason).await;
+                }
                 // Signal ringing to the caller while we place the outbound leg to the carrier.
                 let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
                 if let Some((bridge, leg, sel_codec, sel_te, leg_a_crypto)) = self

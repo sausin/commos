@@ -75,6 +75,7 @@ impl SipServer {
             tenant,
             call_id,
             self.voicemails.clone(),
+            self.store.clone(),
             self.registrations.clone(),
             self.media_ip,
             self.no_answer_timeout,
@@ -128,6 +129,7 @@ impl SipServer {
         tenant: Uuid,
         call_id: Uuid,
         voicemails: VoicemailService,
+        store: Arc<dyn Store>,
         registrations: RegistrationRegistry,
         media_ip: IpAddr,
         no_answer_timeout: Duration,
@@ -175,10 +177,13 @@ impl SipServer {
             }
             ivr::IvrOutcome::Selected { destination, .. } => {
                 // A dial target: bridge the caller to a live registered extension, mid-call.
-                if let (Some(peer), Some(callee)) = (
-                    result.peer,
+                let callee = dnd::not_dnd(
+                    &store,
+                    tenant,
                     find_registered(&registrations, tenant, &destination),
-                ) {
+                )
+                .await;
+                if let (Some(peer), Some(callee)) = (result.peer, callee) {
                     if ivr_transfer(
                         &sock,
                         peer,

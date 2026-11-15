@@ -212,7 +212,8 @@ async fn run(cfg: Config) -> i32 {
     let ivrs = control::ivr::IvrService::new(store.clone(), signal.clone());
     // PSTN / SIP trunking (Volume 7): carriers, gateways, trunks (outbound), inbound DIDs.
     let trunking = control::trunking::TrunkingService::new(store.clone(), signal.clone());
-    let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone());
+    let provisioning = control::provisioning::Provisioning::new(store.clone(), signal.clone())
+        .with_default_cc(cfg.default_country_code.clone());
     let webhooks = control::webhooks::WebhookService::new(store.clone(), signal.clone());
     // Object storage: local filesystem by default; S3-compatible when configured + built with
     // the `s3` feature. Recordings, voicemail, exports, and diagnostics all sit on it.

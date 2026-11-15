@@ -109,6 +109,11 @@ impl SipServer {
             }
             for e164 in &externals {
                 if let Some((gw, num)) = self.select_outbound_gateway(e164).await {
+                    // Forward / follow-me targets are dialled at call time: the same policy and
+                    // loop guard as a direct outbound call (a forward must not be a toll bypass).
+                    if self.vet_external(&gw, &num).await.is_err() {
+                        continue;
+                    }
                     if let Some(won) = self
                         .try_trunk(&gw, &num, call_id, capture.clone(), offer, caller_crypto)
                         .await
@@ -367,6 +372,7 @@ impl SipServer {
                 ("Call-ID", leg_call_id.clone()),
                 ("CSeq", format!("{cseq_num} INVITE")),
                 ("Contact", contact_hdr),
+                ("Max-Forwards", self.out_max_forwards(call_id)),
             ],
             Some(("application/sdp", &sdp)),
         );
@@ -581,6 +587,7 @@ impl SipServer {
                 ("Call-ID", leg_call_id.clone()),
                 ("CSeq", format!("{cseq} INVITE")),
                 ("Contact", contact_hdr.clone()),
+                ("Max-Forwards", self.out_max_forwards(call_id)),
             ];
             if let Some(pai) = &pai_hdr {
                 headers.push(("P-Asserted-Identity", pai.clone()));

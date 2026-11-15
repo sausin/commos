@@ -27,11 +27,43 @@ use crate::control::dialplan;
 /// obligation (and without tripping the `allow_international` policy gate).
 const CAP_DIAL_INTERNATIONAL: &str = "calls.dial.international";
 
-/// The small, deduped set of emergency service numbers recognised across regions
-/// (NANP `911`, GSM/EU `112`, UK `999`, AU `000`, IN `108`/`112`, …). A destination
-/// whose dialled digits match one of these bypasses all policy (CMOS-09).
-const EMERGENCY_NUMBERS: &[&str] =
-    &["911", "112", "999", "000", "111", "119", "110", "108", "118"];
+/// Emergency numbers recognised everywhere: GSM/EU `112` and NANP `911` (both are honoured
+/// worldwide by mobile networks, so they are always safe to treat as emergency).
+const UNIVERSAL_EMERGENCY: &[&str] = &["112", "911"];
+
+/// Country-specific emergency numbers, keyed by the dialling country code (digits only). Kept
+/// deliberately small: a short number such as `108`/`110`/`111`/`118`/`119` is a perfectly ordinary
+/// extension in most deployments, so it is only an emergency number in the country that really
+/// uses it as one (the deployment's `default_country_code`).
+const COUNTRY_EMERGENCY: &[(&str, &[&str])] = &[
+    ("1", &[]),                            // NANP: 911 (universal)
+    ("44", &["999"]),                      // UK
+    ("61", &["000"]),                      // Australia
+    ("64", &["111"]),                      // New Zealand
+    ("49", &["110"]),                      // Germany (112 universal)
+    ("81", &["110", "119"]),               // Japan
+    ("91", &["100", "101", "102", "108"]), // India (112 universal)
+    ("353", &["999"]),                     // Ireland
+    ("65", &["999", "995"]),               // Singapore
+    ("27", &["10111"]),                    // South Africa
+];
+
+/// The emergency numbers in force for a deployment with `default_country_code` (a `+` or
+/// non-digit decoration is ignored): the universal `{112, 911}` plus the country's own.
+pub fn emergency_numbers_for(default_country_code: &str) -> Vec<&'static str> {
+    let cc = digits_only(default_country_code);
+    let mut out: Vec<&'static str> = UNIVERSAL_EMERGENCY.to_vec();
+    if let Some((_, nums)) = COUNTRY_EMERGENCY.iter().find(|(c, _)| *c == cc) {
+        out.extend(nums.iter().copied());
+    }
+    out
+}
+
+/// `true` when `number` (already cleaned: no scheme/host/separators) is an emergency number for
+/// `default_country_code`. Used to refuse creating an extension that would shadow one.
+pub fn is_emergency_number(number: &str, default_country_code: &str) -> bool {
+    emergency_numbers_for(default_country_code).contains(&number)
+}
 
 /// Coarse destination classification used to pick a policy rule. Ordered by escalating
 /// fraud/regulatory sensitivity in spirit, though evaluation order (not this order) is
@@ -54,7 +86,7 @@ pub enum DestinationClass {
 /// Detection order is deliberate and deterministic:
 ///
 /// 1. **Emergency** — the dialled digits (after stripping a `sip:`/`tel:` scheme and any
-///    `@host`) match [`EMERGENCY_NUMBERS`]. Checked first so an emergency call is never
+///    `@host`) match [`emergency_numbers_for`]. Checked first so an emergency call is never
 ///    mis-classified as a short internal extension.
 /// 2. **Internal** — reuses [`dialplan::is_internal`]: a short all-digit reference or a
 ///    non-numeric `sip:` user (an on-net extension) that has no E.164 normalisation under
@@ -64,7 +96,7 @@ pub enum DestinationClass {
 ///    International.
 pub fn classify(to_ref: &str, default_country_code: &str) -> DestinationClass {
     // 1. Emergency wins over everything, including the "short digits = internal" rule.
-    if is_emergency(to_ref) {
+    if is_emergency(to_ref, default_country_code) {
         return DestinationClass::Emergency;
     }
 
@@ -232,7 +264,7 @@ pub fn evaluate(
 ///
 /// Exposed to the router so it can mirror the emergency **cap bypass** when reserving a
 /// concurrency slot (an emergency call must never be denied by the velocity guardrail).
-pub(crate) fn is_emergency(to_ref: &str) -> bool {
+pub(crate) fn is_emergency(to_ref: &str, default_country_code: &str) -> bool {
     // Unwrap a name-addr ("Display" <sip:user@host>) to its addr-spec.
     let addr = match (to_ref.find('<'), to_ref.find('>')) {
         (Some(open), Some(close)) if close > open => to_ref[open + 1..close].trim(),
@@ -257,7 +289,7 @@ pub(crate) fn is_emergency(to_ref: &str) -> bool {
     }
 
     let user = after_scheme.split('@').next().unwrap_or(after_scheme);
-    is_emergency_user(user)
+    is_emergency_user(user, default_country_code)
 }
 
 /// `true` when a **dialled user part** (no scheme/host — e.g. what a phone sent in the
@@ -265,14 +297,14 @@ pub(crate) fn is_emergency(to_ref: &str) -> bool {
 /// emergency number. Unlike [`is_emergency`] it performs no `@host` smuggling check because the
 /// caller has already established that the host is ours; the call is only ever routed out via
 /// the operator's own gateways, never to a caller-chosen host.
-pub(crate) fn is_emergency_user(user: &str) -> bool {
+pub(crate) fn is_emergency_user(user: &str, default_country_code: &str) -> bool {
     let user = user.split(';').next().unwrap_or(user);
     // Drop visual separators, then compare the significant characters.
     let cleaned: String = user
         .chars()
         .filter(|c| !matches!(c, ' ' | '-' | '(' | ')' | '.'))
         .collect();
-    EMERGENCY_NUMBERS.contains(&cleaned.as_str())
+    is_emergency_number(&cleaned, default_country_code)
 }
 
 /// Keep only the ASCII digits of `s` (drops a leading `+`, whitespace, etc.).
@@ -299,11 +331,11 @@ mod tests {
 
     #[test]
     fn dialled_user_part_emergency_ignores_host_but_not_digits() {
-        assert!(is_emergency_user("911"));
-        assert!(is_emergency_user("1 1 2".replace(' ', "").as_str()));
-        assert!(is_emergency_user("999;phone-context=x"));
-        assert!(!is_emergency_user("9111"));
-        assert!(!is_emergency_user("07700900123"));
+        assert!(is_emergency_user("911", "1"));
+        assert!(is_emergency_user("1 1 2".replace(' ', "").as_str(), "1"));
+        assert!(is_emergency_user("999;phone-context=x", "44"));
+        assert!(!is_emergency_user("9111", "1"));
+        assert!(!is_emergency_user("07700900123", "44"));
     }
 
     #[test]
@@ -333,13 +365,13 @@ mod tests {
     fn emergency_number_on_offnet_host_does_not_bypass_policy() {
         // The classic bypass: an emergency number smuggled as the user-part of an off-net URI must
         // NOT classify as Emergency (which would skip the cap + international guardrail).
-        assert!(!is_emergency("sip:911@attacker-gateway.example"));
-        assert!(!is_emergency("\"x\" <sip:112@premium-gw.example>"));
+        assert!(!is_emergency("sip:911@attacker-gateway.example", "1"));
+        assert!(!is_emergency("\"x\" <sip:112@premium-gw.example>", "1"));
         assert_ne!(classify("sip:911@attacker-gateway.example", "1"), DestinationClass::Emergency);
         // Plain emergency dials still bypass.
-        assert!(is_emergency("911"));
-        assert!(is_emergency("tel:112"));
-        assert!(is_emergency("sip:999")); // no host — a bare emergency number under a scheme
+        assert!(is_emergency("911", "1"));
+        assert!(is_emergency("tel:112", "1"));
+        assert!(is_emergency("sip:999", "44")); // no host — a bare emergency number under a scheme
     }
 
     #[test]
@@ -425,5 +457,39 @@ mod tests {
         let json = serde_json::to_value(&d).unwrap();
         assert_eq!(json["effect"], "ALLOW");
         assert_eq!(json["obligations"][0], "REQUIRE_APPROVAL");
+    }
+
+    #[test]
+    fn emergency_table_is_country_specific() {
+        // Default / unknown country: universal pair only.
+        assert_eq!(emergency_numbers_for("1"), vec!["112", "911"]);
+        assert_eq!(emergency_numbers_for("+999"), vec!["112", "911"]);
+        assert_eq!(emergency_numbers_for(""), vec!["112", "911"]);
+        assert!(emergency_numbers_for("+44").contains(&"999"));
+        assert!(emergency_numbers_for("61").contains(&"000"));
+        assert!(emergency_numbers_for("64").contains(&"111"));
+        assert!(emergency_numbers_for("49").contains(&"110"));
+        let jp = emergency_numbers_for("81");
+        assert!(jp.contains(&"110") && jp.contains(&"119"));
+        let inn = emergency_numbers_for("91");
+        for n in ["100", "101", "102", "108", "112"] {
+            assert!(inn.contains(&n), "{n}");
+        }
+    }
+
+    #[test]
+    fn common_extension_numbers_are_not_emergency_outside_their_country() {
+        // 108/110/111/118/119 are ordinary extensions in a NANP (or UK) deployment.
+        for n in ["108", "110", "111", "118", "119", "000"] {
+            assert!(!is_emergency_user(n, "1"), "{n} must not be emergency under cc 1");
+            assert_eq!(classify(n, "1"), DestinationClass::Internal, "{n}");
+        }
+        assert!(!is_emergency_user("110", "44"));
+        assert!(is_emergency_user("999", "44"));
+        assert!(!is_emergency_user("999", "1"));
+        assert!(is_emergency_user("110", "81"));
+        assert!(is_emergency_user("000", "61"));
+        assert!(is_emergency_user("112", "61"), "universal in every country");
+        assert!(is_emergency_user("911", "44"), "universal in every country");
     }
 }

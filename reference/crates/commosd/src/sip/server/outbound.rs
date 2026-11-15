@@ -37,20 +37,30 @@ pub(super) fn trunk_identity(
     )
 }
 
-/// If `dialed` (a user part) is an emergency number — as dialled, or after an outside-line prefix
-/// configured on any gateway (`9-911`) — return the bare emergency digits to send to the carrier.
-pub(super) fn emergency_digits(dialed: &str, strip_prefixes: &[String]) -> Option<String> {
+/// If `dialed` (a user part) is an emergency number for `default_cc` — as dialled, or after an
+/// outside-line prefix configured on any gateway (`9-911`) — return the bare emergency digits to
+/// send to the carrier. The prefixed variant is skipped when `is_extension` (an extension with
+/// exactly the dialled number exists), so with a `9` prefix an extension `9112`/`9911` still rings.
+pub(super) fn emergency_digits(
+    dialed: &str,
+    strip_prefixes: &[String],
+    default_cc: &str,
+    is_extension: bool,
+) -> Option<String> {
     use crate::control::policy::is_emergency_user;
     let clean: String = dialed
         .chars()
         .filter(|c| !matches!(c, ' ' | '-' | '(' | ')' | '.'))
         .collect();
-    if is_emergency_user(&clean) {
+    if is_emergency_user(&clean, default_cc) {
         return Some(clean);
+    }
+    if is_extension {
+        return None;
     }
     for sp in strip_prefixes.iter().filter(|s| !s.is_empty()) {
         if let Some(rest) = clean.strip_prefix(sp.as_str()) {
-            if is_emergency_user(rest) {
+            if is_emergency_user(rest, default_cc) {
                 return Some(rest.to_string());
             }
         }
@@ -59,6 +69,46 @@ pub(super) fn emergency_digits(dialed: &str, strip_prefixes: &[String]) -> Optio
 }
 
 impl SipServer {
+    /// Is `e164` one of this tenant's own provisioned DIDs? An external forward / transfer / call
+    /// that targets our own number would loop back in through the carrier.
+    pub(super) async fn is_own_did(&self, e164: &str) -> bool {
+        let mut cursor = None;
+        loop {
+            let Ok(page) = self.store.list_dids(self.default_tenant, 200, cursor).await else {
+                return false;
+            };
+            if page.items.iter().any(|d| d.e164 == e164) {
+                return true;
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return false,
+            }
+        }
+    }
+
+    /// Vet an **external** (PSTN) leg about to be placed through `gw` to `e164`: the same
+    /// origination policy as the API (`allow_international`, caps; emergency exempt) classified
+    /// under the *gateway's* dial profile so policy and dialling agree, plus the loop guard
+    /// (never to one of our own DIDs). `Err((status, reason))` is the SIP status to report.
+    pub(super) async fn vet_external(
+        &self,
+        gw: &Gateway,
+        e164: &str,
+    ) -> Result<(), (u16, &'static str)> {
+        let cc = gateway_profile(gw, &self.default_cc).country_code;
+        let decision = self.routing.check_outbound(self.default_tenant, e164, &cc);
+        if !decision.allowed() {
+            tracing::warn!(%e164, reason = %decision.reason, "external leg refused by policy");
+            return Err((403, "Forbidden"));
+        }
+        if self.is_own_did(e164).await {
+            tracing::warn!(%e164, "external leg refused: target is one of our own DIDs (loop)");
+            return Err((482, "Loop Detected"));
+        }
+        Ok(())
+    }
+
     /// All SIP gateways with an address: online ones first (the "first available trunk"), then
     /// offline ones — an emergency call tries everything rather than fail on stale health.
     async fn emergency_gateways(&self) -> Vec<Gateway> {
@@ -104,7 +154,12 @@ impl SipServer {
             .iter()
             .filter_map(|g| g.strip_prefix.clone())
             .collect();
-        emergency_digits(dialed, &strips)
+        // An extension whose full number is `dialed` outranks the outside-line-prefix reading.
+        let is_ext = !strips.is_empty()
+            && super::featurecodes::find_extension(&self.store, self.default_tenant, dialed)
+                .await
+                .is_some();
+        emergency_digits(dialed, &strips, &self.default_cc, is_ext)
     }
 
     /// Route an emergency call out the first available trunk, **bypassing** caps, schedules,
@@ -178,16 +233,33 @@ mod tests {
     fn emergency_numbers_are_detected_with_and_without_outside_line_prefix() {
         let none: Vec<String> = vec![];
         let nine = vec!["9".to_string()];
-        assert_eq!(emergency_digits("911", &none).as_deref(), Some("911"));
-        assert_eq!(emergency_digits("112", &none).as_deref(), Some("112"));
-        assert_eq!(emergency_digits("999", &none).as_deref(), Some("999"));
-        assert_eq!(emergency_digits("9911", &none), None, "no strip prefix configured");
-        assert_eq!(emergency_digits("9911", &nine).as_deref(), Some("911"));
-        assert_eq!(emergency_digits("9-112", &nine).as_deref(), Some("112"));
+        assert_eq!(emergency_digits("911", &none, "1", false).as_deref(), Some("911"));
+        assert_eq!(emergency_digits("112", &none, "1", false).as_deref(), Some("112"));
+        assert_eq!(emergency_digits("999", &none, "44", false).as_deref(), Some("999"));
+        assert_eq!(emergency_digits("999", &none, "1", false), None, "999 is not NANP emergency");
+        assert_eq!(emergency_digits("9911", &none, "1", false), None, "no strip prefix configured");
+        assert_eq!(emergency_digits("9911", &nine, "1", false).as_deref(), Some("911"));
+        assert_eq!(emergency_digits("9-112", &nine, "1", false).as_deref(), Some("112"));
         // Not emergencies.
-        assert_eq!(emergency_digits("9112345", &nine), None);
-        assert_eq!(emergency_digits("1001", &nine), None);
-        assert_eq!(emergency_digits("07700900123", &nine), None);
+        assert_eq!(emergency_digits("9112345", &nine, "1", false), None);
+        assert_eq!(emergency_digits("1001", &nine, "1", false), None);
+        assert_eq!(emergency_digits("07700900123", &nine, "44", false), None);
+    }
+
+    #[test]
+    fn common_extensions_are_not_hijacked_by_emergency_detection() {
+        let nine = vec!["9".to_string()];
+        for ext in ["108", "110", "111", "118", "119", "000"] {
+            assert_eq!(emergency_digits(ext, &nine, "1", false), None, "{ext}");
+        }
+        // With a `9` outside-line prefix, an extension numbered 9112 / 9911 / 9999 keeps ringing.
+        assert_eq!(emergency_digits("9112", &nine, "44", true), None);
+        assert_eq!(emergency_digits("9911", &nine, "1", true), None);
+        assert_eq!(emergency_digits("9999", &nine, "44", true), None);
+        // ...but the same digits are an outside-line emergency when no such extension exists.
+        assert_eq!(emergency_digits("9999", &nine, "44", false).as_deref(), Some("999"));
+        // The exact emergency number always wins, extension or not.
+        assert_eq!(emergency_digits("911", &nine, "1", true).as_deref(), Some("911"));
     }
 
     #[test]
