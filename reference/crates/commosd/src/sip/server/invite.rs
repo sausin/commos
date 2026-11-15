@@ -201,6 +201,38 @@ impl SipServer {
                 .await;
         }
 
+        // Feature codes (*78/*79 DND, *72<n>/*73 forward-always) and emergency numbers.
+        if let Some(code) = featurecodes::parse_feature_code(dialed) {
+            return self
+                .answer_with_feature_code(
+                    resp,
+                    msg,
+                    call_id,
+                    &call_id_hdr,
+                    &from_ref,
+                    code,
+                    g711,
+                    te_pt,
+                    src,
+                )
+                .await;
+        }
+        if let Some(number) = self.emergency_number(dialed).await {
+            return self
+                .route_emergency(
+                    resp,
+                    msg,
+                    call_id,
+                    &call_id_hdr,
+                    src,
+                    &number,
+                    capture.clone(),
+                    &offer,
+                    caller_crypto.as_ref(),
+                )
+                .await;
+        }
+
         // The target (from a DID or an extension route) may name an `ivr:<id>` menu: run the IVR
         // runtime (answer with SDP, play the prompt, collect DTMF).
         if let Some(ivr_id) = match ivr_id_of(&target) {
@@ -250,7 +282,10 @@ impl SipServer {
                 )
                 .await
                 .is_some();
-            if is_group || has_forwarding {
+            // Do-not-disturb: a DND extension is never rung (see `resolve_plan_dnd`).
+            let dnd_set = self.dnd_numbers().await;
+            let dnd = !dialled.is_empty() && dnd_set.contains(&dialled);
+            if is_group || has_forwarding || dnd {
                 // Tell the caller's phone we're ringing while we walk the plan.
                 let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
                 let caller_display = msg.header("From").and_then(header_display_name);
@@ -267,7 +302,7 @@ impl SipServer {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let regs = &self.registrations;
                 let tenant = self.default_tenant;
-                let plan = crate::control::ringresolve::resolve_plan(
+                let plan = crate::control::ringresolve::resolve_plan_dnd(
                     &self.store,
                     tenant,
                     &dialled,
@@ -275,8 +310,11 @@ impl SipServer {
                     opts,
                     rotation,
                     |r: &str| find_registered(regs, tenant, r).is_some(),
+                    dnd,
                 )
                 .await;
+                // Ring-group / follow-me members in DND are skipped too.
+                let plan = crate::control::ringplan::strip_dnd(plan, &dnd_set);
 
                 match self
                     .execute_ring_plan(
@@ -344,6 +382,10 @@ impl SipServer {
                             }
                             _ => {}
                         }
+                        // A DND extension must never ring, even with voicemail disabled.
+                        if dnd && voicemail_target.is_none() {
+                            return self.reply(resp, msg, 486, "Busy Here").await;
+                        }
                         // Fall through: a set voicemail_target is picked up by the deposit path;
                         // otherwise the echo fallthrough applies (voicemail disabled).
                     }
@@ -369,7 +411,7 @@ impl SipServer {
                     number: user_part(&from_ref),
                     display: caller_display.as_deref(),
                 };
-                match self
+                let outcome = self
                     .try_bridge(
                         &callee_reg,
                         call_id,
@@ -379,8 +421,30 @@ impl SipServer {
                         caller_id,
                         None,
                     )
-                    .await
-                {
+                    .await;
+                // Busy (486): use the extension's BUSY forwarding rule, if any, instead of the
+                // generic decline handling below.
+                if matches!(outcome, BridgeOutcome::Declined(486)) {
+                    let busy_dialled = user_part(&to_ref).unwrap_or("");
+                    if let Some(result) = self
+                        .divert_busy(
+                            resp,
+                            msg,
+                            call_id,
+                            &call_id_hdr,
+                            src,
+                            busy_dialled,
+                            capture.clone(),
+                            &offer,
+                            caller_crypto.as_ref(),
+                            caller_id,
+                        )
+                        .await
+                    {
+                        return result;
+                    }
+                }
+                match outcome {
                     BridgeOutcome::Answered(
                         bridge,
                         callee_leg,

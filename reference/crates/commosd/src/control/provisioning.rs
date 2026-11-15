@@ -96,6 +96,7 @@ pub struct ExtensionPatch {
     pub number: Option<String>,
     pub label: Option<String>,
     pub destination_ref: Option<String>,
+    pub dnd: Option<bool>,
 }
 
 /// The Provisioning service. Stateless between requests — all state lives in the [`Store`]
@@ -488,6 +489,10 @@ impl Provisioning {
         }
         if let Some(label) = patch.label {
             ext.label = Some(label);
+            touched = true;
+        }
+        if let Some(dnd) = patch.dnd {
+            ext.dnd = dnd;
             touched = true;
         }
         if let Some(dest) = patch.destination_ref {

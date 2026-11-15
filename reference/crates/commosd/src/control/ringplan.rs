@@ -147,10 +147,11 @@ pub fn plan_direct(number: &str, registered: bool, opts: &PlanOpts) -> DialPlan 
 ///
 /// - [`ForwardMode::Always`] — the extension is never rung; the call follows the target
 ///   chain (follow-me).
-/// - [`ForwardMode::NoAnswer`] / [`ForwardMode::Busy`] — ring the extension first (if it is
-///   registered), then walk the targets. (Busy is over-approximated as no-answer here: the
-///   executor advances on busy *or* timeout; distinguishing the two so a *busy*-only forward
-///   never fires on a plain no-answer is a documented refinement.)
+/// - [`ForwardMode::NoAnswer`] — ring the extension first (if it is registered), then walk
+///   the targets.
+/// - [`ForwardMode::Busy`] — fires on **busy only** (a `486` from the callee, or DND), never on a
+///   plain no-answer, so here it plans exactly like a direct call; the busy diversion itself is
+///   built by [`plan_busy`] when the SIP layer observes the busy outcome.
 /// - [`ForwardMode::Unavailable`] — if the extension is registered the rule is inert and it
 ///   rings normally; only when it is offline does the call follow the targets.
 pub fn plan_with_forwarding(
@@ -166,7 +167,9 @@ pub fn plan_with_forwarding(
     let ring_ext_first = match fwd.mode {
         ForwardMode::Always => false,
         // A dead extension is never worth ringing first, regardless of mode.
-        ForwardMode::NoAnswer | ForwardMode::Busy => registered,
+        ForwardMode::NoAnswer => registered,
+        // Busy is not a no-answer rule: ring normally; the busy path uses `plan_busy`.
+        ForwardMode::Busy => return plan_direct(number, registered, opts),
         // Unavailable only forwards when offline; if registered the rule does not apply.
         ForwardMode::Unavailable => {
             if registered {
@@ -200,6 +203,37 @@ pub fn plan_with_forwarding(
         return DialPlan::immediate(final_action);
     }
     DialPlan { stages, final_action }
+}
+
+/// Plan the diversion taken when the dialled extension is **busy** (a `486` from the callee) or
+/// in **do-not-disturb**: the extension is not rung; the rule's `targets` are walked as a
+/// follow-me chain, then the usual voicemail/hangup terminus.
+pub fn plan_busy(number: &str, fwd: &Forwarding, opts: &PlanOpts) -> DialPlan {
+    let mut always = fwd.clone();
+    always.mode = ForwardMode::Always;
+    plan_with_forwarding(number, false, &always, opts)
+}
+
+/// Remove every contact whose extension number is in `dnd` (do-not-disturb) from `plan`,
+/// dropping stages left empty. A `sip:101@host` / `sip:101` / bare `101` contact all match the
+/// number `101`. The final action is untouched.
+pub fn strip_dnd(plan: DialPlan, dnd: &std::collections::HashSet<String>) -> DialPlan {
+    if dnd.is_empty() {
+        return plan;
+    }
+    let number_of = |c: &str| -> String {
+        let c = c.strip_prefix("sips:").or_else(|| c.strip_prefix("sip:")).unwrap_or(c);
+        c.split('@').next().unwrap_or(c).to_string()
+    };
+    let stages = plan
+        .stages
+        .into_iter()
+        .filter_map(|mut st| {
+            st.contacts.retain(|c| !dnd.contains(&number_of(c)));
+            (!st.contacts.is_empty()).then_some(st)
+        })
+        .collect();
+    DialPlan { stages, final_action: plan.final_action }
 }
 
 /// Plan a ring group. `rotation` is a per-call counter that spreads load for the rotating
@@ -336,6 +370,45 @@ mod tests {
 
     fn opts(vm: bool) -> PlanOpts {
         PlanOpts { default_ring_seconds: 30, voicemail_enabled: vm }
+    }
+
+    // ---- busy / DND -------------------------------------------------------------------
+
+    #[test]
+    fn busy_rule_is_not_a_no_answer_rule() {
+        let mut f = Forwarding::create(Uuid::now_v7(), "100", ForwardMode::Busy);
+        f.targets = vec!["external:+14155550100".into()];
+        // Registered: rings the extension only (no forward stage); no-answer → voicemail.
+        let p = plan_with_forwarding("100", true, &f, &opts(true));
+        assert_eq!(p.stages.len(), 1);
+        assert_eq!(p.stages[0].contacts, vec!["sip:100"]);
+        assert_eq!(p.final_action, FinalAction::Voicemail("100".into()));
+    }
+
+    #[test]
+    fn plan_busy_walks_targets_without_ringing_the_extension() {
+        let mut f = Forwarding::create(Uuid::now_v7(), "100", ForwardMode::Busy);
+        f.targets = vec!["sip:101".into(), "external:+14155550100".into()];
+        let p = plan_busy("100", &f, &opts(true));
+        let contacts: Vec<_> = p.stages.iter().flat_map(|s| s.contacts.clone()).collect();
+        assert_eq!(contacts, vec!["sip:101", "external:+14155550100"]);
+        assert_eq!(p.final_action, FinalAction::Voicemail("100".into()));
+        // Voicemail disabled → hangup terminus.
+        assert_eq!(plan_busy("100", &f, &opts(false)).final_action, FinalAction::Hangup);
+    }
+
+    #[test]
+    fn strip_dnd_removes_dnd_members_and_empty_stages() {
+        let mut g = RingGroup::create(Uuid::now_v7(), RingStrategy::Sequential);
+        g.members = vec!["sip:100".into(), "sip:101@host".into(), "102".into()];
+        let plan = plan_ring_group("500", &g, &opts(true), 0);
+        let dnd: std::collections::HashSet<String> = ["101".to_string()].into();
+        let out = strip_dnd(plan.clone(), &dnd);
+        let contacts: Vec<_> = out.stages.iter().flat_map(|s| s.contacts.clone()).collect();
+        assert_eq!(contacts, vec!["sip:100", "sip:102"]);
+        assert_eq!(out.final_action, plan.final_action);
+        // Empty DND set is a no-op.
+        assert_eq!(strip_dnd(plan.clone(), &Default::default()), plan);
     }
 
     // ---- plan_direct ----------------------------------------------------------------

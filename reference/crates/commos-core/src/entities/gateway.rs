@@ -41,6 +41,22 @@ pub struct Gateway {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     pub health: GatewayHealth,
+    /// Country code (digits, no `+`) this carrier's dialling is interpreted in. Overrides the
+    /// deployment `default_country_code` for outbound number normalisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    /// National trunk prefix (default `"0"`; `"1"` for NANP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub national_prefix: Option<String>,
+    /// International access prefix (default `"00"`; `"011"` for NANP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub international_prefix: Option<String>,
+    /// Outside-line prefix stripped from dialled digits (e.g. `"9"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strip_prefix: Option<String>,
+    /// E.164 caller ID presented on the trunk leg (From / P-Asserted-Identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_caller_id: Option<String>,
 }
 
 impl Gateway {
@@ -52,6 +68,11 @@ impl Gateway {
             kind: GatewayKind::Sip,
             address: Some(address.into()),
             health: GatewayHealth::Online,
+            country_code: None,
+            national_prefix: None,
+            international_prefix: None,
+            strip_prefix: None,
+            outbound_caller_id: None,
         }
     }
 }

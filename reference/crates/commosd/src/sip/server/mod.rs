@@ -300,9 +300,12 @@ pub struct SipServer {
 mod auth; // digest auth: nonce issue/replay-guard + challenge
 mod bridge; // media plane: echo, two-leg bridge, ring-group fork, trunk, recording
 mod decline; // callee-decline announcement + leave-a-message path
+mod dnd; // do-not-disturb + busy diversion + bridged-answer bookkeeping
+mod featurecodes; // *78/*79 DND, *72/*73 forward-always dial-in codes
 mod handlers; // non-INVITE methods: REGISTER, INFO, BYE/CANCEL
 mod invite; // the inbound INVITE handler (core routing decision)
 mod ivr_menu; // IVR menu playout + driver
+mod outbound; // trunk dial profiles, outbound caller ID, emergency routing
 mod queue; // call-queue answer path + queue-wait driver
 mod refer; // REFER call transfer (blind + attended)
 mod routing; // destination resolution + outbound gateway selection

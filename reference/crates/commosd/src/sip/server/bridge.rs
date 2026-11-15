@@ -551,7 +551,11 @@ impl SipServer {
             .filter(|c| *c != '-')
             .take(16)
             .collect();
-        let from_hdr = format!("<sip:commos@{}>;tag={from_tag}", self.media_ip);
+        let (from_hdr, pai_hdr) = super::outbound::trunk_identity(
+            self.media_ip,
+            gateway.outbound_caller_id.as_deref(),
+            &from_tag,
+        );
         let contact_hdr = format!("<sip:commos@{}>", self.media_ip);
         let cnonce = from_tag.clone();
         // Offer the caller's codec list to the carrier (transparent pass-through), plus an SDES
@@ -578,6 +582,9 @@ impl SipServer {
                 ("CSeq", format!("{cseq} INVITE")),
                 ("Contact", contact_hdr.clone()),
             ];
+            if let Some(pai) = &pai_hdr {
+                headers.push(("P-Asserted-Identity", pai.clone()));
+            }
             if let Some((name, value)) = &auth {
                 headers.push((name, value.clone()));
             }

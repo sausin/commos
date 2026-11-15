@@ -20,7 +20,7 @@ use super::admin::AdminContext;
 use super::auth::TenantContext;
 use super::calls::ListParams;
 use super::problem::Problem;
-use crate::control::trunking::TrunkingError;
+use crate::control::trunking::{GatewayDialing, TrunkingError};
 use crate::state::AppState;
 
 fn tid(s: &str) -> Result<Uuid, Problem> {
@@ -95,10 +95,14 @@ pub struct CreateGateway {
     pub kind: GatewayKind,
     pub address: Option<String>,
     pub health: Option<GatewayHealth>,
+    #[serde(flatten)]
+    pub dialing: GatewayDialing,
 }
 #[derive(Deserialize)]
 pub struct PatchGateway {
-    pub health: GatewayHealth,
+    pub health: Option<GatewayHealth>,
+    #[serde(flatten)]
+    pub dialing: GatewayDialing,
 }
 
 /// `GET /v1/gateways`
@@ -123,6 +127,11 @@ pub async fn create_gateway(
         .create_gateway(admin.tenant_id, carrier, b.kind, b.address, b.health.unwrap_or(GatewayHealth::Online))
         .await
         .map_err(terr)?;
+    let g = if b.dialing.is_empty() {
+        g
+    } else {
+        st.trunking.update_gateway(admin.tenant_id, g.base.id, None, b.dialing).await.map_err(terr)?
+    };
     Ok((StatusCode::CREATED, Json(g)))
 }
 /// `GET /v1/gateways/{id}`
@@ -136,7 +145,7 @@ pub async fn patch_gateway(
     Path(id): Path<String>,
     Json(b): Json<PatchGateway>,
 ) -> Result<Json<Gateway>, Problem> {
-    Ok(Json(st.trunking.set_gateway_health(admin.tenant_id, tid(&id)?, b.health).await.map_err(terr)?))
+    Ok(Json(st.trunking.update_gateway(admin.tenant_id, tid(&id)?, b.health, b.dialing).await.map_err(terr)?))
 }
 /// `DELETE /v1/gateways/{id}`
 pub async fn delete_gateway(State(st): State<AppState>, admin: AdminContext, Path(id): Path<String>) -> Result<StatusCode, Problem> {
