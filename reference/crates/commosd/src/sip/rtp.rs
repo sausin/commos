@@ -92,6 +92,7 @@ pub struct Bridge {
 }
 
 /// A live re-targeting instruction for the relay task (blind/attended transfer).
+#[allow(clippy::large_enum_variant)] // short-lived control message; boxing buys nothing
 enum BridgeCmd {
     /// Replace `leg`'s socket (and SRTP context) with `sock`, with its peer pre-set to `peer`
     /// (or re-latched from the first packet when `None`).
