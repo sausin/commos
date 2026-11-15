@@ -102,6 +102,7 @@ impl Media {
 /// TODO(B2BUA): this is best-effort. We reconstruct a BYE from the identifiers captured when
 /// the leg was set up, but full RFC 3261 mid-dialog correctness (route sets, contact
 /// refresh, robust CSeq accounting) is not implemented.
+#[derive(Clone)]
 struct CalleeLeg {
     /// Where to send requests toward the callee (its Contact's host:port).
     addr: SocketAddr,
@@ -301,6 +302,7 @@ mod handlers; // non-INVITE methods: REGISTER, INFO, BYE/CANCEL
 mod invite; // the inbound INVITE handler (core routing decision)
 mod ivr_menu; // IVR menu playout + driver
 mod queue; // call-queue answer path + queue-wait driver
+mod refer; // REFER call transfer (blind + attended)
 mod routing; // destination resolution + outbound gateway selection
 mod sdp; // SDP/SRTP negotiation + SIP response construction
 mod voicemail; // voicemail deposit/retrieval, storage, MWI
@@ -432,6 +434,7 @@ impl SipServer {
             }
             "BYE" | "CANCEL" => self.on_bye(resp, &msg).await,
             "INFO" => self.on_info(resp, &msg).await,
+            "REFER" => self.on_refer(resp, &msg).await,
             other => {
                 tracing::info!(method = %other, %src, "SIP method not implemented");
                 self.reply(resp, &msg, 501, "Not Implemented").await
