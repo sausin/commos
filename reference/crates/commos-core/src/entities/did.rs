@@ -20,6 +20,12 @@ pub struct Did {
     pub carrier_id: Uuid,
     /// Where an inbound call to this number goes (e.g. `sip:200@host`, `ivr:<id>`, `voicemail`).
     pub destination_ref: String,
+    /// Optional business-hours [`Schedule`](super::schedule::Schedule). `None` = always open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<Uuid>,
+    /// Where calls go while the schedule is closed (same format as `destination_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_destination_ref: Option<String>,
 }
 
 impl Did {
@@ -35,6 +41,8 @@ impl Did {
             e164: e164.into(),
             carrier_id,
             destination_ref: destination_ref.into(),
+            schedule_id: None,
+            closed_destination_ref: None,
         }
     }
 }

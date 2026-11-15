@@ -24,6 +24,7 @@ use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
 use commos_core::entities::ring_group::RingGroup;
+use commos_core::entities::schedule::Schedule;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -149,6 +150,16 @@ CREATE TABLE IF NOT EXISTS forwardings (
     data        jsonb NOT NULL
 );
 CREATE INDEX IF NOT EXISTS forwardings_tenant_id_idx ON forwardings (tenant_id, id);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id          uuid PRIMARY KEY,
+    tenant_id   uuid NOT NULL,
+    version     bigint NOT NULL,
+    created_at  timestamptz NOT NULL,
+    updated_at  timestamptz NOT NULL,
+    data        jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schedules_tenant_id_idx ON schedules (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS call_flows (
     id uuid PRIMARY KEY, tenant_id uuid NOT NULL, version bigint NOT NULL,
@@ -610,6 +621,9 @@ impl Store for PgStore {
         for rg in &tx.ring_groups {
             upsert(&mut dbtx, "ring_groups", "RingGroup", &rg.base, &serde_json::to_value(rg).map_err(be)?).await?;
         }
+        for s in &tx.schedules {
+            upsert(&mut dbtx, "schedules", "Schedule", &s.base, &serde_json::to_value(s).map_err(be)?).await?;
+        }
         for f in &tx.forwardings {
             upsert(&mut dbtx, "forwardings", "Forwarding", &f.base, &serde_json::to_value(f).map_err(be)?).await?;
         }
@@ -959,6 +973,28 @@ impl Store for PgStore {
     }
     async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         let res = sqlx::query("DELETE FROM ring_groups WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .execute(&self.pool).await.map_err(be)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_schedule(&self, tenant: Uuid, id: Uuid) -> Result<Option<Schedule>, StoreError> {
+        let row = sqlx::query("SELECT data FROM schedules WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_uuid()).bind(id.as_uuid())
+            .fetch_optional(&self.pool).await.map_err(be)?;
+        row.as_ref().map(entity_from_row).transpose()
+    }
+    async fn list_schedules(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Schedule>, StoreError> {
+        let items = self.list_entities::<Schedule>("schedules", tenant, limit, cursor).await?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|s| s.base.id.to_string())
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+    async fn delete_schedule(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let res = sqlx::query("DELETE FROM schedules WHERE tenant_id = $1 AND id = $2")
             .bind(tenant.as_uuid()).bind(id.as_uuid())
             .execute(&self.pool).await.map_err(be)?;
         Ok(res.rows_affected() > 0)

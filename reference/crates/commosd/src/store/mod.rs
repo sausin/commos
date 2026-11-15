@@ -40,6 +40,7 @@ use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
 use commos_core::entities::ring_group::RingGroup;
+use commos_core::entities::schedule::Schedule;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -69,6 +70,8 @@ pub struct Tx {
     /// call-forwarding / follow-me rules.
     pub ring_groups: Vec<RingGroup>,
     pub forwardings: Vec<Forwarding>,
+    /// Business-hours schedules (open/closed routing).
+    pub schedules: Vec<Schedule>,
     /// Routing programs — versioned CallFlows and IVR menu nodes.
     pub call_flows: Vec<CallFlow>,
     pub ivrs: Vec<Ivr>,
@@ -227,6 +230,16 @@ pub trait Store: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Page<Forwarding>, StoreError>;
     async fn delete_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
+
+    // Business-hours schedules — config CRUD, tenant-scoped.
+    async fn get_schedule(&self, tenant: Uuid, id: Uuid) -> Result<Option<Schedule>, StoreError>;
+    async fn list_schedules(
+        &self,
+        tenant: Uuid,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<Page<Schedule>, StoreError>;
+    async fn delete_schedule(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError>;
 
     // Routing programs — CallFlows (versioned) and IVR menu nodes, tenant-scoped.
     async fn get_call_flow(&self, tenant: Uuid, id: Uuid) -> Result<Option<CallFlow>, StoreError>;

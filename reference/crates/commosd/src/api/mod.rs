@@ -28,6 +28,7 @@ pub mod queues;
 pub mod recordings;
 pub mod registrations;
 pub mod ringing;
+pub mod schedules;
 pub mod threads;
 pub mod trunking;
 pub mod video_rooms;
@@ -160,6 +161,13 @@ pub fn router(state: AppState) -> Router {
             "/ring-groups/:id",
             get(ringing::get_ring_group).patch(ringing::patch_ring_group).delete(ringing::delete_ring_group),
         )
+        // Business hours / holidays (open-closed routing); a DID references a schedule.
+        .route("/schedules", get(schedules::list_schedules).post(schedules::create_schedule))
+        .route(
+            "/schedules/:id",
+            get(schedules::get_schedule).patch(schedules::patch_schedule).delete(schedules::delete_schedule),
+        )
+        .route("/schedules/:id/status", get(schedules::schedule_status))
         .route("/forwardings", get(ringing::list_forwardings).post(ringing::create_forwarding))
         .route(
             "/forwardings/:id",
@@ -185,7 +193,7 @@ pub fn router(state: AppState) -> Router {
         .route("/trunks", get(trunking::list_trunks).post(trunking::create_trunk))
         .route("/trunks/:id", get(trunking::get_trunk).delete(trunking::delete_trunk))
         .route("/dids", get(trunking::list_dids).post(trunking::create_did))
-        .route("/dids/:id", get(trunking::get_did).delete(trunking::delete_did))
+        .route("/dids/:id", get(trunking::get_did).patch(trunking::patch_did).delete(trunking::delete_did))
         .route("/agents", get(agents::list_agents).post(agents::set_agent_state))
         .route("/agents/:id", get(agents::get_agent))
         // Admin onboarding wizard — auto-detected suggestions + one-click apply.

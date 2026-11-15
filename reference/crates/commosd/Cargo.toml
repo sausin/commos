@@ -42,6 +42,9 @@ aes = "0.8"
 ctr = "0.9"
 sha1 = "0.10"
 getrandom = "0.2"
+# IANA timezone math for business-hours schedules. tzdb is bundled (works on minimal Pi images
+# with no /usr/share/zoneinfo); pure Rust, no chrono.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
 base64 = "0.22"
 
 # Optional S3-compatible object storage (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Wasabi,

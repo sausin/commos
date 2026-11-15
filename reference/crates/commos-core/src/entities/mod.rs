@@ -23,6 +23,7 @@ pub mod presence_state;
 pub mod queue;
 pub mod recording;
 pub mod ring_group;
+pub mod schedule;
 pub mod route;
 pub mod thread;
 pub mod user;
