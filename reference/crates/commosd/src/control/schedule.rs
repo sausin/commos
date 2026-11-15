@@ -36,6 +36,15 @@ pub fn parse_hhmm(s: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
+/// Parse a range *end* time: `HH:MM` or `24:00` (end of day, 1440 minutes), so an all-day
+/// range `00:00`-`24:00` leaves no one-minute gap at 23:59.
+pub fn parse_hhmm_end(s: &str) -> Option<u32> {
+    if s == "24:00" {
+        return Some(24 * 60);
+    }
+    parse_hhmm(s)
+}
+
 /// Parse a strict `YYYY-MM-DD` date.
 pub fn parse_date(s: &str) -> Option<Date> {
     if s.len() != 10 {
@@ -72,7 +81,7 @@ pub fn validate(name: &str, timezone: &str, weekly: &[WeeklyRange], holidays: &[
                 return Err(format!("invalid day name '{d}' (expected mon..sun)"));
             }
         }
-        let (Some(s), Some(e)) = (parse_hhmm(&r.start), parse_hhmm(&r.end)) else {
+        let (Some(s), Some(e)) = (parse_hhmm(&r.start), parse_hhmm_end(&r.end)) else {
             return Err(format!("start/end must be HH:MM (got '{}'-'{}')", r.start, r.end));
         };
         if s == e {
@@ -91,6 +100,20 @@ fn range_hits(r: &WeeklyRange, day: Weekday) -> bool {
     r.days.iter().any(|d| parse_day(d) == Some(day))
 }
 
+/// Log a WARN the first time each unresolvable timezone is seen (fail-open stays silent
+/// afterwards so a hot call path cannot flood the log).
+fn warn_bad_timezone_once(tz: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut g) = seen.lock() {
+        if g.len() < 256 && g.insert(tz.to_string()) {
+            tracing::warn!(timezone = %tz, "schedule has an unresolvable timezone; failing open (always open)");
+        }
+    }
+}
+
 /// Is `schedule` open at the UTC instant `utc_now`?
 ///
 /// Open when the local time falls in any weekly range for its weekday and the local date is
@@ -98,6 +121,7 @@ fn range_hits(r: &WeeklyRange, day: Weekday) -> bool {
 /// Empty `weekly` = always open (holidays still close). An unresolvable timezone fails open.
 pub fn is_open(schedule: &Schedule, utc_now: Timestamp) -> bool {
     let Ok(tz) = TimeZone::get(&schedule.timezone) else {
+        warn_bad_timezone_once(&schedule.timezone);
         return true;
     };
     let local = utc_now.to_zoned(tz);
@@ -117,7 +141,7 @@ pub fn is_open(schedule: &Schedule, utc_now: Timestamp) -> bool {
     let today = local.weekday();
     let yesterday = today.wrapping_sub(1);
     schedule.weekly.iter().any(|r| {
-        let (Some(s), Some(e)) = (parse_hhmm(&r.start), parse_hhmm(&r.end)) else {
+        let (Some(s), Some(e)) = (parse_hhmm(&r.start), parse_hhmm_end(&r.end)) else {
             return false;
         };
         if s == e {
@@ -280,6 +304,18 @@ mod tests {
     const WEEKDAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri"];
 
     #[test]
+    fn all_day_range_accepts_24_00_with_no_gap() {
+        let s = sched("UTC", vec![(&["mon"], "00:00", "24:00")], vec![]);
+        assert!(validate("n", "UTC", &s.weekly, &[]).is_ok());
+        assert!(is_open(&s, ts("2026-03-02T23:59:30Z")));
+        assert!(!is_open(&s, ts("2026-03-03T00:00:00Z")));
+        // 24:00 is only valid as an end.
+        let bad = vec![WeeklyRange { days: vec!["mon".into()], start: "24:00".into(), end: "12:00".into() }];
+        assert!(validate("n", "UTC", &bad, &[]).is_err());
+        assert!(validate("n", "Not/AZone", &[], &[]).is_err());
+    }
+
+    #[test]
     fn weekday_range() {
         let s = sched("UTC", vec![(WEEKDAYS, "09:00", "17:30")], vec![]);
         // 2026-03-02 is a Monday.
@@ -363,7 +399,7 @@ mod tests {
         assert!(validate("a", "UTC", &bad_day, &[]).is_err());
         let bad_t = vec![WeeklyRange { days: vec!["mon".into()], start: "9:00".into(), end: "17:00".into() }];
         assert!(validate("a", "UTC", &bad_t, &[]).is_err());
-        let bad_t2 = vec![WeeklyRange { days: vec!["mon".into()], start: "09:00".into(), end: "24:00".into() }];
+        let bad_t2 = vec![WeeklyRange { days: vec!["mon".into()], start: "09:00".into(), end: "24:01".into() }];
         assert!(validate("a", "UTC", &bad_t2, &[]).is_err());
         let hol = vec![Holiday { date: "2026-13-40".into(), name: None }];
         assert!(validate("a", "UTC", &[], &hol).is_err());

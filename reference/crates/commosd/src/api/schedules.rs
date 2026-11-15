@@ -101,7 +101,31 @@ pub async fn patch_schedule(
 
 /// `DELETE /v1/schedules/{id}`
 pub async fn delete_schedule(State(st): State<AppState>, admin: AdminContext, Path(id): Path<String>) -> Result<StatusCode, Problem> {
-    svc(&st).delete(admin.tenant_id, tid(&id)?).await.map_err(serr)?;
+    let sid = tid(&id)?;
+    // Refuse while a DID still routes by this schedule (deleting would silently make it
+    // always-open).
+    let mut referencing: Vec<String> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = st
+            .store
+            .list_dids(admin.tenant_id, 200, cursor)
+            .await
+            .map_err(|e| Problem::internal(e.to_string()))?;
+        referencing.extend(page.items.iter().filter(|d| d.schedule_id == Some(sid)).map(|d| d.e164.clone()));
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    if !referencing.is_empty() {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "schedule_in_use",
+            format!("schedule is referenced by DID(s): {}", referencing.join(", ")),
+        ));
+    }
+    svc(&st).delete(admin.tenant_id, sid).await.map_err(serr)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
