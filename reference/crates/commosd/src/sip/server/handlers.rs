@@ -29,6 +29,32 @@ impl SipServer {
         msg: &SipMessage,
     ) -> std::io::Result<()> {
         let src = resp.peer();
+        let aor = match msg.register_aor() {
+            Some(a) if !a.is_empty() => a,
+            _ => {
+                tracing::debug!(%src, "REGISTER without a usable To/From AoR");
+                return self.reply(resp, msg, 400, "Bad Request").await;
+            }
+        };
+
+        // Only extensions that exist may register, independent of the auth setting: this stops
+        // anyone squatting an arbitrary number on a zero-config box. De-registration of an
+        // already-unknown AoR is harmless, but is rejected the same way for simplicity.
+        match user_part(&aor) {
+            Some(number) => match self.extension_exists(number).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(%src, %aor, "SIP REGISTER rejected: unknown extension");
+                    return self.reply(resp, msg, 404, "Not Found").await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "SIP REGISTER: extension lookup failed");
+                    return self.reply(resp, msg, 500, "Server Internal Error").await;
+                }
+            },
+            None => return self.reply(resp, msg, 400, "Bad Request").await,
+        }
+
         // Digest auth gate (Volume 9): an unauthenticated REGISTER is challenged with 401 +
         // WWW-Authenticate; the phone re-sends with credentials we verify against its stored
         // per-device secret. Auth is enforced when configured, and always for a public source.
@@ -42,14 +68,6 @@ impl SipServer {
             }
         } else {
             None
-        };
-
-        let aor = match msg.register_aor() {
-            Some(a) if !a.is_empty() => a,
-            _ => {
-                tracing::debug!(%src, "REGISTER without a usable To/From AoR");
-                return self.reply(resp, msg, 400, "Bad Request").await;
-            }
         };
 
         // Identity binding: a device authenticated as `user` may only register its own AoR. This
