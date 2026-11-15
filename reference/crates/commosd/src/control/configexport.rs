@@ -34,6 +34,7 @@ use commos_core::entities::extension::Extension;
 use commos_core::entities::queue::{Queue, QueueStrategy};
 use commos_core::entities::carrier::Carrier;
 use commos_core::entities::did::Did;
+use commos_core::entities::schedule::Schedule;
 use commos_core::entities::forwarding::Forwarding;
 use commos_core::entities::gateway::Gateway;
 use commos_core::entities::ivr::Ivr;
@@ -129,6 +130,8 @@ pub struct PbxConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trunks: Vec<PbxEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<PbxEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dids: Vec<PbxEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<PbxEntry>,
@@ -171,6 +174,10 @@ pub struct ImportSummary {
     pub trunks_created: usize,
     #[serde(default)]
     pub trunks_updated: usize,
+    #[serde(default)]
+    pub schedules_created: usize,
+    #[serde(default)]
+    pub schedules_updated: usize,
     #[serde(default)]
     pub dids_created: usize,
     #[serde(default)]
@@ -287,6 +294,8 @@ pub async fn export(store: &Arc<dyn Store>, tenant: Uuid) -> Result<PbxConfig, S
     let carriers = export_kind(list_all(|c| store.list_carriers(tenant, PAGE, c)).await?, |c: &Carrier| c.name.clone());
     let gateways = export_kind(list_all(|c| store.list_gateways(tenant, PAGE, c)).await?, gateway_key);
     let trunks = export_kind(list_all(|c| store.list_trunks(tenant, PAGE, c)).await?, |t: &Trunk| t.base.id.to_string());
+    let schedules =
+        export_kind(list_all(|c| store.list_schedules(tenant, PAGE, c)).await?, |s: &Schedule| s.name.clone());
     let dids = export_kind(list_all(|c| store.list_dids(tenant, PAGE, c)).await?, |d: &Did| d.e164.clone());
     let routes = export_kind(list_all(|c| store.list_routes(tenant, PAGE, c)).await?, route_key);
 
@@ -302,6 +311,7 @@ pub async fn export(store: &Arc<dyn Store>, tenant: Uuid) -> Result<PbxConfig, S
         carriers,
         gateways,
         trunks,
+        schedules,
         dids,
         routes,
     })
@@ -341,7 +351,7 @@ macro_rules! has_base {
         }
     )*};
 }
-has_base!(RingGroup, Forwarding, Ivr, Carrier, Gateway, Trunk, Did, Route);
+has_base!(RingGroup, Forwarding, Ivr, Carrier, Gateway, Trunk, Schedule, Did, Route);
 
 /// Project an entity to its intent map via its own serde.
 fn to_entry<T: Serialize>(entity: &T) -> PbxEntry {
@@ -621,6 +631,11 @@ pub async fn import(
         tenant, &cfg.trunks, list_all(|c| store.list_trunks(tenant, PAGE, c)).await?, |t: &Trunk| t.base.id.to_string())?;
     summary.trunks_created = a;
     summary.trunks_updated = b;
+    // Schedules before DIDs: a DID's `schedule_id` references one.
+    let (schedules, a, b) = reconcile_kind(
+        tenant, &cfg.schedules, list_all(|c| store.list_schedules(tenant, PAGE, c)).await?, |s: &Schedule| s.name.clone())?;
+    summary.schedules_created = a;
+    summary.schedules_updated = b;
     let (dids, a, b) = reconcile_kind(
         tenant, &cfg.dids, list_all(|c| store.list_dids(tenant, PAGE, c)).await?, |d: &Did| d.e164.clone())?;
     summary.dids_created = a;
@@ -642,6 +657,7 @@ pub async fn import(
             carriers,
             gateways,
             trunks,
+            schedules,
             dids,
             routes,
             events: Vec::new(),
@@ -961,9 +977,16 @@ mod tests {
             "id": Uuid::now_v7().to_string(), "carrier_id": carrier_id.to_string(),
             "channels_max": 10, "codecs": ["PCMU"]
         }))];
+        let schedule_id = Uuid::now_v7();
+        cfg.schedules = vec![entry(serde_json::json!({
+            "id": schedule_id.to_string(), "name": "Office hours", "timezone": "Europe/London",
+            "weekly": [{"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "17:00"}],
+            "holidays": [{"date": "2026-12-25", "name": "Christmas"}]
+        }))];
         cfg.dids = vec![entry(serde_json::json!({
             "id": Uuid::now_v7().to_string(), "e164": "+15551230000",
-            "carrier_id": carrier_id.to_string(), "destination_ref": "sip:1001@commos"
+            "carrier_id": carrier_id.to_string(), "destination_ref": "sip:1001@commos",
+            "schedule_id": schedule_id.to_string(), "closed_destination_ref": "voicemail"
         }))];
         cfg.routes = vec![entry(serde_json::json!({
             "id": Uuid::now_v7().to_string(), "destination_ref": "sip:1001@commos", "priority": 5
@@ -987,6 +1010,9 @@ mod tests {
         let exported = export(&src, tenant).await.unwrap();
         assert_eq!(exported.carriers.len(), 1);
         assert_eq!(exported.dids.len(), 1);
+        assert_eq!(first.schedules_created, 1);
+        assert_eq!(exported.schedules.len(), 1);
+        assert_eq!(exported.dids[0].get("schedule_id").and_then(|v| v.as_str()), Some(schedule_id.to_string().as_str()));
         assert_eq!(exported.ivrs.len(), 1);
         // The extension's bound route_id is carried via the serde-flattened `extra` map.
         assert!(exported.extensions[0].extra.contains_key("route_id"));
