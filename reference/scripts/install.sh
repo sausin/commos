@@ -407,13 +407,14 @@ fi
   echo "# media_ip is the address phones send RTP audio to — MUST be reachable from the phones."
   echo "media_ip: \"$MEDIA_IP\""
   echo "data_dir: \"$DATA_DIR\""
+  echo "# Secure defaults (no edit needed): require_sip_auth is on (the onboarding wizard mints a SIP secret per"
+  echo "# extension), dev_tokens turns off when an admin_password is set, voicemail is on (~20 s no-answer)."
   # Phone clock (provisioning): timezone for local-time display, and the NTP source to sync from.
   [ -n "$TIMEZONE" ] && echo "timezone: \"$TIMEZONE\"   # phones display local time in this zone"
   [ -n "$NTP_SERVER" ] && echo "ntp_server: \"$NTP_SERVER\"   # phones sync their clock from here"
   if [ "$DO_TLS" = "1" ]; then
     echo "# SIP-over-TLS (SIPS): protects SDES SRTP keys + call metadata in transit."
     echo "$SIPS_YAML"
-    echo "require_sip_auth: true   # TLS is exposed beyond the LAN; demand per-device SIP credentials."
   fi
   [ -n "$ADMIN_YAML" ] && echo "$ADMIN_YAML"
 } > "$CONFIG"

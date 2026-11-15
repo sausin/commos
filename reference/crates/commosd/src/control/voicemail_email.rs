@@ -137,6 +137,42 @@ impl VoicemailEmailer {
         Ok(true)
     }
 
+    /// The directory email of the user who owns extension `number`. An Extension carries no
+    /// user link, so the owner is the User whose `display_name` equals the extension's `label`
+    /// (or the onboarding default `"Extension <number>"`) and who has an email address.
+    async fn owner_email(&self, tenant: Uuid, number: &str) -> anyhow::Result<Option<String>> {
+        let mut names: Vec<String> = vec![format!("Extension {number}")];
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.store.list_extensions(tenant, 500, cursor).await?;
+            if let Some(e) = page.items.iter().find(|e| e.number == number) {
+                if let Some(l) = &e.label {
+                    names.insert(0, l.clone());
+                }
+                break;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.store.list_users(tenant, 500, cursor).await?;
+            for name in &names {
+                if let Some(u) = page.items.iter().find(|u| &u.display_name == name) {
+                    if let Some(email) = u.email.as_ref().filter(|e| !e.trim().is_empty()) {
+                        return Ok(Some(email.trim().to_string()));
+                    }
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
     /// Look up the mailbox + recipients for a voicemail, or `None` if it is not deliverable.
     async fn resolve(&self, tenant: Uuid, vm_id: Uuid) -> anyhow::Result<Option<Resolved>> {
         let Some(vm) = self.store.get_voicemail(tenant, vm_id).await? else {
@@ -153,7 +189,13 @@ impl VoicemailEmailer {
         let Some(mailbox) = user_part(&call.to_ref) else {
             return Ok(None);
         };
-        let recipients = self.mailboxes.get(&mailbox).cloned().unwrap_or_default();
+        let mut recipients = self.mailboxes.get(&mailbox).cloned().unwrap_or_default();
+        if recipients.is_empty() {
+            // Not listed in `smtp.mailboxes`: fall back to the owning user's directory email.
+            if let Some(email) = self.owner_email(tenant, &mailbox).await? {
+                recipients = vec![email];
+            }
+        }
         if recipients.is_empty() {
             return Ok(None);
         }
@@ -305,6 +347,26 @@ mod tests {
         map.insert("100".to_string(), vec!["alice@example.com".to_string()]);
         let e = emailer(store.clone(), map);
         assert!(e.resolve(tenant, vm_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_to_owning_users_email() {
+        use commos_core::entities::extension::Extension;
+        use commos_core::entities::user::User;
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let tenant = Uuid::now_v7();
+        let mut ext = Extension::new(tenant, "100", Uuid::now_v7());
+        ext.label = Some("Ada Lovelace".into());
+        let mut user = User::new(tenant, "Ada Lovelace");
+        user.email = Some("ada@example.com".into());
+        store
+            .commit(Tx { extensions: vec![ext], users: vec![user], ..Default::default() })
+            .await
+            .unwrap();
+        let vm_id = seed_voicemail(&store, tenant, "sip:555@pstn", "sip:100@commos").await;
+        let e = emailer(store.clone(), HashMap::new());
+        let r = e.resolve(tenant, vm_id).await.unwrap().expect("falls back to directory email");
+        assert_eq!(r.recipients, vec!["ada@example.com".to_string()]);
     }
 
     #[tokio::test]

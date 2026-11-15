@@ -29,10 +29,11 @@ pub struct Config {
     #[serde(default = "default_sip_listen")]
     pub sip_listen: Option<SocketAddr>,
 
-    /// Require SIP digest authentication on REGISTER (Volume 9). Default `false` so a LAN test
-    /// bed works with zero setup; set `true` to demand per-device credentials (generated during
-    /// provisioning) — do this before exposing SIP beyond a trusted network.
-    #[serde(default)]
+    /// Require SIP digest authentication on REGISTER/INVITE (Volume 9). Default `true`: every
+    /// extension gets a per-device credential at provisioning/onboarding, so a fresh install is
+    /// secure with no hand-editing. Set `false` only for a throwaway bench (a REGISTER for an
+    /// extension that does not exist is rejected either way).
+    #[serde(default = "default_true")]
     pub require_sip_auth: bool,
 
     /// SIP digest realm presented in the auth challenge. Default `commos`.
@@ -69,15 +70,16 @@ pub struct Config {
     pub on_decline: OnDecline,
 
     /// How many times a called extension rings before an unanswered call is diverted to
-    /// voicemail (or the echo fallback when voicemail is off). Default `5` (~30 s — a standard
-    /// PBX ring). One "ring" is the ~6 s ring cadence, so the effective no-answer timeout is
+    /// voicemail (or the echo fallback when voicemail is off). Default `3` (~20 s, so a missed
+    /// call lands in voicemail promptly). One "ring" is the ~6 s ring cadence, so the effective no-answer timeout is
     /// `no_answer_rings × 6 s`. Raise it if callers are being sent to voicemail before people
     /// can reach the phone; lower it for a snappier fallback.
     #[serde(default = "default_no_answer_rings")]
     pub no_answer_rings: u32,
 
-    /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1` (loopback
-    /// echo test); set to the server's LAN/public address for real phones.
+    /// IP address advertised to callers in SDP for RTP media. Default `127.0.0.1`, which at
+    /// startup is replaced by the autodetected default-route LAN IPv4 (unless SIP only listens
+    /// on loopback); set it explicitly to the server's LAN/public address to pin it.
     #[serde(default = "default_media_ip")]
     pub media_ip: IpAddr,
 
@@ -150,10 +152,12 @@ pub struct Config {
     #[serde(default)]
     pub jwt_secret: Option<SecretRef>,
 
-    /// Accept the `tenant:<uuidv7>` development bearer token. Default `true` so local dev and
-    /// the dashboard work with zero setup; set `false` in production once `jwt_secret` is set.
-    #[serde(default = "default_true")]
-    pub dev_tokens: bool,
+    /// Accept the `tenant:<uuidv7>` development bearer token. Unset (default) → `true` only
+    /// when NO `admin_password` is configured (zero-config local dev and the dashboard keep
+    /// working) and `false` as soon as one is. Set explicitly to override either way. See
+    /// [`Config::dev_tokens_enabled`].
+    #[serde(default)]
+    pub dev_tokens: Option<bool>,
 
     /// Database DSN — the system of record. A **reference**, never an inline credential
     /// (CMOS-14-DEP-083). `None` (the default) means use the embedded SQLite store at
@@ -394,13 +398,21 @@ impl Default for LogConfig {
     }
 }
 
+impl Config {
+    /// Effective `dev_tokens`: an explicit setting wins; otherwise on only when no admin
+    /// password is configured.
+    pub fn dev_tokens_enabled(&self) -> bool {
+        self.dev_tokens.unwrap_or(self.admin_password.is_none())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             api_version: default_api_version(),
             listen: default_listen(),
             sip_listen: default_sip_listen(),
-            require_sip_auth: false,
+            require_sip_auth: true,
             sip_realm: default_sip_realm(),
             record_calls: false,
             voicemail_enabled: true,
@@ -416,7 +428,7 @@ impl Default for Config {
             sip_tls_cert: None,
             sip_tls_key: None,
             jwt_secret: None,
-            dev_tokens: default_true(),
+            dev_tokens: None,
             database_url: None,
             data_dir: default_data_dir(),
             sounds_dir: None,
@@ -450,7 +462,7 @@ fn default_media_ip() -> IpAddr {
 }
 
 fn default_no_answer_rings() -> u32 {
-    5
+    3
 }
 
 fn default_data_dir() -> String {
@@ -549,6 +561,24 @@ fn reject_inline_secrets(raw: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_defaults() {
+        let cfg = Config::from_yaml("{}").unwrap();
+        assert!(cfg.require_sip_auth);
+        assert!(cfg.voicemail_enabled);
+        assert_eq!(cfg.no_answer_rings, 3);
+        // dev_tokens follows admin_password unless set explicitly.
+        assert!(cfg.dev_tokens_enabled());
+        let with_admin =
+            Config::from_yaml("admin_password: { ref_uri: \"env://X\" }").unwrap();
+        assert!(!with_admin.dev_tokens_enabled());
+        let forced = Config::from_yaml(
+            "dev_tokens: true\nadmin_password: { ref_uri: \"env://X\" }",
+        )
+        .unwrap();
+        assert!(forced.dev_tokens_enabled());
+    }
 
     #[test]
     fn empty_yaml_is_defaults() {

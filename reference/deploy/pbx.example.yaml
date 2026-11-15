@@ -14,10 +14,11 @@
 # ── Network ──────────────────────────────────────────────────────────────────
 listen:      "0.0.0.0:8080"     # HTTP API + phone auto-provisioning (/provision)
 sip_listen:  "0.0.0.0:5060"     # SIP/UDP ingress (null disables the SIP plane)
-media_ip:    "127.0.0.1"        # RTP address advertised to phones. 127.0.0.1 = LOCAL TEST ONLY:
-                                # real phones will connect with NO AUDIO. Set it to THIS host's
-                                # LAN IP. It is also written into provisioned phone configs as the
-                                # SIP registrar, so phones both send RTP and REGISTER here.
+media_ip:    "127.0.0.1"        # RTP address advertised to phones. Left at loopback (or unset), commosd
+                                # AUTODETECTS this host's default-route LAN IPv4 at startup (and logs
+                                # a loud WARN if it cannot, since phones would then get NO AUDIO).
+                                # Pin it here on multi-homed hosts. It is also written into
+                                # provisioned phone configs as the SIP registrar.
 #
 # Multi-homed host? Pin SIP + media to the phone-facing interface, and leave the HTTP API on all
 # interfaces so you can still administer it from a management network:
@@ -54,7 +55,7 @@ srtp:              true    # encrypt RTP (SRTP/SDES) when a phone offers RTP/SAV
 trunk_srtp:        false   # also offer SRTP to a carrier trunk. Off keeps the carrier leg plaintext so trunk calls never break.
 record_calls:      false   # capture call audio as stored objects on hangup.
 voicemail_enabled: true    # record-on-no-answer for internal extensions, plus MWI.
-no_answer_rings:   5       # rings before an unanswered call diverts to voicemail (~6s each, so 5 ≈ 30s).
+no_answer_rings:   3       # rings before an unanswered call diverts to voicemail (~6s each, so 3 ≈ 20s).
 on_decline:        announce # a caller whose call is *actively declined* (Decline/Reject button):
                            #   announce = play "unavailable", then offer voicemail (press 1) or hang up (default)
                            #   voicemail = divert straight to voicemail, same as a no-answer
@@ -72,7 +73,8 @@ on_decline:        announce # a caller whose call is *actively declined* (Declin
 #   # username: "commos"                                   # optional AUTH LOGIN username…
 #   # password: { ref_uri: "file:///run/secrets/smtp_pw" } # …paired with a referenced password.
 #   attach_audio: true        # attach the message as a WAV (μ-law).
-#   mailboxes:                # extension number → recipient(s); comma-separate for several.
+#   mailboxes:                # extension number → recipient(s); comma-separate for several. A mailbox NOT listed
+#                             # falls back to the owning user's directory email (matched by extension label / name).
 #     "100": "alice@example.com"
 #     "101": "bob@example.com, team@example.com"
 
@@ -82,9 +84,9 @@ on_decline:        announce # a caller whose call is *actively declined* (Declin
 # phone provisioning just work; from a PUBLIC address those are refused (a signed JWT is required
 # for /v1, an admin session for privileged routes, and SIP auth is auto-required). A JWT signing
 # secret is auto-generated at {data_dir}/secrets/jwt.key if `jwt_secret` is unset.
-require_sip_auth: false     # true → ALWAYS require SIP digest auth. Even when false, auth is auto-required for any non-LAN source.
+require_sip_auth: true      # DEFAULT true: every extension gets a SIP secret at onboarding/provisioning. false = LAN bench only (auto-required for non-LAN sources regardless). REGISTER for a non-existent extension is always rejected.
 sip_realm:        "commos"  # digest realm presented in the auth challenge.
-dev_tokens:       true      # accept the `tenant:<uuid>` dev bearer — honoured from LAN/loopback peers only, never from a public address.
+# dev_tokens:     true      # accept the `tenant:<uuid>` dev bearer (LAN/loopback peers only). Unset → true ONLY when no admin_password is set, false once one is.
 # jwt_secret:     { ref_uri: "env://COMMOS_JWT_SECRET" }            # override the auto-generated HS256 signing key for /v1 bearer tokens.
 # admin_password: { ref_uri: "file:///etc/commos/admin_password" }  # gates admin AND the operator console.
 #   When set, the console (/dashboard, /onboarding, /metrics, /info, /_introspect) requires HTTP

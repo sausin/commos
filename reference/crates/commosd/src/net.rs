@@ -20,6 +20,27 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Choose the IP advertised for media. Pure selection logic (the probe is done by the caller):
+/// an explicit non-loopback `configured` address always wins; otherwise a `detected` non-loopback
+/// LAN address replaces the loopback default, unless SIP only listens on loopback (a local
+/// bench, where loopback is correct). Falls back to `configured`.
+pub fn select_media_ip(
+    configured: IpAddr,
+    detected: Option<IpAddr>,
+    sip_listen: Option<IpAddr>,
+) -> IpAddr {
+    if !configured.is_loopback() && !configured.is_unspecified() {
+        return configured;
+    }
+    if sip_listen.is_some_and(|ip| ip.is_loopback()) {
+        return configured;
+    }
+    match detected {
+        Some(ip) if !ip.is_loopback() && !ip.is_unspecified() => ip,
+        _ => configured,
+    }
+}
+
 /// Is this IP on a trusted network (loopback, private, or link-local)?
 ///
 /// Trusted ⇒ the request originated on the local host or the private LAN CommOS is deployed
@@ -76,6 +97,23 @@ fn is_link_local_v6(v6: &Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn media_ip_selection() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.10".parse().unwrap();
+        let pinned: IpAddr = "10.0.0.5".parse().unwrap();
+        let any: Option<IpAddr> = Some("0.0.0.0".parse().unwrap());
+        // Explicit non-loopback wins over detection.
+        assert_eq!(select_media_ip(pinned, Some(lan), any), pinned);
+        // Loopback default is replaced by the detected LAN IP.
+        assert_eq!(select_media_ip(lo, Some(lan), any), lan);
+        // Nothing detected / detected loopback -> stays loopback.
+        assert_eq!(select_media_ip(lo, None, any), lo);
+        assert_eq!(select_media_ip(lo, Some(lo), any), lo);
+        // Loopback-only SIP bench keeps loopback.
+        assert_eq!(select_media_ip(lo, Some(lan), Some(lo)), lo);
+    }
+
     use super::*;
 
     #[test]

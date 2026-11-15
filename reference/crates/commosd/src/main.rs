@@ -61,7 +61,7 @@ fn main() {
         Err(code) => std::process::exit(code),
     };
 
-    let cfg = match Config::load(&config_path) {
+    let mut cfg = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             // Logging may not be up yet; write plainly to stderr.
@@ -78,6 +78,24 @@ fn main() {
     };
 
     telemetry::init(&cfg.log);
+
+    // media_ip autodetect: a loopback/unset media_ip silently breaks audio for real phones, so
+    // swap in the default-route LAN IPv4 when we can find one.
+    {
+        let detected = control::onboarding::primary_host_ip();
+        let chosen = net::select_media_ip(cfg.media_ip, detected, cfg.sip_listen.map(|a| a.ip()));
+        if chosen != cfg.media_ip {
+            tracing::info!(configured = %cfg.media_ip, media_ip = %chosen, "media_ip autodetected (default-route LAN address)");
+            cfg.media_ip = chosen;
+        }
+        if cfg.media_ip.is_loopback() && cfg.sip_listen.is_some_and(|a| !a.ip().is_loopback()) {
+            tracing::warn!(
+                media_ip = %cfg.media_ip,
+                "media_ip is still LOOPBACK and could not be autodetected: phones will connect but \
+                 there will be NO AUDIO. Set `media_ip` in pbx.yaml to this host's LAN IP."
+            );
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -237,9 +255,13 @@ async fn run(cfg: Config) -> i32 {
             }
         },
     };
-    let auth = api::auth::AuthConfig { jwt_secret, dev_tokens: cfg.dev_tokens };
+    let dev_tokens = cfg.dev_tokens_enabled();
+    let auth = api::auth::AuthConfig { jwt_secret, dev_tokens };
     if auth.jwt_secret.is_some() {
-        tracing::info!(dev_tokens = cfg.dev_tokens, "bearer auth: HS256 JWT verification enabled");
+        tracing::info!(dev_tokens, "bearer auth: HS256 JWT verification enabled");
+    }
+    if dev_tokens && cfg.admin_password.is_some() {
+        tracing::warn!("dev_tokens is explicitly enabled although an admin_password is set: the tenant:<uuid> bearer bypasses it");
     }
 
     // Admin auth: resolve the admin password (if referenced). When set, the privileged setup

@@ -97,6 +97,22 @@ impl SipServer {
         self.require_auth || !crate::net::is_trusted_ip(&src.ip())
     }
 
+    /// Does an Extension with this dial `number` exist for the SIP tenant? (A REGISTER for an
+    /// unknown extension is refused regardless of `require_auth`.)
+    pub(super) async fn extension_exists(&self, number: &str) -> Result<bool, crate::store::StoreError> {
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.store.list_extensions(self.default_tenant, 500, cursor).await?;
+            if page.items.iter().any(|e| e.number.eq_ignore_ascii_case(number)) {
+                return Ok(true);
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Send a `401 Unauthorized` with a fresh digest challenge, prompting the phone to
     /// re-send the request with an `Authorization` header.
     pub(super) async fn send_challenge(
