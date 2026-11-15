@@ -18,8 +18,10 @@ use crate::sip::transport::Responder;
 /// Shortest / longest subscription lifetime we grant (seconds); `0` means unsubscribe.
 pub const MIN_EXPIRES: u64 = 60;
 pub const MAX_EXPIRES: u64 = 3600;
-/// Maximum live subscriptions per watcher (the `From` user) and in total.
+/// Maximum live subscriptions per watcher (the authenticated digest username, or the source
+/// address when auth is off), per source IP, and in total.
 pub const MAX_PER_WATCHER: usize = 200;
+pub const MAX_PER_IP: usize = 1000;
 pub const MAX_TOTAL: usize = 10_000;
 
 /// Clamp a requested lifetime into the granted range (`0` is preserved = terminate).
@@ -82,8 +84,11 @@ pub struct Subscription {
     pub event: EventKind,
     /// The watched extension (user-part).
     pub target: String,
-    /// The watching identity (From user-part), for the per-watcher cap.
+    /// The watching identity for the per-watcher cap: the authenticated digest username
+    /// (never the attacker-controlled `From`), or `ip:port` of the source when auth is off.
     pub watcher: String,
+    /// Source IP of the SUBSCRIBE, for the per-IP cap.
+    pub src_ip: std::net::IpAddr,
     /// NOTIFY `From` header value (the SUBSCRIBE's `To` with our tag).
     pub local_hdr: String,
     /// NOTIFY `To` header value (the SUBSCRIBE's `From`, with the subscriber's tag).
@@ -200,7 +205,8 @@ impl BlfHub {
             return Ok(());
         }
         let per_watcher = g.subs.values().filter(|s| s.watcher == sub.watcher).count();
-        if per_watcher >= MAX_PER_WATCHER || g.subs.len() >= MAX_TOTAL {
+        let per_ip = g.subs.values().filter(|s| s.src_ip == sub.src_ip).count();
+        if per_watcher >= MAX_PER_WATCHER || per_ip >= MAX_PER_IP || g.subs.len() >= MAX_TOTAL {
             return Err(BlfError::TooManySubscriptions);
         }
         g.subs.insert(sub.key.clone(), sub);
@@ -279,6 +285,28 @@ impl BlfHub {
                 if let Some(c) = g.calls.get_mut(call_id) {
                     if c.state != new {
                         c.state = new;
+                        changed.push(c.from.clone());
+                        changed.push(c.to.clone());
+                    }
+                }
+            }
+            "CallTransferred" => {
+                // `from_ref` is the transferor (Referred-By), `to_ref` the new target. The
+                // transferor's leg is replaced by the target; the other party stays.
+                let get =
+                    |k: &str| data.and_then(|d| d.get(k)).and_then(|v| v.as_str()).and_then(ext_of);
+                if let (Some(c), Some(target)) = (g.calls.get_mut(call_id), get("to_ref")) {
+                    let transferor = get("from_ref");
+                    let old = if transferor.as_deref() == Some(c.to.as_str()) {
+                        Some(std::mem::replace(&mut c.to, target.clone()))
+                    } else if transferor.as_deref() == Some(c.from.as_str()) {
+                        Some(std::mem::replace(&mut c.from, target.clone()))
+                    } else {
+                        None
+                    };
+                    if let Some(old) = old {
+                        changed.push(old);
+                        changed.push(target);
                         changed.push(c.from.clone());
                         changed.push(c.to.clone());
                     }
@@ -393,6 +421,7 @@ mod tests {
             event: EventKind::Dialog,
             target: target.into(),
             watcher: watcher.into(),
+            src_ip: "127.0.0.1".parse().unwrap(),
             local_hdr: "<sip:200@h>;tag=l".into(),
             remote_hdr: "<sip:100@h>;tag=r".into(),
             remote_uri: "sip:100@10.0.0.1".into(),
@@ -463,6 +492,34 @@ mod tests {
         // Unknown call / unrelated events are no-ops.
         assert!(hub.on_event(&ev("CallEnded", "zz", "", "")).is_empty());
         assert!(hub.on_event(&json!({"type": "X"})).is_empty());
+    }
+
+    #[test]
+    fn transfer_moves_the_lamp_to_the_target() {
+        let hub = BlfHub::new();
+        hub.on_event(&ev("CallStarted", "c1", "100", "200"));
+        hub.on_event(&ev("CallAnswered", "c1", "", ""));
+        // 200 (callee) blind-transfers 100 to 300.
+        let ch = hub.on_event(&ev("CallTransferred", "c1", "sip:200@h", "sip:300@h"));
+        assert_eq!(ch, vec!["100", "200", "300"]);
+        assert!(hub.dialogs_for("200").is_empty());
+        assert_eq!(hub.dialogs_for("300").len(), 1);
+        assert_eq!(hub.dialogs_for("100")[0].remote, "300");
+        // Unknown transferor: no change.
+        assert!(hub.on_event(&ev("CallTransferred", "c1", "999", "400")).is_empty());
+    }
+
+    #[test]
+    fn per_ip_cap_applies_across_watcher_identities() {
+        let hub = BlfHub::new();
+        let now = Instant::now();
+        for i in 0..MAX_PER_IP {
+            hub.subscribe(sub(&format!("c{i}"), &format!("w{i}"), "200", 60, now)).unwrap();
+        }
+        assert_eq!(
+            hub.subscribe(sub("over", "fresh", "200", 60, now)),
+            Err(BlfError::TooManySubscriptions)
+        );
     }
 
     #[test]

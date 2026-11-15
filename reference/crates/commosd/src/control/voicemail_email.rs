@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use commos_core::common::Uuid;
+use commos_core::entities::user::User;
 
 use crate::bus::EventBus;
 use crate::control::smtp::{self, Attachment, Email, SmtpTransport};
@@ -137,9 +138,12 @@ impl VoicemailEmailer {
         Ok(true)
     }
 
-    /// The directory email of the user who owns extension `number`. An Extension carries no
-    /// user link, so the owner is the User whose `display_name` equals the extension's `label`
-    /// (or the onboarding default `"Extension <number>"`) and who has an email address.
+    /// The directory email of the user who owns extension `number`.
+    ///
+    /// Preferred: the explicit link the admin console writes - an `ext:<number>` entry in
+    /// `User.capabilities`. Fallback: the User whose `display_name` equals the extension's
+    /// `label` (or the onboarding default `"Extension <number>"`), used only when exactly one
+    /// user matches (names are not unique). Ambiguity => no email is sent (logged).
     async fn owner_email(&self, tenant: Uuid, number: &str) -> anyhow::Result<Option<String>> {
         let mut names: Vec<String> = vec![format!("Extension {number}")];
         let mut cursor: Option<String> = None;
@@ -156,21 +160,17 @@ impl VoicemailEmailer {
                 break;
             }
         }
+        let mut users = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let page = self.store.list_users(tenant, 500, cursor).await?;
-            for name in &names {
-                if let Some(u) = page.items.iter().find(|u| &u.display_name == name) {
-                    if let Some(email) = u.email.as_ref().filter(|e| !e.trim().is_empty()) {
-                        return Ok(Some(email.trim().to_string()));
-                    }
-                }
-            }
+            users.extend(page.items);
             cursor = page.next_cursor;
             if cursor.is_none() {
-                return Ok(None);
+                break;
             }
         }
+        Ok(pick_owner_email(&users, number, &names))
     }
 
     /// Look up the mailbox + recipients for a voicemail, or `None` if it is not deliverable.
@@ -239,6 +239,69 @@ fn user_part(uri: &str) -> Option<String> {
         .trim_start_matches("tel:");
     let user = s.split(['@', ';', '>']).next().unwrap_or(s).trim();
     (!user.is_empty()).then(|| user.to_string())
+}
+
+/// Pure owner selection for `owner_email`; see its docs for the policy.
+fn pick_owner_email(users: &[User], number: &str, names: &[String]) -> Option<String> {
+    let email_of = |u: &User| {
+        u.email.as_ref().map(|e| e.trim()).filter(|e| !e.is_empty()).map(str::to_string)
+    };
+    let link = format!("ext:{number}");
+    let linked: Vec<&User> =
+        users.iter().filter(|u| u.capabilities.contains(&link)).collect();
+    if !linked.is_empty() {
+        let mut emails: Vec<String> = linked.iter().filter_map(|u| email_of(u)).collect();
+        emails.sort();
+        emails.dedup();
+        return match emails.len() {
+            1 => emails.pop(),
+            0 => None,
+            _ => {
+                tracing::warn!(%number, "several users are linked to this extension; not sending voicemail email");
+                None
+            }
+        };
+    }
+    let matches: Vec<&User> =
+        users.iter().filter(|u| names.iter().any(|n| &u.display_name == n)).collect();
+    match matches.len() {
+        0 => None,
+        1 => email_of(matches[0]),
+        _ => {
+            tracing::warn!(%number, "display-name match is ambiguous; not sending voicemail email");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn user(name: &str, email: &str, caps: &[&str]) -> User {
+        let mut u = User::new(Uuid::now_v7(), name);
+        u.email = Some(email.into());
+        u.capabilities = caps.iter().map(|c| c.to_string()).collect();
+        u
+    }
+
+    #[test]
+    fn explicit_ext_link_wins_over_display_name() {
+        let users = vec![
+            user("Sam", "wrong@x", &[]),
+            user("Samantha", "right@x", &["ext:200"]),
+        ];
+        assert_eq!(pick_owner_email(&users, "200", &["Sam".into()]).as_deref(), Some("right@x"));
+    }
+
+    #[test]
+    fn display_name_only_when_unique() {
+        let names = vec!["Sam".to_string()];
+        let one = vec![user("Sam", "a@x", &[])];
+        assert_eq!(pick_owner_email(&one, "200", &names).as_deref(), Some("a@x"));
+        let two = vec![user("Sam", "a@x", &[]), user("Sam", "b@x", &[])];
+        assert_eq!(pick_owner_email(&two, "200", &names), None);
+    }
 }
 
 #[cfg(test)]

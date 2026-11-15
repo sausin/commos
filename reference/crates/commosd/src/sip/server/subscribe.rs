@@ -128,6 +128,36 @@ impl SipServer {
         for ext in self.blf.on_event(event) {
             self.notify_extension(&ext).await;
         }
+        if event.get("type").and_then(|v| v.as_str()) == Some("VoicemailReceived") {
+            self.notify_mailbox_of(event).await;
+        }
+    }
+
+    /// A voicemail was deposited: push a fresh MWI NOTIFY to the mailbox's
+    /// `message-summary` watchers. (The mailbox is the deposit Call's dialled extension.)
+    async fn notify_mailbox_of(&self, event: &serde_json::Value) {
+        let Some(id) = event
+            .get("data")
+            .and_then(|d| d.get("voicemail_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse(s).ok())
+        else {
+            return;
+        };
+        let Ok(vm) = self.voicemails.get(self.default_tenant, id).await else { return };
+        let Some(call_id) = vm.call_id else { return };
+        let Ok(Some(call)) = self.store.get_call(self.default_tenant, call_id).await else {
+            return;
+        };
+        let Some(ext) = blf::ext_of(&call.to_ref) else { return };
+        self.notify_mailbox(&ext).await;
+    }
+
+    /// NOTIFY every `message-summary` watcher of mailbox `ext` (case-insensitive match).
+    pub(crate) async fn notify_mailbox(&self, ext: &str) {
+        for key in self.blf.watchers_of(ext, EventKind::MessageSummary) {
+            self.notify_one(&key).await;
+        }
     }
 
     /// Terminate and NOTIFY every subscription whose lifetime has elapsed.
@@ -179,10 +209,17 @@ impl SipServer {
             return resp.send(r.as_bytes()).await;
         };
 
-        if self.auth_required_from(src) && self.digest_ok(msg, "SUBSCRIBE").await.is_none() {
-            tracing::info!(%src, "SIP SUBSCRIBE challenged (digest auth required)");
-            return self.send_challenge(resp, msg).await;
+        // The watcher identity is the *authenticated* digest username — never the
+        // attacker-controlled From user — or the source address when auth is off.
+        let mut authed_user: Option<String> = None;
+        if self.auth_required_from(src) {
+            authed_user = self.digest_ok(msg, "SUBSCRIBE").await;
+            if authed_user.is_none() {
+                tracing::info!(%src, "SIP SUBSCRIBE challenged (digest auth required)");
+                return self.send_challenge(resp, msg).await;
+            }
         }
+        let watcher = authed_user.map(|u| format!("user:{u}")).unwrap_or_else(|| format!("addr:{src}"));
 
         let (Some(call_id), Some(from_tag), Some(from_hdr), Some(to_hdr)) = (
             msg.call_id(),
@@ -249,7 +286,8 @@ impl SipServer {
             key: key.clone(),
             event,
             target: target.clone(),
-            watcher: blf::ext_of(&from_aor).unwrap_or_else(|| src.ip().to_string()),
+            watcher,
+            src_ip: src.ip(),
             local_hdr: format!("{to_hdr};tag={local_tag}"),
             remote_hdr: from_hdr.to_string(),
             remote_uri: msg.contact_uri().unwrap_or_else(|| from_aor.clone()),
