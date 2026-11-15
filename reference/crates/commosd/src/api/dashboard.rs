@@ -6,15 +6,24 @@
 //! `/_introspect/events`) and, with an operator-supplied bearer token, the versioned
 //! `/v1/*` workload resources (calls, video rooms, presence, registrations, messaging).
 //!
-//! It is mounted unauthenticated at `GET /dashboard`; the token the operator pastes is
-//! used only client-side as the `Authorization` header on `/v1` fetches. Nothing here is
-//! part of the frozen contract.
+//! It is mounted behind `console_guard`; the page embeds the bearer it needs for `/v1` fetches
+//! (a fresh admin session when an admin password is configured, the dev tenant token in dev
+//! mode — see [`super::console::page_bearer`]). Nothing here is part of the frozen contract.
 
-use axum::response::Html;
+use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderValue};
+use axum::response::{IntoResponse, Response};
+
+use crate::state::AppState;
 
 /// `GET /dashboard` — the self-contained operations dashboard page.
-pub async fn dashboard() -> Html<String> {
-    Html(PAGE.to_string())
+pub async fn dashboard(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let html = PAGE.replacen(super::console::BEARER_MARK, &super::console::page_bearer(&st, &headers), 1);
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        axum::response::Html(html),
+    )
+        .into_response()
 }
 
 /// The complete page. Inline `<style>` + `<script>`, zero external requests.
@@ -233,11 +242,6 @@ const PAGE: &str = r####"<!doctype html>
   </div>
 
   <div class="controls">
-    <div class="field">
-      <label for="token">Bearer token (tenant:&lt;uuidv7&gt;)</label>
-      <input id="token" spellcheck="false" autocomplete="off"
-             value="tenant:01920000-0000-7000-8000-000000000001">
-    </div>
     <div class="btns">
       <button class="primary" id="btnCall">Originate test call</button>
       <button id="btnMsg">Send test message</button>
@@ -286,7 +290,7 @@ const PAGE: &str = r####"<!doctype html>
 
   var POLL_MS = 2000;
   var $ = function (id) { return document.getElementById(id); };
-  var tokenEl = $("token");
+  var BEARER = "@@COMMOS_BEARER@@";
 
   // ---- tiny DOM helpers (textContent only — never innerHTML for data) ----
   function el(tag, cls, text) {
@@ -349,7 +353,7 @@ const PAGE: &str = r####"<!doctype html>
 
   // ---- fetch wrappers ----
   function bearer() {
-    return { "Authorization": "Bearer " + (tokenEl.value || "").trim() };
+    return { "Authorization": "Bearer " + BEARER };
   }
   function getOp(path) { // unauthenticated operational endpoints
     return fetch(path, { headers: { "Accept": "application/json" } });

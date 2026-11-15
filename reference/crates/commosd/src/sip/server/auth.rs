@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Minimum age before a cached extension-number set is re-read after a miss.
+const EXT_CACHE_MIN_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
+
+type ExtCache = std::sync::Mutex<HashMap<(usize, Uuid), (std::time::Instant, std::collections::HashSet<String>)>>;
+
+fn ext_cache() -> &'static ExtCache {
+    static CACHE: std::sync::OnceLock<ExtCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 impl SipServer {
     /// How long a challenge nonce stays valid (seconds).
     const NONCE_TTL: i64 = 300;
@@ -99,18 +109,43 @@ impl SipServer {
 
     /// Does an Extension with this dial `number` exist for the SIP tenant? (A REGISTER for an
     /// unknown extension is refused regardless of `require_auth`.)
+    ///
+    /// The store has no lookup-by-number, so the (lower-cased) number set is cached briefly
+    /// instead of paging the whole table on every REGISTER. A number missing from a cache older
+    /// than [`EXT_CACHE_MIN_REFRESH`] triggers a refresh, so a newly added extension is picked up
+    /// within seconds while a flood of REGISTERs for random numbers costs at most one scan per
+    /// interval.
     pub(super) async fn extension_exists(&self, number: &str) -> Result<bool, crate::store::StoreError> {
+        let key = (Arc::as_ptr(&self.store) as *const () as usize, self.default_tenant);
+        let want = number.to_ascii_lowercase();
+        {
+            let g = ext_cache().lock().expect("ext cache mutex");
+            if let Some((at, set)) = g.get(&key) {
+                if set.contains(&want) {
+                    return Ok(true);
+                }
+                if at.elapsed() < EXT_CACHE_MIN_REFRESH {
+                    return Ok(false);
+                }
+            }
+        }
+        let mut set = std::collections::HashSet::new();
         let mut cursor: Option<String> = None;
         loop {
             let page = self.store.list_extensions(self.default_tenant, 500, cursor).await?;
-            if page.items.iter().any(|e| e.number.eq_ignore_ascii_case(number)) {
-                return Ok(true);
-            }
+            set.extend(page.items.iter().map(|e| e.number.to_ascii_lowercase()));
             cursor = page.next_cursor;
             if cursor.is_none() {
-                return Ok(false);
+                break;
             }
         }
+        let found = set.contains(&want);
+        let mut g = ext_cache().lock().expect("ext cache mutex");
+        if g.len() > 16 {
+            g.retain(|_, (at, _)| at.elapsed() < EXT_CACHE_MIN_REFRESH);
+        }
+        g.insert(key, (std::time::Instant::now(), set));
+        Ok(found)
     }
 
     /// Send a `401 Unauthorized` with a fresh digest challenge, prompting the phone to

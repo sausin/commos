@@ -93,9 +93,23 @@ async fn console_guard(
         )
             .into_response();
     }
-    // Configured: require HTTP Basic auth matching the admin password.
-    if basic_auth_password(req.headers()).is_some_and(|pw| admin.verify_password(&pw)) {
-        return next.run(req).await;
+    // Configured: require HTTP Basic auth matching the admin password, behind the same per-IP
+    // brute-force lockout as `/admin/login` (a locked IP is refused before any password check).
+    let ip = peer.ip();
+    if let Some(secs) = admin.lockout_remaining(ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, secs.to_string())],
+            "too many failed attempts\n",
+        )
+            .into_response();
+    }
+    if let Some(pw) = basic_auth_password(req.headers()) {
+        if admin.verify_password(&pw) {
+            admin.record_success(ip);
+            return next.run(req).await;
+        }
+        admin.record_failure(ip);
     }
     (
         StatusCode::UNAUTHORIZED,

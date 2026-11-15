@@ -22,18 +22,19 @@ use crate::control::configexport::{self, ImportSummary, PbxConfig};
 use crate::state::AppState;
 
 use super::admin::AdminContext;
-use super::auth::TenantContext;
 use super::problem::Problem;
 
 /// `GET /v1/config` — export this tenant's configuration as `pbx.yaml`.
 ///
 /// Returns the YAML with `content-type: text/yaml`. The output is deterministic
 /// (CMOS-14-DEP-081), so committing it to Git and re-exporting produces no spurious diff.
+/// Admin-only, and carrier credentials (`trunks[].auth`) are redacted; an import carrying the
+/// placeholder (or no `auth`) keeps the stored credentials.
 pub async fn export_config(
     State(st): State<AppState>,
-    tenant: TenantContext,
+    admin: AdminContext,
 ) -> Result<impl IntoResponse, Problem> {
-    let cfg = configexport::export(&st.store, tenant.tenant_id)
+    let cfg = configexport::export(&st.store, admin.tenant_id)
         .await
         .map_err(|e| Problem::internal(e.to_string()))?;
     let yaml = configexport::to_yaml(&cfg).map_err(|e| Problem::internal(e.to_string()))?;
@@ -53,6 +54,7 @@ pub async fn import_config(
 ) -> Result<Json<ImportSummary>, Problem> {
     let cfg: PbxConfig = serde_yaml::from_str(&body)
         .map_err(|e| Problem::bad_request(format!("invalid pbx.yaml: {e}")))?;
+    configexport::validate_schedules(admin.tenant_id, &cfg).map_err(Problem::bad_request)?;
     let summary = configexport::import(&st.store, admin.tenant_id, &cfg)
         .await
         .map_err(|e| Problem::internal(e.to_string()))?;
