@@ -37,27 +37,18 @@ impl SipServer {
             }
         };
 
-        // Only extensions that exist may register, independent of the auth setting: this stops
-        // anyone squatting an arbitrary number on a zero-config box. De-registration of an
-        // already-unknown AoR is harmless, but is rejected the same way for simplicity.
-        match user_part(&aor) {
-            Some(number) => match self.extension_exists(number).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::info!(%src, %aor, "SIP REGISTER rejected: unknown extension");
-                    return self.reply(resp, msg, 404, "Not Found").await;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "SIP REGISTER: extension lookup failed");
-                    return self.reply(resp, msg, 500, "Server Internal Error").await;
-                }
-            },
-            None => return self.reply(resp, msg, 400, "Bad Request").await,
-        }
+        let Some(number) = user_part(&aor) else {
+            return self.reply(resp, msg, 400, "Bad Request").await;
+        };
 
         // Digest auth gate (Volume 9): an unauthenticated REGISTER is challenged with 401 +
         // WWW-Authenticate; the phone re-sends with credentials we verify against its stored
         // per-device secret. Auth is enforced when configured, and always for a public source.
+        //
+        // The challenge is sent *before* any extension-existence check so that an unauthenticated
+        // prober cannot tell real extensions from unknown ones (404 vs 401): an unknown number gets
+        // the same 401 as a real one, and can never authenticate (no credential), so it is simply
+        // re-challenged exactly like a wrong password.
         let authed_user = if self.auth_required_from(src) {
             match self.digest_ok(msg, "REGISTER").await {
                 Some(user) => Some(user),
@@ -69,6 +60,25 @@ impl SipServer {
         } else {
             None
         };
+
+        // Only extensions that exist may register, independent of the auth setting: this stops
+        // anyone squatting an arbitrary number on a zero-config box. With auth off the caller is
+        // a trusted LAN peer, so a plain 404 is fine; an authenticated caller gets 403.
+        match self.extension_exists(number).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(%src, %aor, "SIP REGISTER rejected: unknown extension");
+                return if authed_user.is_some() {
+                    self.reply(resp, msg, 403, "Forbidden").await
+                } else {
+                    self.reply(resp, msg, 404, "Not Found").await
+                };
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "SIP REGISTER: extension lookup failed");
+                return self.reply(resp, msg, 500, "Server Internal Error").await;
+            }
+        }
 
         // Identity binding: a device authenticated as `user` may only register its own AoR. This
         // stops a device that holds one extension's credential from hijacking another extension's
@@ -192,5 +202,122 @@ impl SipServer {
             }
         }
         self.reply(resp, msg, 200, "OK").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::ivr::IvrService;
+    use crate::control::objects::ObjectService;
+    use crate::control::policy::PolicyLimits;
+    use crate::control::recordings::RecordingService;
+    use crate::media::LoopbackMedia;
+    use crate::objectstore::{LocalObjectStore, ObjectStore};
+    use crate::relay::RelaySignal;
+    use crate::store::MemStore;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    async fn test_server(require_auth: bool) -> Arc<SipServer> {
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
+        let tenant = Uuid::now_v7();
+        store
+            .commit(crate::store::Tx {
+                extensions: vec![commos_core::entities::extension::Extension::new(tenant, "200", Uuid::now_v7())],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let signal = RelaySignal::new();
+        let routing = Routing::new(
+            store.clone(),
+            Arc::new(LoopbackMedia::new(tx)),
+            signal.clone(),
+            PolicyLimits::default(),
+            "1",
+        );
+        let root = std::env::temp_dir().join(format!("commos-reg-{}", Uuid::now_v7()));
+        let blob: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(root));
+        let objects = ObjectService::new(blob, store.clone(), signal.clone());
+        Arc::new(SipServer::new(
+            RegistrationRegistry::new(),
+            routing,
+            "127.0.0.1".parse().unwrap(),
+            tenant,
+            store.clone(),
+            require_auth,
+            "commos",
+            false,
+            RecordingService::new(objects.clone(), store.clone(), signal.clone()),
+            false,
+            OnDecline::default(),
+            5,
+            VoicemailService::new(objects.clone(), store.clone(), signal.clone()),
+            IvrService::new(store.clone(), signal.clone()),
+            objects,
+            "1",
+            false,
+            false,
+            "/nonexistent",
+            "/nonexistent/display_name.txt",
+            Arc::new(crate::sip::moh::MohSource::synth()),
+            false,
+        ))
+    }
+
+    /// Send one REGISTER for `ext` and return the response status.
+    async fn register_status(server: &Arc<SipServer>, ext: &str) -> u16 {
+        let srv = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let msg = format!(
+            "REGISTER sip:127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5999;branch=z9hG4bKr{ext}\r\n\
+             From: <sip:{ext}@127.0.0.1>;tag=a\r\nTo: <sip:{ext}@127.0.0.1>\r\nCall-ID: reg-{ext}\r\n\
+             CSeq: 1 REGISTER\r\nContact: <sip:{ext}@127.0.0.1:5999>\r\nExpires: 60\r\nContent-Length: 0\r\n\r\n"
+        );
+        let r = Responder::Udp { socket: srv, dst: phone.local_addr().unwrap() };
+        server.handle(&r, msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), phone.recv_from(&mut buf))
+            .await
+            .expect("response expected")
+            .unwrap();
+        message::parse(&buf[..n]).unwrap().status().unwrap()
+    }
+
+    #[tokio::test]
+    async fn register_does_not_reveal_which_extensions_exist_when_auth_required() {
+        let server = test_server(true).await;
+        // Known and unknown extensions are indistinguishable: both challenged with 401.
+        assert_eq!(register_status(&server, "200").await, 401);
+        assert_eq!(register_status(&server, "999").await, 401);
+    }
+
+    #[tokio::test]
+    async fn register_unknown_extension_is_404_only_without_auth() {
+        let server = test_server(false).await;
+        assert_eq!(register_status(&server, "999").await, 404);
+        assert_eq!(register_status(&server, "200").await, 200);
+    }
+
+    #[tokio::test]
+    async fn extension_exists_uses_a_cached_number_set() {
+        let server = test_server(false).await;
+        assert!(server.extension_exists("200").await.unwrap());
+        assert!(!server.extension_exists("201").await.unwrap());
+        // A just-created extension is not visible within the refresh window (served from cache)...
+        server
+            .store
+            .commit(crate::store::Tx {
+                extensions: vec![commos_core::entities::extension::Extension::new(
+                    server.default_tenant, "201", Uuid::now_v7())],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!server.extension_exists("201").await.unwrap(), "no rescan inside the window");
+        // ...but known numbers keep answering from the cache, case-insensitively.
+        assert!(server.extension_exists("200").await.unwrap());
     }
 }

@@ -91,6 +91,8 @@ struct LoginAttempts {
     fails: u32,
     /// Unix seconds until which this IP is locked out (0 = not locked).
     locked_until: i64,
+    /// Unix seconds of the most recent failure (entries with fails > 0 expire this long after).
+    last_fail: i64,
 }
 
 /// Ephemeral admin authentication state, held on `AppState` by the hub.
@@ -182,21 +184,23 @@ impl AdminAuth {
 
     /// Whether `ip` is currently locked out from logging in. Returns the seconds remaining if so.
     /// Prunes expired lockouts lazily.
-    fn lockout_remaining(&self, ip: IpAddr) -> Option<i64> {
+    pub(crate) fn lockout_remaining(&self, ip: IpAddr) -> Option<i64> {
         let now = now_unix();
         let mut g = self.attempts.lock().expect("admin attempts mutex");
-        g.retain(|_, a| a.locked_until > now || a.fails > 0);
+        // Drop expired lockouts and stale partial-failure counters so the map stays bounded.
+        g.retain(|_, a| a.locked_until > now || (a.fails > 0 && now - a.last_fail < LOGIN_LOCKOUT_SECS));
         g.get(&ip)
             .filter(|a| a.locked_until > now)
             .map(|a| a.locked_until - now)
     }
 
     /// Record a failed login from `ip`, locking it out once [`MAX_LOGIN_FAILS`] is reached.
-    fn record_failure(&self, ip: IpAddr) {
+    pub(crate) fn record_failure(&self, ip: IpAddr) {
         let now = now_unix();
         let mut g = self.attempts.lock().expect("admin attempts mutex");
-        let a = g.entry(ip).or_insert(LoginAttempts { fails: 0, locked_until: 0 });
+        let a = g.entry(ip).or_insert(LoginAttempts { fails: 0, locked_until: 0, last_fail: now });
         a.fails = a.fails.saturating_add(1);
+        a.last_fail = now;
         if a.fails >= MAX_LOGIN_FAILS {
             a.locked_until = now + LOGIN_LOCKOUT_SECS;
             a.fails = 0; // reset the counter; the lockout is the penalty now
@@ -204,7 +208,7 @@ impl AdminAuth {
     }
 
     /// Clear failed-attempt state for `ip` after a successful login.
-    fn record_success(&self, ip: IpAddr) {
+    pub(crate) fn record_success(&self, ip: IpAddr) {
         self.attempts.lock().expect("admin attempts mutex").remove(&ip);
     }
 
@@ -637,6 +641,19 @@ mod tests {
         // A success clears the state.
         admin.record_success(ip);
         assert!(admin.lockout_remaining(ip).is_none());
+    }
+
+    #[test]
+    fn stale_partial_failures_are_pruned() {
+        let admin = AdminAuth::new(Some(PASSWORD.to_string()));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        admin.record_failure(ip); // 1 fail, no lockout
+        assert_eq!(admin.attempts.lock().unwrap().len(), 1);
+        admin.lockout_remaining(ip);
+        assert_eq!(admin.attempts.lock().unwrap().len(), 1, "fresh partial failures are kept");
+        admin.attempts.lock().unwrap().get_mut(&ip).unwrap().last_fail = now_unix() - LOGIN_LOCKOUT_SECS - 1;
+        admin.lockout_remaining(ip);
+        assert!(admin.attempts.lock().unwrap().is_empty(), "stale entries are removed");
     }
 
     #[test]

@@ -265,8 +265,17 @@ pub async fn reboot_extension(
 
 /// `GET /onboarding` — a self-contained setup wizard page (unauthenticated, like the
 /// dashboard). Pick an environment and fleet size; it auto-detects the rest.
-pub async fn wizard() -> Html<&'static str> {
-    Html(WIZARD_HTML)
+pub async fn wizard(
+    axum::extract::State(st): axum::extract::State<crate::state::AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let html = WIZARD_HTML.replacen(super::console::BEARER_MARK, &super::console::page_bearer(&st, &headers), 1);
+    (
+        [(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"))],
+        Html(html),
+    )
+        .into_response()
 }
 
 const WIZARD_HTML: &str = r##"<!doctype html>
@@ -311,7 +320,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 <div id="out"></div>
 </div>
 <script>
-const TOKEN="tenant:01920000-0000-7000-8000-000000000001";
+const TOKEN="@@COMMOS_BEARER@@"; // admin:<session> (configured) or tenant:<uuid> (dev), embedded per request
 // Admin session token, set after a successful /admin/login (configured deployments only).
 let ADMIN=null;
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};

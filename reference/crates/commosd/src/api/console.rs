@@ -49,6 +49,24 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Placeholder in the dashboard / wizard pages replaced by the per-request bearer.
+pub const BEARER_MARK: &str = "@@COMMOS_BEARER@@";
+
+/// The dev tenant bearer used in dev mode (no admin password).
+const DEV_BEARER: &str = "tenant:01920000-0000-7000-8000-000000000001";
+
+/// The bearer (without the `Bearer ` prefix) a console page should embed: a fresh admin session
+/// (`admin:<token>`) when an admin password is configured (the Basic guard already proved it),
+/// else the dev token. Callers must serve the page `no-store`.
+pub fn page_bearer(st: &AppState, headers: &HeaderMap) -> String {
+    if !st.admin.is_dev_mode() {
+        if let Some(token) = super::basic_auth_password(headers).and_then(|pw| st.admin.login(&pw)) {
+            return format!("admin:{token}");
+        }
+    }
+    DEV_BEARER.to_string()
+}
+
 /// `GET /admin` — serve the console.
 pub async fn page(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let mut meta = format!(
@@ -242,6 +260,53 @@ mod tests {
         assert_eq!(send(&app, Method::GET, "/admin/", LAN, None, None).await.0, StatusCode::OK);
         // The public internet is refused outright in dev mode.
         assert_eq!(send(&app, Method::GET, "/admin", PUBLIC, None, None).await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn basic_guard_locks_out_brute_force() {
+        let app = crate::api::router(state(AdminAuth::new(Some(PW.into()))));
+        let bad = basic("nope");
+        for _ in 0..5 {
+            assert_eq!(send(&app, Method::GET, "/admin", LAN, Some(&bad), None).await.0, StatusCode::UNAUTHORIZED);
+        }
+        // Locked: even the right password is refused for this IP...
+        let ok = basic(PW);
+        assert_eq!(send(&app, Method::GET, "/admin", LAN, Some(&ok), None).await.0, StatusCode::TOO_MANY_REQUESTS);
+        // ...but other IPs are unaffected, and a missing header never counts as a failure.
+        assert_eq!(send(&app, Method::GET, "/admin", "192.168.1.99:1", Some(&ok), None).await.0, StatusCode::OK);
+        for _ in 0..10 {
+            assert_eq!(send(&app, Method::GET, "/dashboard", "192.168.1.50:1", None, None).await.0, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(send(&app, Method::GET, "/dashboard", "192.168.1.50:1", Some(&ok), None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_and_wizard_embed_admin_session_when_configured() {
+        let app = crate::api::router(state(AdminAuth::new(Some(PW.into()))));
+        let ok = basic(PW);
+        for uri in ["/dashboard", "/onboarding"] {
+            let (st, h, body) = send(&app, Method::GET, uri, LAN, Some(&ok), None).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            assert_eq!(h[header::CACHE_CONTROL], "no-store");
+            assert!(!body.contains(BEARER_MARK), "{uri}: placeholder replaced");
+            assert!(!body.contains("tenant:01920000"), "{uri}: no dev token in configured mode");
+            let i = body.find("admin:").expect("admin session embedded");
+            let tok: String = body[i + 6..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            let (st, _, _) = send(&app, Method::GET, "/v1/onboarding/environments", LAN, Some(&format!("Bearer admin:{tok}")), None).await;
+            assert_eq!(st, StatusCode::OK, "{uri}: embedded session works on /v1");
+        }
+        assert!(!send(&app, Method::GET, "/dashboard", LAN, Some(&ok), None).await.2.contains("id=\"token\""));
+    }
+
+    #[tokio::test]
+    async fn dashboard_and_wizard_use_dev_token_in_dev_mode() {
+        let app = crate::api::router(state(AdminAuth::new(None)));
+        for uri in ["/dashboard", "/onboarding"] {
+            let (st, _, body) = send(&app, Method::GET, uri, LAN, None, None).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(body.contains(DEV_BEARER), "{uri}");
+            assert!(!body.contains(BEARER_MARK));
+        }
     }
 
     #[tokio::test]

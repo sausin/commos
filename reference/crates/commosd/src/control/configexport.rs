@@ -293,7 +293,13 @@ pub async fn export(store: &Arc<dyn Store>, tenant: Uuid) -> Result<PbxConfig, S
     let ivrs = export_kind(list_all(|c| store.list_ivrs(tenant, PAGE, c)).await?, |i: &Ivr| i.base.id.to_string());
     let carriers = export_kind(list_all(|c| store.list_carriers(tenant, PAGE, c)).await?, |c: &Carrier| c.name.clone());
     let gateways = export_kind(list_all(|c| store.list_gateways(tenant, PAGE, c)).await?, gateway_key);
-    let trunks = export_kind(list_all(|c| store.list_trunks(tenant, PAGE, c)).await?, |t: &Trunk| t.base.id.to_string());
+    let mut trunks = export_kind(list_all(|c| store.list_trunks(tenant, PAGE, c)).await?, |t: &Trunk| t.base.id.to_string());
+    // Carrier credentials (`auth: {username, password}`) are never exported in plaintext.
+    for t in &mut trunks {
+        if t.get("auth").is_some_and(|v| !v.is_null()) {
+            t.insert("auth".into(), serde_json::Value::String(REDACTED.into()));
+        }
+    }
     let schedules =
         export_kind(list_all(|c| store.list_schedules(tenant, PAGE, c)).await?, |s: &Schedule| s.name.clone());
     let dids = export_kind(list_all(|c| store.list_dids(tenant, PAGE, c)).await?, |d: &Did| d.e164.clone());
@@ -334,6 +340,10 @@ where
         }
     }
 }
+
+/// Placeholder emitted in an export for a trunk's `auth` (carrier credentials never leave the
+/// store). On import an absent or placeholder `auth` keeps the stored value.
+pub const REDACTED: &str = "<redacted>";
 
 /// The server-managed fields stripped from every exported entity (the `id` is kept).
 const SERVER_FIELDS: [&str; 4] = ["tenant_id", "version", "created_at", "updated_at"];
@@ -444,6 +454,27 @@ where
     Ok((out, created, updated))
 }
 
+/// Validate the authored schedules of a config (timezone, weekly ranges, holidays) with
+/// [`crate::control::schedule::validate`]. `Err` is a human-readable reason.
+pub fn validate_schedules(tenant: Uuid, cfg: &PbxConfig) -> Result<(), String> {
+    for (i, entry) in cfg.schedules.iter().enumerate() {
+        let mut obj = match serde_json::to_value(EntityBase::new(tenant)) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (k, v) in entry {
+            if !SERVER_FIELDS.contains(&k.as_str()) {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        let sch: Schedule = serde_json::from_value(serde_json::Value::Object(obj))
+            .map_err(|e| format!("invalid schedule #{}: {e}", i + 1))?;
+        crate::control::schedule::validate(&sch.name, &sch.timezone, &sch.weekly, &sch.holidays)
+            .map_err(|e| format!("invalid schedule {:?}: {e}", sch.name))?;
+    }
+    Ok(())
+}
+
 /// Render a [`PbxConfig`] to YAML. Field order follows the struct definition, so combined
 /// with [`export`]'s sorting the output is fully deterministic.
 pub fn to_yaml(cfg: &PbxConfig) -> Result<String, serde_yaml::Error> {
@@ -473,6 +504,8 @@ pub async fn import(
     cfg: &PbxConfig,
 ) -> Result<ImportSummary, StoreError> {
     use std::collections::HashMap;
+
+    validate_schedules(tenant, cfg).map_err(StoreError::Backend)?;
 
     // ---- Gather the tenant's current entities, keyed by natural key. ----
     let mut current_users: HashMap<String, User> = HashMap::new();
@@ -627,8 +660,18 @@ pub async fn import(
         tenant, &cfg.gateways, list_all(|c| store.list_gateways(tenant, PAGE, c)).await?, gateway_key)?;
     summary.gateways_created = a;
     summary.gateways_updated = b;
-    let (trunks, a, b) = reconcile_kind(
-        tenant, &cfg.trunks, list_all(|c| store.list_trunks(tenant, PAGE, c)).await?, |t: &Trunk| t.base.id.to_string())?;
+    let current_trunks = list_all(|c| store.list_trunks(tenant, PAGE, c)).await?;
+    let stored_auth: HashMap<Uuid, serde_json::Value> =
+        current_trunks.iter().filter_map(|t| Some((t.base.id, t.auth.clone()?))).collect();
+    let (mut trunks, a, b) =
+        reconcile_kind(tenant, &cfg.trunks, current_trunks, |t: &Trunk| t.base.id.to_string())?;
+    // An absent or redacted `auth` keeps the stored credentials; the placeholder is never stored.
+    for t in &mut trunks {
+        let redacted = t.auth.as_ref().is_some_and(|v| v.is_null() || v.as_str() == Some(REDACTED));
+        if redacted || t.auth.is_none() {
+            t.auth = stored_auth.get(&t.base.id).cloned();
+        }
+    }
     summary.trunks_created = a;
     summary.trunks_updated = b;
     // Schedules before DIDs: a DID's `schedule_id` references one.
@@ -958,6 +1001,58 @@ mod tests {
             serde_json::Value::Object(m) => m.into_iter().collect(),
             _ => panic!("object"),
         }
+    }
+
+    #[tokio::test]
+    async fn trunk_auth_is_never_exported_and_survives_reimport() {
+        let st = store();
+        let tenant = Uuid::now_v7();
+        let carrier_id = Uuid::now_v7();
+        let trunk_id = Uuid::now_v7();
+        let mut cfg = sample_cfg();
+        cfg.carriers = vec![entry(serde_json::json!({
+            "id": carrier_id.to_string(), "name": "Acme", "kind": "SIP_TRUNK"
+        }))];
+        cfg.trunks = vec![entry(serde_json::json!({
+            "id": trunk_id.to_string(), "carrier_id": carrier_id.to_string(),
+            "auth": {"username": "u", "password": "hunter2"}
+        }))];
+        import(&st, tenant, &cfg).await.unwrap();
+        let exported = export(&st, tenant).await.unwrap();
+        let yaml = to_yaml(&exported).unwrap();
+        assert!(!yaml.contains("hunter2"), "password leaked: {yaml}");
+        assert_eq!(exported.trunks[0]["auth"], serde_json::json!(REDACTED));
+        // Re-import the redacted export: stored credentials are untouched.
+        let parsed: PbxConfig = serde_yaml::from_str(&yaml).unwrap();
+        import(&st, tenant, &parsed).await.unwrap();
+        let stored = st.list_trunks(tenant, 10, None).await.unwrap().items;
+        assert_eq!(stored[0].credentials(), Some(("u".into(), "hunter2".into())));
+        // An entry with no `auth` key at all also keeps it.
+        let mut no_auth = parsed.clone();
+        no_auth.trunks[0].remove("auth");
+        import(&st, tenant, &no_auth).await.unwrap();
+        let stored = st.list_trunks(tenant, 10, None).await.unwrap().items;
+        assert_eq!(stored[0].credentials(), Some(("u".into(), "hunter2".into())));
+        // Fresh store + redacted export: no placeholder stored as credentials.
+        let dst = store();
+        import(&dst, tenant, &parsed).await.unwrap();
+        let t = &dst.list_trunks(tenant, 10, None).await.unwrap().items[0];
+        assert!(t.auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_invalid_schedules() {
+        let st = store();
+        let tenant = Uuid::now_v7();
+        let mut cfg = sample_cfg();
+        cfg.schedules = vec![entry(serde_json::json!({
+            "id": Uuid::now_v7().to_string(), "name": "Bad", "timezone": "Not/AZone",
+            "weekly": [], "holidays": []
+        }))];
+        let err = import(&st, tenant, &cfg).await.unwrap_err().to_string();
+        assert!(err.contains("invalid schedule"), "{err}");
+        assert!(validate_schedules(tenant, &cfg).is_err());
+        assert!(st.list_schedules(tenant, 10, None).await.unwrap().items.is_empty());
     }
 
     #[tokio::test]
