@@ -268,7 +268,13 @@ async fn run(cfg: Config) -> i32 {
         },
         None => None,
     };
-    let admin = api::admin::AdminAuth::new(admin_password);
+    // A `file://` reference is a file we can rewrite, which lets `POST /admin/password` work.
+    let admin_password_file = cfg
+        .admin_password
+        .as_ref()
+        .and_then(|s| s.ref_uri.strip_prefix("file://"))
+        .map(std::path::PathBuf::from);
+    let admin = api::admin::AdminAuth::new(admin_password).with_password_file(admin_password_file);
     if admin.is_dev_mode() {
         tracing::warn!("admin auth: DEV MODE (no admin_password set) — any tenant bearer acts as admin");
     } else {

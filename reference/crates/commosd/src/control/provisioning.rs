@@ -134,6 +134,18 @@ impl Provisioning {
         Ok(secret)
     }
 
+    /// Replace the SIP shared secret for `username` with a freshly generated one and return it
+    /// (the admin console's "reset password"). The phone must be re-provisioned / re-entered.
+    pub async fn reset_credential(
+        &self,
+        tenant: Uuid,
+        username: &str,
+    ) -> Result<String, ProvisioningError> {
+        let secret = gen_secret();
+        self.store.put_sip_credential(tenant, username, &secret).await?;
+        Ok(secret)
+    }
+
     fn event<P: EventPayload>(tenant: Uuid, payload: P, idem: String) -> serde_json::Value {
         let ctx = Correlation::root(tenant);
         Envelope::new(payload, &ctx, idem).to_json()

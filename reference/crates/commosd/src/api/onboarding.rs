@@ -295,6 +295,7 @@ select{background:rgba(127,127,127,.1);border:1px solid rgba(127,127,127,.3);bor
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.15)}
 .hide{display:none}
 </style></head><body><div class="wrap">
+<p class="sub" style="text-align:right;margin:0"><a href="/admin" style="color:inherit">Admin console</a></p>
 <h1>Welcome to CommOS</h1>
 <p class="sub">Two questions, and we'll set up the rest. Everything below is auto-detected or a sensible default you can change.</p>
 

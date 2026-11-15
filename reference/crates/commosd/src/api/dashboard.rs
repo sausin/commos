@@ -217,6 +217,7 @@ const PAGE: &str = r####"<!doctype html>
       </div>
     </div>
     <div class="spacer"></div>
+    <a href="/admin" style="color:inherit;margin-right:16px;font-weight:600">Admin</a>
     <div class="status" id="status" title="server connectivity">
       <span class="dot" id="statusDot"></span>
       <span id="statusText">connecting…</span>
