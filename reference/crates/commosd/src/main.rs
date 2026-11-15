@@ -311,6 +311,8 @@ async fn run(cfg: Config) -> i32 {
             moh,
             cfg.music_on_hold,
         ));
+        // BLF lamps: bus-driven NOTIFYs to dialog/presence subscribers + expiry sweep.
+        tokio::spawn(server.clone().run_blf(bus.clone()));
         if cfg.require_sip_auth {
             tracing::info!(realm = %cfg.sip_realm, "SIP digest auth: REQUIRED");
         } else {

@@ -90,6 +90,8 @@ impl SipServer {
         let extra = [
             ("Contact", contact_header),
             ("Expires", expires.to_string()),
+            ("Allow", super::subscribe::ALLOW_METHODS.to_string()),
+            ("Allow-Events", super::subscribe::ALLOW_EVENTS.to_string()),
         ];
         let reply = message::response_with(msg, 200, "OK", &extra);
         let sent = resp.send(reply.as_bytes()).await;
