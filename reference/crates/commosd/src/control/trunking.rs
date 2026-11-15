@@ -40,6 +40,9 @@ use crate::store::{Page, Store, StoreError, Tx};
 pub enum TrunkingError {
     #[error("entity not found")]
     NotFound,
+    /// A DID with this E.164 number already exists (inbound routing needs it unique).
+    #[error("number already exists")]
+    DuplicateNumber,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -186,6 +189,18 @@ impl TrunkingService {
         carrier_id: Uuid,
         destination_ref: String,
     ) -> Result<Did, TrunkingError> {
+        // Inbound routing resolves a DID by its number, so a duplicate would be unreachable.
+        let mut cursor = None;
+        loop {
+            let page = self.store.list_dids(tenant, 500, cursor).await?;
+            if page.items.iter().any(|d| d.e164 == e164) {
+                return Err(TrunkingError::DuplicateNumber);
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
         let d = Did::new(tenant, e164, carrier_id, destination_ref);
         self.store.commit(Tx { dids: vec![d.clone()], ..Default::default() }).await?;
         self.signal.wake();
@@ -251,6 +266,11 @@ mod tests {
         assert_eq!(s.list_gateways(t, 50, None).await.unwrap().items.len(), 1);
         assert_eq!(s.list_trunks(t, 50, None).await.unwrap().items.len(), 1);
         assert_eq!(s.get_did(t, did.base.id).await.unwrap().destination_ref, "sip:200@host");
+        // A second DID with the same number is refused (inbound routing needs it unique).
+        assert!(matches!(
+            s.create_did(t, "+14155550100".into(), carrier.base.id, "voicemail".into()).await,
+            Err(TrunkingError::DuplicateNumber)
+        ));
 
         // Health toggle versions the gateway forward.
         let off = s.update_gateway(t, gw.base.id, Some(GatewayHealth::Offline), GatewayDialing::default()).await.unwrap();

@@ -35,6 +35,9 @@ fn opt_id(s: Option<String>, field: &'static str) -> Result<Option<Uuid>, Proble
 fn terr(e: TrunkingError) -> Problem {
     match e {
         TrunkingError::NotFound => Problem::not_found("no such trunking entity"),
+        TrunkingError::DuplicateNumber => {
+            Problem::new(StatusCode::CONFLICT, "duplicate_number", "that number is already set up")
+        }
         TrunkingError::Store(crate::store::StoreError::VersionConflict { .. }) => {
             Problem::new(StatusCode::CONFLICT, "version_conflict", "concurrent modification")
         }
