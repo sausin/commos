@@ -61,6 +61,7 @@ impl SipServer {
             self.moh.clone(),
             self.music_on_hold,
             self.registrations.clone(),
+            self.store.clone(),
             queue.members.clone(),
             tenant,
             wait,
@@ -122,6 +123,7 @@ impl SipServer {
         moh: Arc<crate::sip::moh::MohSource>,
         music_on_hold: bool,
         registrations: RegistrationRegistry,
+        store: Arc<dyn Store>,
         members: Vec<String>,
         tenant: Uuid,
         wait: crate::sip::queuewait::WaitConfig,
@@ -162,7 +164,13 @@ impl SipServer {
                 tracing::info!(%call_id, "queue: max wait reached; overflowing");
                 ivr::play(&sock, peer, pt, &hold_prompt).await;
                 if let Some(dest) = overflow_ref.as_deref() {
-                    if let Some(reg) = find_registered(&registrations, tenant, dest) {
+                    if let Some(reg) = dnd::not_dnd(
+                        &store,
+                        tenant,
+                        find_registered(&registrations, tenant, dest),
+                    )
+                    .await
+                    {
                         let _ = ivr_transfer(
                             &sock,
                             peer,
@@ -188,7 +196,13 @@ impl SipServer {
                 cursor,
             ) {
                 cursor = i + 1;
-                if let Some(reg) = find_registered(&registrations, tenant, &members[i]) {
+                if let Some(reg) = dnd::not_dnd(
+                    &store,
+                    tenant,
+                    find_registered(&registrations, tenant, &members[i]),
+                )
+                .await
+                {
                     // ivr_transfer rings the member (ring-back to the caller) and, on answer,
                     // relays until hangup. `true` → the caller was connected and the call is done.
                     if ivr_transfer(
@@ -272,6 +286,7 @@ mod tests {
             moh,
             true,
             RegistrationRegistry::new(),
+            Arc::new(crate::store::MemStore::new()),
             Vec::new(), // no members → nobody to place the caller with
             Uuid::now_v7(),
             wait,

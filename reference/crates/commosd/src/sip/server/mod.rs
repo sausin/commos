@@ -291,6 +291,9 @@ pub struct SipServer {
     ring_rotation: Arc<std::sync::atomic::AtomicUsize>,
     /// BLF / presence subscription table + per-extension call-dialog tracker (SUBSCRIBE/NOTIFY).
     blf: Arc<crate::control::blf::BlfHub>,
+    /// Loop guard: the `Max-Forwards` value to stamp on CommOS-originated legs of a call whose
+    /// inbound INVITE arrived already part-way through the hop budget (see [`Self::note_hops`]).
+    hop_limits: Arc<Mutex<HashMap<Uuid, u32>>>,
 }
 
 // The `impl SipServer` is split across these topic modules (each an `impl SipServer` block);
@@ -369,7 +372,35 @@ impl SipServer {
             music_on_hold,
             ring_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             blf: Arc::new(crate::control::blf::BlfHub::new()),
+            hop_limits: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Remember the decremented `Max-Forwards` of an inbound INVITE so outbound legs placed for
+    /// `call_id` carry it (RFC 3261 s16.6): a forward/transfer loop through a carrier then dies
+    /// after the hop budget instead of spinning forever. Only calls that arrived with a reduced
+    /// budget are recorded; the table is bounded.
+    pub(super) fn note_hops(&self, call_id: Uuid, inbound_max_forwards: Option<u32>) {
+        let Some(mf) = inbound_max_forwards.filter(|m| *m < 70) else {
+            return;
+        };
+        let mut t = self.hop_limits.lock().expect("hop mutex");
+        if t.len() > 4096 {
+            t.clear();
+        }
+        t.insert(call_id, mf.saturating_sub(1));
+    }
+
+    /// The `Max-Forwards` for a CommOS-originated leg of `call_id` (70 unless the inbound call
+    /// had already spent hops).
+    pub(super) fn out_max_forwards(&self, call_id: Uuid) -> String {
+        self.hop_limits
+            .lock()
+            .expect("hop mutex")
+            .get(&call_id)
+            .copied()
+            .unwrap_or(70)
+            .to_string()
     }
 
     /// Bind `bind` and serve SIP over UDP forever. Returns only on a fatal socket error. Shared

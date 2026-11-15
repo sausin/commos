@@ -176,6 +176,32 @@ pub(super) fn confirmation_tone(ok: bool, codec: g711::G711) -> Vec<u8> {
 }
 
 impl SipServer {
+    /// Policy gate for `*72<number>`: an internal target is always fine; an external one must pass
+    /// the outbound policy under its gateway's dial profile and must not be one of our own DIDs.
+    /// (The same vetting runs again at call time, when the forward actually fires.)
+    pub(super) async fn forward_allowed(&self, code: &FeatureCode) -> bool {
+        let FeatureCode::ForwardOn(raw) = code else {
+            return true;
+        };
+        let Some(target) = forward_target(raw) else {
+            return true; // apply_feature_code will refuse it
+        };
+        let Some(external) = target.strip_prefix("external:") else {
+            return true;
+        };
+        if let Some(e164) = dialplan::normalize_e164(external, &self.default_cc) {
+            if self.is_own_did(&e164).await {
+                tracing::warn!(%external, "*72 refused: forward target is one of our own DIDs");
+                return false;
+            }
+        }
+        match self.select_outbound_gateway(external).await {
+            Some((gw, num)) => self.vet_external(&gw, &num).await.is_ok(),
+            // No usable gateway: nothing to classify against (and nothing it could dial).
+            None => true,
+        }
+    }
+
     /// Answer a feature-code call, apply it, play the confirmation tone and hang up.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn answer_with_feature_code(
@@ -191,7 +217,10 @@ impl SipServer {
         src: SocketAddr,
     ) -> std::io::Result<()> {
         let caller = user_part(from_ref).unwrap_or("");
-        let ok = apply_feature_code(&self.store, self.default_tenant, caller, &code).await;
+        // `*72<external>` is vetted like an outbound call (policy + own-DID loop guard) so a
+        // forward cannot be a toll-fraud or loop primitive; a refused one gets the refusal tone.
+        let ok = self.forward_allowed(&code).await
+            && apply_feature_code(&self.store, self.default_tenant, caller, &code).await;
         tracing::info!(%call_id, %caller, ?code, ok, "feature code");
 
         let g711_codec = codec::Codec {

@@ -83,6 +83,23 @@ impl Routing {
         }
     }
 
+    /// Evaluate the origination policy for an *external* destination placed from the SIP plane
+    /// (INVITE -> trunk, REFER target, forward-to-PSTN). `classify_cc` is the country code the
+    /// destination is classified under: the dialling gateway's own profile, so policy and
+    /// dialling agree on what is national vs international. Emergency stays exempt.
+    pub fn check_outbound(&self, tenant: Uuid, to_ref: &str, classify_cc: &str) -> policy::Decision {
+        policy::evaluate(
+            &PolicyRequest {
+                to_ref,
+                caller_has_identity: true,
+                caller_capabilities: &[],
+                active_calls: self.active_count(tenant),
+            },
+            &self.policy,
+            classify_cc,
+        )
+    }
+
     /// Current in-progress call count for a tenant.
     fn active_count(&self, tenant: Uuid) -> u32 {
         *self.active.lock().expect("active-calls mutex").get(&tenant).unwrap_or(&0)
@@ -160,7 +177,7 @@ impl Routing {
         // reservation is held by an RAII guard that releases the slot on any early-return/error
         // below, and is kept (left counted) only once the call is successfully originated.
         let slot = match self.policy.max_concurrent_calls {
-            Some(cap) if !policy::is_emergency(&req.to_ref) => {
+            Some(cap) if !policy::is_emergency(&req.to_ref, &self.default_cc) => {
                 if !self.try_reserve(tenant, cap) {
                     return Err(RoutingError::PolicyDenied(format!(
                         "concurrency cap reached: at or above the limit of {cap}"

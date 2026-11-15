@@ -4,10 +4,57 @@ use std::collections::HashSet;
 
 use super::*;
 
+/// The extension number a *resolved* routing `target` (after DID / schedule / extension-route
+/// resolution) names: the user part of a `sip:`/`ext:`/bare endpoint reference. DND, forwarding
+/// and voicemail-off decisions key on this, not on the request-URI, which for a DID-routed call
+/// is the carrier number rather than the extension that will actually ring. A non-endpoint target
+/// (`ringgroup:`, `queue:`, `ivr:`, `external:`, `voicemail`, a bare E.164) falls back to
+/// `fallback` (the dialled request-URI user).
+pub(super) fn target_extension_number(target: &str, fallback: &str) -> String {
+    let t = target.trim();
+    let endpoint_like = t.starts_with("sip:")
+        || t.starts_with("sips:")
+        || t.starts_with("ext:")
+        || t.starts_with('<')
+        || (!t.contains(':') && t != "voicemail");
+    if endpoint_like {
+        if let Some(user) = dial_target(t) {
+            if !user.contains(':') && !user.starts_with('+') {
+                return user.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+/// Live DND lookup for spawned media drivers (IVR / queue transfers), which have no `&self`:
+/// returns `reg` unless its extension is in do-not-disturb (a DND extension is never rung, even
+/// when a menu option or queue member points at it).
+pub(super) async fn not_dnd(
+    store: &Arc<dyn Store>,
+    tenant: Uuid,
+    reg: Option<Registration>,
+) -> Option<Registration> {
+    let r = reg?;
+    let number = user_part(&r.aor).unwrap_or_default();
+    if let Some(ext) = super::featurecodes::find_extension(store, tenant, number).await {
+        if ext.dnd {
+            tracing::info!(%number, "transfer target is in DND; not rung");
+            return None;
+        }
+    }
+    Some(r)
+}
+
 impl SipServer {
     /// Extension numbers currently in do-not-disturb.
     pub(super) async fn dnd_numbers(&self) -> HashSet<String> {
         self.extension_numbers_where(|e| e.dnd).await
+    }
+
+    /// Whether extension `number` is currently in do-not-disturb.
+    pub(super) async fn is_dnd(&self, number: &str) -> bool {
+        !number.is_empty() && self.dnd_numbers().await.contains(number)
     }
 
     /// Extension numbers with voicemail switched off (`Extension::voicemail == false`).
@@ -133,5 +180,23 @@ impl SipServer {
             self.answer_bridged(resp, msg, call_id, call_id_hdr, src, capture, won, "busy forward")
                 .await,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_extension_number_follows_the_resolved_target_not_the_request_uri() {
+        // DID-routed: request-URI is the DID, the target is the extension that will ring.
+        assert_eq!(target_extension_number("sip:200@host", "+14155550100"), "200");
+        assert_eq!(target_extension_number("ext:201", "+14155550100"), "201");
+        assert_eq!(target_extension_number("202", "+14155550100"), "202");
+        assert_eq!(target_extension_number("<sip:203@host;x=1>", "x"), "203");
+        // Non-endpoint targets keep the dialled number.
+        for t in ["ringgroup:abc", "queue:abc", "ivr:abc", "external:+1415", "voicemail", "+14155550100"] {
+            assert_eq!(target_extension_number(t, "500"), "500", "{t}");
+        }
     }
 }

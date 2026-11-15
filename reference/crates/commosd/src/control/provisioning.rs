@@ -106,11 +106,34 @@ pub struct ExtensionPatch {
 pub struct Provisioning {
     store: Arc<dyn Store>,
     signal: RelaySignal,
+    /// Home country code: selects the emergency numbers an extension may not shadow.
+    default_cc: String,
 }
 
 impl Provisioning {
     pub fn new(store: Arc<dyn Store>, signal: RelaySignal) -> Self {
-        Provisioning { store, signal }
+        Provisioning { store, signal, default_cc: "1".to_string() }
+    }
+
+    /// Set the deployment's `default_country_code` (decides which numbers are emergency numbers).
+    pub fn with_default_cc(mut self, cc: impl Into<String>) -> Self {
+        self.default_cc = cc.into();
+        self
+    }
+
+    /// Refuse an extension number that equals an active emergency number: such an extension
+    /// could never be reached (the emergency route wins) and would shadow the real service.
+    fn check_not_emergency(&self, number: &str) -> Result<(), ProvisioningError> {
+        let n = number.trim();
+        if crate::control::policy::is_emergency_number(n, &self.default_cc) {
+            return Err(ProvisioningError::IllegalState(format!(
+                "extension number {n} is an emergency number for this deployment \
+                 (country code {}); calls to it always go to the emergency services - choose a \
+                 different number",
+                self.default_cc
+            )));
+        }
+        Ok(())
     }
 
     /// Commit a transaction and wake the relay so any events surface promptly.
@@ -468,6 +491,7 @@ impl Provisioning {
         if req.destination_ref.trim().is_empty() {
             return Err(ProvisioningError::Invalid("destination_ref is required".into()));
         }
+        self.check_not_emergency(&req.number)?;
         let route = Route::new(tenant, req.destination_ref);
         let mut ext = Extension::new(tenant, req.number, route.base.id);
         ext.label = req.label;
@@ -497,6 +521,7 @@ impl Provisioning {
             if number.trim().is_empty() {
                 return Err(ProvisioningError::Invalid("number cannot be empty".into()));
             }
+            self.check_not_emergency(&number)?;
             ext.number = number;
             touched = true;
         }
@@ -621,6 +646,32 @@ mod tests {
         let store: Arc<dyn Store> = Arc::new(MemStore::new());
         let p = Provisioning::new(store.clone(), RelaySignal::new());
         (p, store)
+    }
+
+    #[tokio::test]
+    async fn extension_cannot_shadow_an_active_emergency_number() {
+        let (p, _store) = svc();
+        let t = Uuid::now_v7();
+        let new = |n: &str| NewExtension {
+            number: n.into(),
+            destination_ref: "sip:x".into(),
+            ..Default::default()
+        };
+        // Default (cc 1): 911 and 112 are refused; 108/110/119 are ordinary extensions.
+        for n in ["911", "112"] {
+            match p.create_extension(t, new(n)).await {
+                Err(ProvisioningError::IllegalState(m)) => assert!(m.contains("emergency"), "{m}"),
+                other => panic!("{n}: expected IllegalState, got {other:?}"),
+            }
+        }
+        for n in ["108", "110", "111", "119", "999"] {
+            p.create_extension(t, new(n)).await.unwrap();
+        }
+        // UK deployment: 999 is now reserved, 110 stays free.
+        let (p, _store) = svc();
+        let p = p.with_default_cc("44");
+        assert!(p.create_extension(t, new("999")).await.is_err());
+        p.create_extension(t, new("110")).await.unwrap();
     }
 
     #[tokio::test]
