@@ -236,6 +236,54 @@ pub async fn create_did(
 pub async fn get_did(State(st): State<AppState>, t: TenantContext, Path(id): Path<String>) -> Result<Json<Did>, Problem> {
     Ok(Json(st.trunking.get_did(t.tenant_id, tid(&id)?).await.map_err(terr)?))
 }
+/// Distinguish an absent JSON field from an explicit `null` (for PATCH clears).
+fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+pub struct PatchDid {
+    pub destination_ref: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub schedule_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub closed_destination_ref: Option<Option<String>>,
+}
+
+/// `PATCH /v1/dids/{id}` — partial update; explicit `null` clears `schedule_id` /
+/// `closed_destination_ref`.
+pub async fn patch_did(
+    State(st): State<AppState>,
+    admin: AdminContext,
+    Path(id): Path<String>,
+    Json(b): Json<PatchDid>,
+) -> Result<Json<Did>, Problem> {
+    let schedule_id = match b.schedule_id {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(s)) => {
+            let sid = tid(&s)?;
+            // The referenced schedule must exist for this tenant.
+            if st.store.get_schedule(admin.tenant_id, sid).await.map_err(|e| Problem::internal(e.to_string()))?.is_none() {
+                return Err(Problem::bad_request("schedule_id does not reference an existing schedule"));
+            }
+            Some(Some(sid))
+        }
+    };
+    if b.destination_ref.as_deref().is_some_and(str::is_empty) {
+        return Err(Problem::bad_request("destination_ref must not be empty"));
+    }
+    let d = st
+        .trunking
+        .update_did(admin.tenant_id, tid(&id)?, b.destination_ref, schedule_id, b.closed_destination_ref)
+        .await
+        .map_err(terr)?;
+    Ok(Json(d))
+}
 /// `DELETE /v1/dids/{id}`
 pub async fn delete_did(State(st): State<AppState>, admin: AdminContext, Path(id): Path<String>) -> Result<StatusCode, Problem> {
     st.trunking.delete_did(admin.tenant_id, tid(&id)?).await.map_err(terr)?;

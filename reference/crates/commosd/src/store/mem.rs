@@ -26,6 +26,7 @@ use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
 use commos_core::entities::ring_group::RingGroup;
+use commos_core::entities::schedule::Schedule;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -114,6 +115,8 @@ struct Inner {
     ring_group_order: Vec<(Uuid, Uuid)>,
     forwardings: HashMap<(Uuid, Uuid), Forwarding>,
     forwarding_order: Vec<(Uuid, Uuid)>,
+    schedules: HashMap<(Uuid, Uuid), Schedule>,
+    schedule_order: Vec<(Uuid, Uuid)>,
     /// Routing programs — CallFlows, IVR nodes, and the append-only CallFlow revision log.
     call_flows: HashMap<(Uuid, Uuid), CallFlow>,
     call_flow_order: Vec<(Uuid, Uuid)>,
@@ -281,6 +284,16 @@ impl Store for MemStore {
                 }
             } else if rg.base.version != 0 {
                 return Err(StoreError::VersionConflict { entity: "RingGroup", id: rg.base.id.to_string(), expected: 0 });
+            }
+        }
+        for s in &tx.schedules {
+            let key = (s.base.tenant_id, s.base.id);
+            if let Some(existing) = g.schedules.get(&key) {
+                if s.base.version != existing.base.version + 1 {
+                    return Err(StoreError::VersionConflict { entity: "Schedule", id: s.base.id.to_string(), expected: existing.base.version + 1 });
+                }
+            } else if s.base.version != 0 {
+                return Err(StoreError::VersionConflict { entity: "Schedule", id: s.base.id.to_string(), expected: 0 });
             }
         }
         for f in &tx.forwardings {
@@ -497,6 +510,13 @@ impl Store for MemStore {
                 g.ring_group_order.push(key);
             }
             g.ring_groups.insert(key, rg);
+        }
+        for s in tx.schedules {
+            let key = (s.base.tenant_id, s.base.id);
+            if !g.schedules.contains_key(&key) {
+                g.schedule_order.push(key);
+            }
+            g.schedules.insert(key, s);
         }
         for f in tx.forwardings {
             let key = (f.base.tenant_id, f.base.id);
@@ -812,6 +832,24 @@ impl Store for MemStore {
         let removed = g.ring_groups.remove(&key).is_some();
         if removed {
             g.ring_group_order.retain(|k| k != &key);
+        }
+        Ok(removed)
+    }
+
+    async fn get_schedule(&self, tenant: Uuid, id: Uuid) -> Result<Option<Schedule>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(g.schedules.get(&(tenant, id)).cloned())
+    }
+    async fn list_schedules(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Schedule>, StoreError> {
+        let g = self.inner.lock().expect("store mutex not poisoned");
+        Ok(page_from(&g.schedule_order, |k| g.schedules.get(k).cloned(), tenant, limit, cursor))
+    }
+    async fn delete_schedule(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        let mut g = self.inner.lock().expect("store mutex not poisoned");
+        let key = (tenant, id);
+        let removed = g.schedules.remove(&key).is_some();
+        if removed {
+            g.schedule_order.retain(|k| k != &key);
         }
         Ok(removed)
     }

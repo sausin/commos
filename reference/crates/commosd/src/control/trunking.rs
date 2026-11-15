@@ -149,6 +149,30 @@ impl TrunkingService {
         self.signal.wake();
         Ok(d)
     }
+    /// Partial DID update. Outer `None` = leave unchanged; `Some(None)` clears a nullable field.
+    pub async fn update_did(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        destination_ref: Option<String>,
+        schedule_id: Option<Option<Uuid>>,
+        closed_destination_ref: Option<Option<String>>,
+    ) -> Result<Did, TrunkingError> {
+        let mut d = self.get_did(tenant, id).await?;
+        if let Some(v) = destination_ref {
+            d.destination_ref = v;
+        }
+        if let Some(v) = schedule_id {
+            d.schedule_id = v;
+        }
+        if let Some(v) = closed_destination_ref {
+            d.closed_destination_ref = v;
+        }
+        d.base.touch();
+        self.store.commit(Tx { dids: vec![d.clone()], ..Default::default() }).await?;
+        self.signal.wake();
+        Ok(d)
+    }
     pub async fn get_did(&self, tenant: Uuid, id: Uuid) -> Result<Did, TrunkingError> {
         self.store.get_did(tenant, id).await?.ok_or(TrunkingError::NotFound)
     }
@@ -202,5 +226,30 @@ mod tests {
         let b = Uuid::now_v7();
         let c = s.create_carrier(a, "A".into(), CarrierKind::Pstn, None).await.unwrap();
         assert!(matches!(s.get_carrier(b, c.base.id).await, Err(TrunkingError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn did_patch_sets_and_clears_schedule_fields() {
+        let s = svc();
+        let t = Uuid::now_v7();
+        let did = s.create_did(t, "+14155550101".into(), Uuid::now_v7(), "sip:200".into()).await.unwrap();
+        assert!(did.schedule_id.is_none());
+        let sid = Uuid::now_v7();
+        let d = s
+            .update_did(t, did.base.id, None, Some(Some(sid)), Some(Some("voicemail".into())))
+            .await
+            .unwrap();
+        assert_eq!(d.destination_ref, "sip:200");
+        assert_eq!(d.schedule_id, Some(sid));
+        assert_eq!(d.closed_destination_ref.as_deref(), Some("voicemail"));
+        assert_eq!(d.base.version, 1);
+        // Absent fields are untouched; destination changes.
+        let d = s.update_did(t, did.base.id, Some("sip:300".into()), None, None).await.unwrap();
+        assert_eq!(d.destination_ref, "sip:300");
+        assert_eq!(d.schedule_id, Some(sid));
+        // Explicit null clears.
+        let d = s.update_did(t, did.base.id, None, Some(None), Some(None)).await.unwrap();
+        assert!(d.schedule_id.is_none() && d.closed_destination_ref.is_none());
+        assert!(matches!(s.update_did(t, Uuid::now_v7(), None, None, None).await, Err(TrunkingError::NotFound)));
     }
 }

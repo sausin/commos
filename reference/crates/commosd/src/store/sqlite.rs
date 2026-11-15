@@ -34,6 +34,7 @@ use commos_core::entities::presence_state::PresenceState;
 use commos_core::entities::queue::Queue;
 use commos_core::entities::recording::Recording;
 use commos_core::entities::ring_group::RingGroup;
+use commos_core::entities::schedule::Schedule;
 use commos_core::entities::route::Route;
 use commos_core::entities::thread::Thread;
 use commos_core::entities::user::User;
@@ -72,6 +73,8 @@ CREATE TABLE IF NOT EXISTS ring_groups  (id TEXT PRIMARY KEY, tenant_id TEXT NOT
 CREATE INDEX IF NOT EXISTS ring_groups_tenant_id_idx ON ring_groups (tenant_id, id);
 CREATE TABLE IF NOT EXISTS forwardings  (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS forwardings_tenant_id_idx ON forwardings (tenant_id, id);
+CREATE TABLE IF NOT EXISTS schedules  (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS schedules_tenant_id_idx ON schedules (tenant_id, id);
 CREATE TABLE IF NOT EXISTS call_flows   (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS call_flows_tenant_id_idx ON call_flows (tenant_id, id);
 CREATE TABLE IF NOT EXISTS ivrs         (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, data TEXT NOT NULL);
@@ -371,6 +374,10 @@ impl Store for SqliteStore {
             let data = serde_json::to_string(rg).map_err(be)?;
             Self::upsert(&mut dbtx, "ring_groups", "RingGroup", &rg.base, &data).await?;
         }
+        for s in &tx.schedules {
+            let data = serde_json::to_string(s).map_err(be)?;
+            Self::upsert(&mut dbtx, "schedules", "Schedule", &s.base, &data).await?;
+        }
         for f in &tx.forwardings {
             let data = serde_json::to_string(f).map_err(be)?;
             Self::upsert(&mut dbtx, "forwardings", "Forwarding", &f.base, &data).await?;
@@ -547,6 +554,16 @@ impl Store for SqliteStore {
     }
     async fn delete_ring_group(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
         self.delete_row("ring_groups", tenant, id).await
+    }
+
+    async fn get_schedule(&self, tenant: Uuid, id: Uuid) -> Result<Option<Schedule>, StoreError> {
+        self.get_one("schedules", tenant, id).await
+    }
+    async fn list_schedules(&self, tenant: Uuid, limit: usize, cursor: Option<String>) -> Result<Page<Schedule>, StoreError> {
+        self.list("schedules", tenant, limit, cursor).await
+    }
+    async fn delete_schedule(&self, tenant: Uuid, id: Uuid) -> Result<bool, StoreError> {
+        self.delete_row("schedules", tenant, id).await
     }
 
     async fn get_forwarding(&self, tenant: Uuid, id: Uuid) -> Result<Option<Forwarding>, StoreError> {

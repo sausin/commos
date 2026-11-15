@@ -45,7 +45,17 @@ impl SipServer {
                 .await
                 .ok()?;
             if let Some(did) = page.items.iter().find(|d| d.e164 == e164) {
-                return Some(did.destination_ref.clone());
+                // Business hours: a DID with a schedule routes to its closed destination
+                // while the schedule is closed (`control/schedule.rs::pick_destination`).
+                let schedule = match did.schedule_id {
+                    Some(sid) => self.store.get_schedule(self.default_tenant, sid).await.ok().flatten(),
+                    None => None,
+                };
+                return Some(crate::control::schedule::pick_destination(
+                    did,
+                    schedule.as_ref(),
+                    jiff::Timestamp::now(),
+                ));
             }
             match page.next_cursor {
                 Some(c) => cursor = Some(c),
