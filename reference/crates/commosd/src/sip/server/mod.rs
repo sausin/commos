@@ -288,6 +288,8 @@ pub struct SipServer {
     /// Per-call rotation counter for hunt-group / round-robin member ordering (the pure ring
     /// planner takes this as its rotation input, spreading load across successive calls).
     ring_rotation: Arc<std::sync::atomic::AtomicUsize>,
+    /// BLF / presence subscription table + per-extension call-dialog tracker (SUBSCRIBE/NOTIFY).
+    blf: Arc<crate::control::blf::BlfHub>,
 }
 
 // The `impl SipServer` is split across these topic modules (each an `impl SipServer` block);
@@ -303,6 +305,7 @@ mod ivr_menu; // IVR menu playout + driver
 mod queue; // call-queue answer path + queue-wait driver
 mod routing; // destination resolution + outbound gateway selection
 mod sdp; // SDP/SRTP negotiation + SIP response construction
+mod subscribe; // SUBSCRIBE/NOTIFY: BLF (dialog), message-summary, presence
 mod voicemail; // voicemail deposit/retrieval, storage, MWI
 
 impl SipServer {
@@ -360,6 +363,7 @@ impl SipServer {
             moh,
             music_on_hold,
             ring_rotation: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            blf: Arc::new(crate::control::blf::BlfHub::new()),
         }
     }
 
@@ -423,7 +427,12 @@ impl SipServer {
             "REGISTER" => self.on_register(resp, &msg).await,
             "OPTIONS" => {
                 tracing::info!(method = %method, %src, "SIP OPTIONS");
-                self.reply(resp, &msg, 200, "OK").await
+                let extra = [
+                    ("Allow", subscribe::ALLOW_METHODS.to_string()),
+                    ("Allow-Events", subscribe::ALLOW_EVENTS.to_string()),
+                ];
+                resp.send(message::response_with(&msg, 200, "OK", &extra).as_bytes())
+                    .await
             }
             "INVITE" => self.on_invite(resp, &msg).await,
             "ACK" => {
@@ -432,6 +441,14 @@ impl SipServer {
             }
             "BYE" | "CANCEL" => self.on_bye(resp, &msg).await,
             "INFO" => self.on_info(resp, &msg).await,
+            "SUBSCRIBE" => self.on_subscribe(resp, &msg).await,
+            // In-dialog session refresh without SDP: nothing to renegotiate.
+            "UPDATE" if msg.body().is_empty() => self.reply(resp, &msg, 200, "OK").await,
+            "PUBLISH" => {
+                let extra = [("Allow", subscribe::ALLOW_METHODS.to_string())];
+                resp.send(message::response_with(&msg, 405, "Method Not Allowed", &extra).as_bytes())
+                    .await
+            }
             other => {
                 tracing::info!(method = %other, %src, "SIP method not implemented");
                 self.reply(resp, &msg, 501, "Not Implemented").await
