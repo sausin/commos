@@ -97,9 +97,33 @@ Config file itself is found via `default_config_path()` in `main.rs` (`$COMMOS_C
   (`hold_direction`) drives `rtp::Bridge::set_hold` (`HoldState`/`Leg`), which suspends the relay
   and streams MoH to the held leg (callee-initiated hold — a leg-B re-INVITE — is the remaining
   wiring; the media path already supports `Held(Leg::B)`).
+- **Transfer / BLF** (SIP dispatch in `sip/server/mod.rs` also handles REFER, SUBSCRIBE, bodiless
+  UPDATE) — `sip/server/refer.rs` (blind + attended/`Replaces` transfer; re-targets a live
+  `rtp::Bridge` leg via `BridgeCmd` rather than re-negotiating the transferee) and
+  `sip/server/subscribe.rs` + `control/blf.rs` (in-memory subscription table; `dialog`,
+  `message-summary`, `presence` events; state driven off the call-event bus by
+  `SipServer::run_blf`).
+- **Dialing / feature codes** — `control/dialplan.rs::normalize_dialed` (national/intl/outside-line
+  → E.164, per-`Gateway` overrides incl. `outbound_caller_id`); `sip/server/outbound.rs`
+  (emergency numbers always go out a trunk); `sip/server/featurecodes.rs` (`*78`/`*79` DND,
+  `*72<n>`/`*73` forward-always); `sip/server/dnd.rs` (`Extension.dnd` → never rung; busy uses the
+  `Busy` forwarding rule).
+- **Business hours** — `control/schedule.rs` (pure `is_open`/`pick_destination`, `jiff` with bundled
+  tzdb) + `api/schedules.rs`; a `Did` optionally carries `schedule_id` + `closed_destination_ref`,
+  applied in `sip/server/routing.rs::resolve_did`.
+- **Admin console** — `/admin` (`api/console.rs` + `api/console/{index.html,app.js,app.css}` via
+  `include_str!`; vanilla JS, no build step). One tab per office noun (People, Groups, Numbers,
+  Hours, History, System), driven entirely by `/v1`; an admin session (`Bearer admin:<token>`) is
+  accepted on `/v1` as `ADMIN_DEV_TENANT`. Keep it jargon-free; advanced config stays API-only.
+  `/dashboard` (live monitoring) and `/onboarding` (setup wizard) remain separate.
+- **Defaults** — `require_sip_auth` defaults true and REGISTER for an unknown extension is 404;
+  `dev_tokens` defaults on only when no `admin_password` is set (`Config::dev_tokens_enabled`);
+  a loopback/unset `media_ip` is autodetected at boot (`net::select_media_ip`). `/v1/config`
+  export/import covers every config entity (add new ones to `control/configexport.rs`).
 - **Voicemail-to-email** — `control/smtp.rs` (hand-rolled pure-Rust SMTP submission client, like
   `webhook_delivery.rs`) + `control/voicemail_email.rs` (a `VoicemailReceived` bus subscriber that
-  resolves the mailbox → `smtp.mailboxes` recipient and emails a WAV). Config: `smtp:` section.
+  resolves the mailbox → `smtp.mailboxes` recipient, falling back to the owning user's email, and
+  emails a WAV). Config: `smtp:` section.
 - **Provisioning** — `api/provision.rs` (per-vendor phone configs: Yealink/Grandstream/generic,
   incl. NTP + timezone, voicemail Message-key code `*97`, Grandstream TR-069 off (`P1409=0`, kills
   the "CPE connection failed" warning), and optional web-UI lockdown via `phone_admin_password`
