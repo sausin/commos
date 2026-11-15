@@ -285,6 +285,9 @@ impl SipServer {
             // Do-not-disturb: a DND extension is never rung (see `resolve_plan_dnd`).
             let dnd_set = self.dnd_numbers().await;
             let dnd = !dialled.is_empty() && dnd_set.contains(&dialled);
+            // Per-extension voicemail switch (`Extension::voicemail`); the global
+            // `voicemail_enabled` stays the master switch.
+            let vm_on = self.voicemail_on_for(&dialled).await;
             if is_group || has_forwarding || dnd {
                 // Tell the caller's phone we're ringing while we walk the plan.
                 let _ = resp.send(self.build_ringing(msg, call_id).as_bytes()).await;
@@ -295,7 +298,7 @@ impl SipServer {
                 };
                 let opts = crate::control::ringplan::PlanOpts {
                     default_ring_seconds: self.no_answer_timeout.as_secs().max(1) as u32,
-                    voicemail_enabled: self.voicemail_enabled,
+                    voicemail_enabled: vm_on,
                 };
                 let rotation = self
                     .ring_rotation
@@ -362,16 +365,14 @@ impl SipServer {
                     None => {
                         // Nobody answered → apply the plan's final action.
                         match &plan.final_action {
-                            crate::control::ringplan::FinalAction::Voicemail(num)
-                                if self.voicemail_enabled =>
+                            crate::control::ringplan::FinalAction::Voicemail(num) if vm_on =>
                             {
                                 voicemail_target = Some(VoicemailBox {
                                     aor: format!("sip:{num}"),
                                     notify: None,
                                 });
                             }
-                            crate::control::ringplan::FinalAction::Redirect(_)
-                                if self.voicemail_enabled =>
+                            crate::control::ringplan::FinalAction::Redirect(_) if vm_on =>
                             {
                                 // A redirect (queue / another group) is not yet re-resolved here;
                                 // divert the dialled number to voicemail as the safe terminus.
@@ -385,6 +386,10 @@ impl SipServer {
                         // A DND extension must never ring, even with voicemail disabled.
                         if dnd && voicemail_target.is_none() {
                             return self.reply(resp, msg, 486, "Busy Here").await;
+                        }
+                        // Voicemail switched off for this extension: "unavailable", no recording.
+                        if voicemail_target.is_none() && self.voicemail_enabled && !vm_on {
+                            return self.reply(resp, msg, 480, "Temporarily Unavailable").await;
                         }
                         // Fall through: a set voicemail_target is picked up by the deposit path;
                         // otherwise the echo fallthrough applies (voicemail disabled).
@@ -442,6 +447,24 @@ impl SipServer {
                         .await
                     {
                         return result;
+                    }
+                }
+                // Voicemail switched off for this extension: an unanswered / declined call is
+                // never recorded; the caller gets the "unavailable" status instead.
+                if self.voicemail_enabled
+                    && !self
+                        .voicemail_on_for(user_part(&to_ref).unwrap_or(""))
+                        .await
+                {
+                    match &outcome {
+                        BridgeOutcome::Declined(code) => {
+                            let (status, reason) = decline_status(*code);
+                            return self.reply(resp, msg, status, reason).await;
+                        }
+                        BridgeOutcome::NoAnswer => {
+                            return self.reply(resp, msg, 480, "Temporarily Unavailable").await;
+                        }
+                        BridgeOutcome::Answered(..) => {}
                     }
                 }
                 match outcome {
@@ -552,6 +575,14 @@ impl SipServer {
                             "registered callee did not answer within timeout; falling back to echo");
                     }
                 }
+            } else if self.voicemail_enabled
+                && !self
+                    .voicemail_on_for(user_part(&to_ref).unwrap_or(""))
+                    .await
+                && (routed_uri.is_some() || did_dest.is_some())
+            {
+                // Offline extension with voicemail switched off: unavailable, nothing recorded.
+                return self.reply(resp, msg, 480, "Temporarily Unavailable").await;
             } else if self.voicemail_enabled && (routed_uri.is_some() || did_dest.is_some()) {
                 // The target is an internal endpoint (an extension route or a DID destination) but
                 // nobody is registered for it — the mailbox owner is offline. Take a voicemail; its

@@ -97,6 +97,7 @@ pub struct ExtensionPatch {
     pub label: Option<String>,
     pub destination_ref: Option<String>,
     pub dnd: Option<bool>,
+    pub voicemail: Option<bool>,
 }
 
 /// The Provisioning service. Stateless between requests — all state lives in the [`Store`]
@@ -507,6 +508,10 @@ impl Provisioning {
             ext.dnd = dnd;
             touched = true;
         }
+        if let Some(voicemail) = patch.voicemail {
+            ext.voicemail = voicemail;
+            touched = true;
+        }
         if let Some(dest) = patch.destination_ref {
             let mut route = self
                 .store
@@ -705,6 +710,29 @@ mod tests {
             .unwrap();
         let route = store.get_route(t, ext.route_id).await.unwrap().unwrap();
         assert_eq!(route.destination_ref, "queue:abc");
+
+        // voicemail defaults on and is patchable.
+        assert!(ext.voicemail);
+        let off = p
+            .update_extension(
+                t,
+                ext.base.id,
+                ExtensionPatch { voicemail: Some(false), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert!(!off.voicemail);
+        assert!(!store.get_extension(t, ext.base.id).await.unwrap().unwrap().voicemail);
+        // An unrelated patch leaves it alone.
+        let kept = p
+            .update_extension(
+                t,
+                ext.base.id,
+                ExtensionPatch { label: Some("x".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert!(!kept.voicemail);
 
         // Delete removes it; a second delete is NotFound.
         p.delete_extension(t, ext.base.id).await.unwrap();

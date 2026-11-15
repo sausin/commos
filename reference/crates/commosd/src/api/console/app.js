@@ -152,7 +152,8 @@ function derive() {
       ext, user, number: ext.number, route: routeById.get(ext.route_id),
       name: (user && user.display_name) || lbl || 'Extension ' + ext.number,
       email: (user && user.email) || '',
-      vmOff: caps.includes('voicemail:off'),
+      // First-class `ext.voicemail` (default on); legacy `voicemail:off` capability still reads as off.
+      vmOff: ext.voicemail === false || caps.includes('voicemail:off'),
       dnd: ext.dnd === true,
       fwd: D.fwds.find((f) => f.number === ext.number) || null,
       online: online.has(ext.number),
@@ -424,7 +425,7 @@ function personForm(p) {
 async function refreshQuiet() { try { await loadCore(); } catch (e) { /* the page refresh will report it */ } }
 
 async function createPerson(v) {
-  const caps = ['ext:' + v.number].concat(v.voicemail ? [] : ['voicemail:off']);
+  const caps = ['ext:' + v.number];
   const user = await api('POST', '/v1/users', { display_name: v.name, email: v.email || undefined, capabilities: caps });
   let ext;
   try {
@@ -436,6 +437,7 @@ async function createPerson(v) {
   let password = null;
   try { password = (await api('POST', '/v1/extensions/' + ext.id + '/sip-password')).password; } catch (_) { /* optional */ }
   if (v.fwdMode) await api('POST', '/v1/forwardings', { number: v.number, enabled: true, mode: v.fwdMode, targets: [v.fwdTo] });
+  if (!v.voicemail) { try { await api('PATCH', '/v1/extensions/' + ext.id, { voicemail: false }); } catch (_) { toast('Turning voicemail off isn’t available on this version yet.', true); } }
   if (v.dnd) { try { await api('PATCH', '/v1/extensions/' + ext.id, { dnd: true }); } catch (_) { toast('Do not disturb isn’t available on this version yet.', true); } }
   return { ext, user, password };
 }
@@ -443,7 +445,6 @@ async function createPerson(v) {
 async function savePerson(p, v) {
   let caps = ((p.user && p.user.capabilities) || []).filter((c) => c !== 'voicemail:off' && !c.startsWith('ext:'));
   caps.push('ext:' + p.number);
-  if (!v.voicemail) caps.push('voicemail:off');
   const userBody = { display_name: v.name, email: v.email, capabilities: caps };
   if (p.user) {
     const same = p.user.display_name === v.name && (p.user.email || '') === v.email && JSON.stringify(p.user.capabilities || []) === JSON.stringify(caps);
@@ -454,6 +455,8 @@ async function savePerson(p, v) {
   const patch = {};
   if (!p.ext.label || p.ext.label === p.name) { if (p.ext.label !== v.name) patch.label = v.name; }
   if (v.dnd !== p.dnd) patch.dnd = v.dnd;
+  // Also migrates a legacy `voicemail:off` capability (dropped from caps above) onto the extension.
+  if (v.voicemail !== (p.ext.voicemail !== false)) patch.voicemail = v.voicemail;
   if (Object.keys(patch).length) {
     const r = await api('PATCH', '/v1/extensions/' + p.ext.id, patch);
     if ('dnd' in patch && r && r.dnd !== undefined && r.dnd !== v.dnd) toast('Do not disturb didn’t stick.', true);

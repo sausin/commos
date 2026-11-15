@@ -277,6 +277,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voicemail_off_never_yields_a_voicemail_action() {
+        let (s, t) = store();
+        let off = PlanOpts { default_ring_seconds: 30, voicemail_enabled: false };
+        // Plain extension, unanswered: no voicemail final action.
+        let p = resolve_plan(&s, t, "100", "sip:100@h", off.clone(), 0, regset(&["100"])).await;
+        assert!(!matches!(p.final_action, FinalAction::Voicemail(_)));
+        // Offline extension too.
+        let p = resolve_plan(&s, t, "100", "sip:100@h", off.clone(), 0, regset(&[])).await;
+        assert!(!matches!(p.final_action, FinalAction::Voicemail(_)));
+        // DND with voicemail off: no voicemail either.
+        let p = resolve_plan_dnd(&s, t, "100", "sip:100@h", off, 0, regset(&["100"]), true).await;
+        assert!(!matches!(p.final_action, FinalAction::Voicemail(_)));
+        // Control: with voicemail on it does.
+        let p = resolve_plan(&s, t, "100", "sip:100@h", opts(), 0, regset(&[])).await;
+        assert_eq!(p.final_action, FinalAction::Voicemail("100".into()));
+    }
+
+    #[tokio::test]
     async fn dnd_goes_to_busy_rule_then_unavailable_then_voicemail() {
         let (s, t) = store();
         // No rules: voicemail, extension never rung even though registered.

@@ -966,6 +966,8 @@ mod tests {
         let tenant = Uuid::now_v7();
         let carrier_id = Uuid::now_v7();
         let mut cfg = sample_cfg();
+        // Per-extension voicemail switch survives the round-trip (extra map).
+        cfg.extensions[0].extra.insert("voicemail".into(), serde_json::json!(false));
         cfg.carriers = vec![entry(serde_json::json!({
             "id": carrier_id.to_string(), "name": "Acme Telecom", "kind": "SIP_TRUNK"
         }))];
@@ -1016,6 +1018,9 @@ mod tests {
         assert_eq!(exported.ivrs.len(), 1);
         // The extension's bound route_id is carried via the serde-flattened `extra` map.
         assert!(exported.extensions[0].extra.contains_key("route_id"));
+        assert_eq!(exported.extensions[0].extra["voicemail"], serde_json::json!(false));
+        // An extension that never set it exports the default (true).
+        assert_eq!(exported.extensions[1].extra["voicemail"], serde_json::json!(true));
         let yaml = to_yaml(&exported).unwrap();
 
         // Import the YAML into a brand-new store and compare the re-export.
@@ -1024,6 +1029,7 @@ mod tests {
         import(&dst, tenant, &parsed).await.unwrap();
         let again = export(&dst, tenant).await.unwrap();
         assert_eq!(yaml, to_yaml(&again).unwrap());
+        assert_eq!(again.extensions[0].extra["voicemail"], serde_json::json!(false));
         // Cross-references survive because ids are preserved.
         assert_eq!(again.gateways[0]["carrier_id"], serde_json::json!(carrier_id.to_string()));
 

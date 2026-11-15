@@ -25,6 +25,16 @@ pub struct Extension {
     /// forwarding rule, else voicemail).
     #[serde(default)]
     pub dnd: bool,
+    /// Voicemail on/off for this extension. Default `true` (rows predating the field keep
+    /// voicemail). When `false`, an unanswered / declined / busy call is not recorded: the
+    /// caller gets an "unavailable" status instead. The global `voicemail_enabled` config
+    /// remains the master switch.
+    #[serde(default = "default_true")]
+    pub voicemail: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Extension {
@@ -37,6 +47,7 @@ impl Extension {
             route_id,
             label: None,
             dnd: false,
+            voicemail: true,
         }
     }
 }
@@ -94,5 +105,28 @@ mod dnd_tests {
         j.as_object_mut().unwrap().remove("dnd");
         let back: Extension = serde_json::from_value(j).unwrap();
         assert!(!back.dnd);
+    }
+}
+
+#[cfg(test)]
+mod voicemail_tests {
+    use super::*;
+
+    #[test]
+    fn voicemail_defaults_true_for_old_rows() {
+        let ext = Extension::new(Uuid::now_v7(), "1001", Uuid::now_v7());
+        let mut j = serde_json::to_value(&ext).unwrap();
+        assert_eq!(j["voicemail"], true);
+        j.as_object_mut().unwrap().remove("voicemail");
+        let back: Extension = serde_json::from_value(j).unwrap();
+        assert!(back.voicemail);
+    }
+
+    #[test]
+    fn voicemail_false_round_trips() {
+        let mut ext = Extension::new(Uuid::now_v7(), "1001", Uuid::now_v7());
+        ext.voicemail = false;
+        let back: Extension = serde_json::from_value(serde_json::to_value(&ext).unwrap()).unwrap();
+        assert!(!back.voicemail);
     }
 }

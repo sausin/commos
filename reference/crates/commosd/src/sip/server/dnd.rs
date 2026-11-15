@@ -7,6 +7,22 @@ use super::*;
 impl SipServer {
     /// Extension numbers currently in do-not-disturb.
     pub(super) async fn dnd_numbers(&self) -> HashSet<String> {
+        self.extension_numbers_where(|e| e.dnd).await
+    }
+
+    /// Extension numbers with voicemail switched off (`Extension::voicemail == false`).
+    pub(super) async fn voicemail_off_numbers(&self) -> HashSet<String> {
+        self.extension_numbers_where(|e| !e.voicemail).await
+    }
+
+    /// Whether the dialled extension takes voicemail: the global master switch AND the
+    /// extension's own flag.
+    pub(super) async fn voicemail_on_for(&self, dialled: &str) -> bool {
+        self.voicemail_enabled
+            && (dialled.is_empty() || !self.voicemail_off_numbers().await.contains(dialled))
+    }
+
+    async fn extension_numbers_where(&self, pred: impl Fn(&commos_core::entities::extension::Extension) -> bool) -> HashSet<String> {
         let mut out = HashSet::new();
         let mut cursor = None;
         loop {
@@ -17,7 +33,7 @@ impl SipServer {
             else {
                 break;
             };
-            out.extend(page.items.into_iter().filter(|e| e.dnd).map(|e| e.number));
+            out.extend(page.items.into_iter().filter(|e| pred(e)).map(|e| e.number));
             match page.next_cursor {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -100,7 +116,7 @@ impl SipServer {
         }
         let opts = crate::control::ringplan::PlanOpts {
             default_ring_seconds: self.no_answer_timeout.as_secs().max(1) as u32,
-            voicemail_enabled: self.voicemail_enabled,
+            voicemail_enabled: self.voicemail_on_for(dialled).await,
         };
         let plan = crate::control::ringresolve::resolve_busy_plan(
             &self.store,
