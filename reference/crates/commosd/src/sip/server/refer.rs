@@ -91,8 +91,13 @@ impl SipServer {
             return self.reply(resp, msg, 400, "Bad Request").await;
         };
         let refer_cseq = msg.cseq_parts().map(|(n, _)| n).unwrap_or(1);
+        // The transferor's identity: an in-dialog REFER's own From is the sender's AOR in this
+        // dialog (always the transferor), unlike the client-supplied Referred-By or the stored
+        // leg's To, which can name the other party. BLF moves the transferor's lamp off this.
         let from_ref = msg
-            .referred_by()
+            .header("From")
+            .and_then(extract_uri)
+            .or_else(|| msg.referred_by())
             .or_else(|| extract_uri(&parties.transferor.to));
         tracing::info!(call_id = %parties.call_id, to = %refer.uri,
             attended = refer.replaces.is_some(), "SIP REFER");
